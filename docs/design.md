@@ -5,10 +5,10 @@
 
 ## Problem
 
-Claude Code running on LXC 133 (akio-paw) manages 30+ LXC containers and machines across two Proxmox nodes. Every remote command requires triple-nested shell escaping:
+Claude Code instances across the homelab manage many LXC containers and machines across multiple Proxmox nodes. Every remote command requires triple-nested shell escaping:
 
 ```bash
-ssh root@akio-lab "pct exec 100 -- bash -c 'cd /root/docker-app && docker compose ps --format json'"
+ssh root@pve-node "pct exec 100 -- bash -c 'cd /root/docker-app && docker compose ps --format json'"
 ```
 
 Each layer (local bash → SSH → pct exec → bash -c) interprets quotes, making complex commands fragile and error-prone. Pipes, heredocs, and special characters compound the problem.
@@ -22,16 +22,23 @@ Commando is a command relay system with two components:
 
 The command string travels through MCP (JSON-RPC) and Cap'n Proto (binary serialization) — neither interprets the string as shell. Only one shell (`sh -c` on the target) ever touches the command. Zero escaping layers in transport.
 
+### Non-Goals
+
+- **Not a config management tool** — Commando is not a replacement for Ansible, Terraform, or NixOS. It relays ad-hoc commands; it does not manage desired state.
+- **Not for untrusted networks** — unencrypted Cap'n Proto RPC on a trusted LAN. HMAC challenge-response protects PSKs on the wire, but commands and output are plaintext. No TLS, no certificate management (see Future Enhancements for TLS upgrade path).
+- **No Windows support** — agents target Linux only (`sh -c` / `bash -c` / `fish -c`).
+- **No multi-tenancy** — single admin, single trust domain. No per-user authorization or audit separation.
+
 ### Before vs After
 
 **Before (today):**
 ```bash
-ssh root@akio-lab "pct exec 127 -- bash -c 'echo \"hello world\" | grep \"hello\"'"
+ssh root@pve-node "pct exec 100 -- bash -c 'echo \"hello world\" | grep \"hello\"'"
 ```
 
 **After (Commando):**
 ```
-commando_exec(target="akio-nocodb", command="echo \"hello world\" | grep \"hello\"")
+commando_exec(target="node-1/my-app", command="echo \"hello world\" | grep \"hello\"")
 ```
 
 One shell layer. Done.
@@ -49,21 +56,21 @@ One shell layer. Done.
 ## Architecture
 
 ```
-Claude Code (LXC 133, akio-paw)
+Claude Code (any workstation)
     │
-    │ stdio (MCP JSON-RPC)
+    │ SSH stdio (MCP JSON-RPC)
     │
     ▼
 ┌─────────────────────────────────┐
 │  Commando Gateway               │
-│  LXC: akio-commando (new)       │
+│  (any always-on host)           │
 │                                 │
 │  ┌───────────┐  ┌────────────┐  │
 │  │ MCP Server│  │  Registry  │  │
 │  │ (stdio)   │──│            │  │
 │  └───────────┘  │ - Proxmox  │  │
 │       │         │   auto-disc│  │
-│       │         │ - YAML     │  │
+│       │         │ - TOML     │  │
 │       ▼         │   manual   │  │
 │  ┌───────────┐  └────────────┘  │
 │  │ Cap'n     │                  │
@@ -74,33 +81,53 @@ Claude Code (LXC 133, akio-paw)
          │
          │ Cap'n Proto RPC (TCP, port 9876)
          │
-   ┌─────┼──────┬──────┬──────┬──────────┐
-   ▼     ▼      ▼      ▼      ▼          ▼
- Agent  Agent  Agent  Agent  Agent      Agent
- LXC    LXC    LXC    LXC    LXC       akio-
- 100    107    127    131    115        fractal
- akio-  akio-  akio-  akio-  akio-
- lab    lab    lab    lab    garage
+   ┌─────┼──────┬──────┬──────┐
+   ▼     ▼      ▼      ▼      ▼
+ Agent  Agent  Agent  Agent  Agent
+ LXC    LXC    LXC    LXC    bare
+ 101    102    103    104    metal
+ node1  node1  node2  node2
 ```
 
 ## Cap'n Proto Schema
 
+The schema file ID must be globally unique. Generate with `capnp id` before first use.
+
 ```capnp
-@0xb7c5e6a2d3f41890;
+@0xb7c5e6a2d3f41890;  # PLACEHOLDER — replace with output of `capnp id`
+
+# Capability-based auth: the bootstrap interface is Authenticator. The client
+# requests a challenge nonce, then proves PSK knowledge via HMAC — the PSK
+# never crosses the wire. A successful authenticate() returns a CommandAgent
+# capability. Without it, the client has no way to call exec or ping —
+# enforced by the type system, not runtime state tracking.
+interface Authenticator {
+  challenge @0 () -> (nonce :Data);
+  # Returns a 32-byte random nonce. The client computes HMAC-SHA256(psk, nonce)
+  # and passes it to authenticate().
+
+  authenticate @1 (hmac :Data) -> (agent :CommandAgent, agentVersion :Text);
+  # Validates the HMAC against the agent's stored PSK and the previously issued
+  # nonce. On success, returns a CommandAgent capability. On failure, throws an
+  # RPC exception and disconnects. agentVersion (e.g., "0.1.0") enables future
+  # version negotiation. Each nonce is single-use — a second authenticate()
+  # call on the same connection requires a new challenge().
+}
 
 interface CommandAgent {
-  # Must be called first on every new connection. Agent disconnects on failure.
-  auth @0 (psk :Text) -> (ok :Bool);
-
-  exec @1 (request :ExecRequest) -> (result :ExecResult);
-  ping @2 () -> (pong :PingResult);
+  exec @0 (request :ExecRequest) -> (result :ExecResult);
+  ping @1 () -> (pong :PingResult);
 }
 
 struct ExecRequest {
   command @0 :Text;       # Shell command to execute
-  workDir @1 :Text;       # Working directory (empty = home dir)
+  workDir @1 :Text;       # Working directory (empty string = agent's default home dir)
   timeoutSecs @2 :UInt32; # Timeout in seconds (0 = default 60s)
-  env @3 :List(EnvVar);   # Optional environment variable overrides
+  extraEnv @3 :List(EnvVar);  # Additional environment variables (merged with clean base env)
+  requestId @4 :Text;     # Optional correlation ID (gateway-generated UUID, echoed in result and logs)
+  # No stdin field — intentional. All input must be expressed within the command
+  # itself (heredocs, echo pipes, etc.). This keeps the protocol simple and
+  # avoids streaming complexity. Covers all Claude Code use cases.
 }
 
 struct EnvVar {
@@ -111,14 +138,18 @@ struct EnvVar {
 struct ExecResult {
   stdout @0 :Data;        # Raw stdout bytes
   stderr @1 :Data;        # Raw stderr bytes
-  exitCode @2 :Int32;     # Process exit code
+  exitCode @2 :Int32;     # Process exit code (0-255 normal, 128+signal for signal kills, e.g., SIGTERM=143, SIGKILL=137)
   durationMs @3 :UInt64;  # Execution wall time in milliseconds
+  timedOut @4 :Bool;      # True if the process was killed due to timeout
+  truncated @5 :Bool;     # True if output was truncated due to size limit
+  requestId @6 :Text;     # Echoed from ExecRequest for cross-component log correlation
 }
 
 struct PingResult {
   hostname @0 :Text;      # Machine hostname
   uptimeSecs @1 :UInt64;  # Agent uptime in seconds
   shell @2 :Text;         # Default shell (bash, fish, etc.)
+  version @3 :Text;       # Agent version (semver, e.g., "0.1.0")
 }
 ```
 
@@ -126,11 +157,10 @@ struct PingResult {
 
 ### Auto-Discovery (Proxmox API)
 
-On startup and every 60 seconds, the gateway queries both Proxmox nodes:
+On startup and every 60 seconds, the gateway queries each configured Proxmox node:
 
 ```
-GET https://akio-lab:8006/api2/json/nodes/akio-lab/lxc
-GET https://akio-garage:8006/api2/json/nodes/akio-garage/lxc
+GET https://<node-host>:8006/api2/json/nodes/<node-name>/lxc
 ```
 
 For each running LXC, it extracts:
@@ -138,27 +168,34 @@ For each running LXC, it extracts:
 - IP address (from `lxc/{vmid}/interfaces`)
 - Agent port: always `9876`
 
-This builds a live inventory of all LXC targets. Stopped LXCs are listed but marked unavailable.
+Auto-discovered LXC targets are keyed by `node-name/hostname` (e.g., `node-1/my-app`) to avoid collisions when LXCs on different Proxmox nodes share the same hostname. Manual targets use plain names (e.g., `my-desktop`).
 
-### Manual Targets (`/etc/commando/targets.yaml`)
+All MCP tools require fully qualified target names. Claude Code must use `node-1/my-app` for auto-discovered LXCs and `my-desktop` for manual targets. `commando_list` returns the fully qualified name for each target, so Claude Code always knows the correct key. No short-name matching or ambiguity resolution — explicit is better.
 
-Non-LXC machines are registered via YAML config:
+This builds a near-real-time inventory of all LXC targets (up to 60s lag for newly created LXCs). Stopped LXCs are listed but marked unavailable.
 
-```yaml
-targets:
-  - name: akio-fractal
-    host: akio-fractal        # hostname or IP
-    port: 9876
-    shell: fish               # default shell for this target
-    type: machine             # "machine" (not LXC)
-    tags:
-      - gpu
-      - desktop
+During each discovery cycle, the gateway also pings each agent (TCP connect + `ping()` RPC) and records reachability in the registry. `commando_list` output includes a `reachable` field (true/false/unknown) so Claude Code can see agent health without explicit ping calls. The ping check uses the same `connect_timeout_secs` (default: 5s) and runs concurrently across all targets to avoid slowing the discovery cycle.
+
+### Manual Targets
+
+Non-LXC machines are registered directly in `gateway.toml` under `[[targets]]`:
+
+```toml
+[[targets]]
+name = "my-desktop"
+host = "my-desktop"        # hostname or IP
+port = 9876
+shell = "fish"             # default shell for this target
+tags = ["gpu", "desktop"]
 ```
 
 ### Merged Registry
 
-Auto-discovered LXCs and manual targets are merged into a single registry. Manual entries can override auto-discovered ones (e.g., to set a custom shell or tags). The registry is queryable via the `commando_list` MCP tool.
+Auto-discovered LXCs (keyed by `node/hostname`) and manual targets (keyed by plain name) are merged into a single registry. Manual entries can override auto-discovered ones by using the same `node/hostname` key (e.g., to set a custom shell, tags, or override the IP). The registry is queryable via the `commando_list` MCP tool. All PSKs are stored in `gateway.toml` under `[agent.psk]`, keyed by target name — one source of truth for secrets, regardless of how the target was discovered.
+
+The gateway caches the registry to disk (`/var/lib/commando/registry.json`). On startup, if a cached registry exists, it is loaded immediately so targets are available before the first Proxmox poll completes. If no cache exists (first deploy), the gateway runs one synchronous discovery cycle before accepting MCP requests, ensuring targets are available immediately. The cache is updated after each successful discovery cycle.
+
+Each discovery cycle fully replaces the registry with the combination of freshly discovered auto-discovered LXCs and manual targets from `gateway.toml`. LXCs that no longer exist are removed; new ones appear. The cache exists solely for fast startup — it is never merged with live discovery results. If multiple gateway hosts are deployed, each maintains its own independent cache, which is expected and harmless.
 
 ## MCP Tools
 
@@ -170,12 +207,15 @@ Execute a command on a target machine.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `target` | string | yes | Target hostname (e.g., `akio-arr`, `akio-fractal`) |
+| `target` | string | yes | Fully qualified target name (e.g., `node-1/my-app`, `my-desktop`) |
 | `command` | string | yes | Shell command to execute |
 | `work_dir` | string | no | Working directory (default: home dir) |
 | `timeout` | number | no | Timeout in seconds (default: 60) |
+| `env` | object | no | Additional environment variables (e.g., `{"PGPASSWORD": "xxx"}`) merged with the clean base env |
 
-**Returns:** stdout, stderr, exit code, duration
+**Returns:** stdout, stderr, exit code, duration, timed_out, truncated
+
+**Output encoding:** The gateway performs lossy UTF-8 conversion for stdout/stderr — invalid bytes are replaced with U+FFFD. MCP tool results are passed directly to the LLM, so output must always be readable text. No base64 fallback. This is a permanent design choice, not a v1 shortcut — binary output is not a use case for this system.
 
 ### `commando_list`
 
@@ -183,9 +223,11 @@ List all registered targets with their status.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `filter` | string | no | Filter by name, tag, or status |
+| `filter` | string | no | Case-insensitive substring match against target name and tags |
 
-**Returns:** Array of targets with name, host, type, status, shell, tags
+**Returns:** Array of targets with name, host, type, status, shell, tags, has_psk, reachable
+
+The `has_psk` field indicates whether the gateway has a PSK configured for this target. Auto-discovered LXCs without a PSK entry will show `has_psk: false` — a signal that the agent needs to be deployed and its PSK added to `gateway.toml`.
 
 ### `commando_ping`
 
@@ -193,9 +235,9 @@ Health check a specific agent.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `target` | string | yes | Target hostname |
+| `target` | string | yes | Fully qualified target name |
 
-**Returns:** hostname, uptime, shell, reachability
+**Returns:** hostname, uptime, shell, version, reachability
 
 ## Components
 
@@ -204,18 +246,26 @@ Health check a specific agent.
 A single static Rust binary (~2-4MB) that runs on every target machine.
 
 **Responsibilities:**
-- Listen on TCP port `9876` for Cap'n Proto RPC connections
-- Authenticate incoming connections via pre-shared key (PSK)
-- Execute commands using the machine's default shell (`sh -c` or `fish -c`)
+- Listen on configured bind address and TCP port `9876` for Cap'n Proto RPC connections. Enable `SO_KEEPALIVE` on accepted sockets so the agent detects dead connections promptly during long-running commands — this ensures process group cleanup (step 8) fires even if the gateway crashes without a clean TCP close
+- Authenticate incoming connections via pre-shared key (PSK) using the `Authenticator` capability interface. On success, returns a `CommandAgent` capability — the client cannot call `exec` or `ping` without it. Simple rate limiting for v1: after 3 consecutive auth failures from the same peer IP, delay responses by 1 second. Per-IP failure counters are held in an in-memory map and cleared on successful auth from that IP
+- Enforce a local concurrency limit (`max_concurrent`, default: 8) using an RAII guard tied to connection lifetime — the guard is acquired when an `exec` call starts and released when the connection closes (whether the exec completes normally, times out, or the connection drops). This ensures the counter never leaks. The agent rejects `exec` calls with an RPC error when the limit is reached. This is the true backstop: it protects the host regardless of how many gateways connect. The gateway's `max_concurrent_per_target` (default: 4) is a courtesy limit per gateway instance — multiple Claude Code sessions can collectively reach the agent's hard limit
+- Execute commands using the configured shell (`sh -c`, `bash -c`, `fish -c`). Any shell configured in `agent.toml` must support the `-c <command>` interface
 - Return stdout, stderr, exit code, and timing
-- Respond to ping requests with hostname, uptime, and shell info
+- Cap buffered stdout/stderr at `max_output_bytes` (default 128KB). If either stream exceeds the limit, keep the **last** `max_output_bytes` (tail truncation) and set `truncated = true` in the response. Tail truncation is intentional: errors and final output are at the end, which is what matters for debugging. 128KB is chosen because MCP tool results feed directly into the LLM context window — 1MB+ of text would far exceed useful context
+- On timeout: send SIGTERM, wait 5s grace period, then SIGKILL if still alive. Return buffered stdout/stderr with `timedOut = true`
+- Respond to ping requests with hostname, uptime, shell, and agent version
 
-**Configuration** (`/etc/commando/agent.toml`):
+**Configuration** (`/etc/commando/agent.toml`, must be `chmod 600 root:root` — contains the agent PSK):
 ```toml
+bind = "10.0.0.5"   # bind to LAN interface only (not 0.0.0.0)
 port = 9876
-shell = "sh"        # or "fish" for akio-fractal
-psk = "shared-secret-key-here"
+shell = "sh"        # or "bash", "fish", etc.
+psk = "per-agent-unique-key"  # unique to this agent, gateway must know it
+max_output_bytes = 131_072    # 128KB, tail-truncate stdout/stderr beyond this
+max_concurrent = 8            # max simultaneous exec calls, rejects beyond this
 ```
+
+**Config reload:** The agent reads `agent.toml` once at startup. Changes to PSK, shell, bind address, or limits require a restart (`systemctl restart commando-agent`). There is no hot-reload mechanism — this is intentional to keep the agent simple. PSK rotation is a restart.
 
 **Systemd unit** (`/etc/systemd/system/commando-agent.service`):
 ```ini
@@ -234,14 +284,19 @@ WantedBy=multi-user.target
 ```
 
 **Process execution flow:**
-1. Accept TCP connection
-2. Wait for `auth(psk)` call — disconnect if invalid
-3. Receive `ExecRequest` via Cap'n Proto RPC
-4. Spawn child process: `sh -c "<command>"` (or configured shell)
-5. Apply `env` overrides and working directory if specified
+1. Accept TCP connection (with `SO_KEEPALIVE` enabled)
+2. Serve the `Authenticator` interface. On `challenge()`: generate and return a 32-byte random nonce. On `authenticate(hmac)`: validate `HMAC-SHA256(psk, nonce)`, return a `CommandAgent` capability on success, throw RPC exception and disconnect on failure
+3. Receive `ExecRequest` via `CommandAgent.exec()` (only reachable after successful auth)
+4. Spawn child process using `Command::new(&shell).arg("-c").arg(&command)` with `pre_exec(|| { libc::setsid(); })` to place each command in its own process group. This is the core zero-escaping guarantee: the command is passed as a single OS argument (argv), never interpolated into a string. The command travels from Claude Code through MCP JSON and Cap'n Proto binary serialization without any layer interpreting it as shell. Only the target shell receives it, as-is. No login shell (`-l`) flag — this avoids profile scripts polluting stdout with motd or greeting messages
+5. Build a clean environment: start from a minimal base, then apply `extraEnv` overrides. Do not inherit the agent's process environment. No restrictions on env var names — `extraEnv` can override `PATH`, `LD_PRELOAD`, etc. This is accepted risk: the gateway already has full exec-as-root access, so env var restrictions would be security theater. Base env:
+   - `HOME=/root`, `USER=root` (agent runs as root)
+   - `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`
+   - `SHELL` = configured shell from `agent.toml`
+   - `LANG=C.UTF-8`, `TERM=dumb`, `NO_COLOR=1` (`TERM=dumb` and `NO_COLOR` are intentional for non-interactive exec: disables pagers, color escape sequences, and curses output that would pollute captured stdout)
 6. Wait for completion (with timeout)
-7. Capture stdout/stderr, exit code
-8. Return `ExecResult` with timing data
+7. If timeout expires: SIGTERM the entire process group (`kill(-pgid, SIGTERM)`), wait 5s, SIGKILL the group if still alive, set `timedOut = true`
+8. If the RPC connection drops while a child process is running: SIGTERM the entire process group (same 5s grace + SIGKILL). The `setsid()` process group ensures all child processes (e.g., subprocesses spawned by `docker compose`) are cleaned up — no orphans. The agent tracks active child PIDs per connection and cleans up on disconnect
+9. Return `ExecResult` with captured stdout/stderr, exit code, timing, and timeout flag
 
 ### Commando Gateway (`commando-gateway`)
 
@@ -249,19 +304,23 @@ An MCP server that bridges Claude Code to the agent network.
 
 **Responsibilities:**
 - Serve MCP protocol over stdio (launched by Claude Code)
-- Maintain the target registry (auto-discovery + YAML)
-- Route `commando_exec` calls to the correct agent via Cap'n Proto RPC
-- Handle connections to agents (see concurrency note below)
+- Maintain the target registry (auto-discovery + manual targets from `gateway.toml`)
+- Route `commando_exec` calls to the correct agent via Cap'n Proto RPC — converts the MCP `env` object (`{"KEY": "val"}`) to Cap'n Proto `List(EnvVar)` format
+- Enforce per-target concurrency limits via a configurable semaphore (default: 4 concurrent execs per agent)
 - Provide `commando_list` and `commando_ping` tools
 
-**Concurrency note:** `capnp-rpc`'s `RpcSystem` uses `Rc` internally and is `!Send`. Each agent connection must be driven on a `tokio::task::spawn_local()` within a `LocalSet`. The gateway should use a single `LocalSet` driving all agent connections, or one `LocalSet` per connection on a dedicated thread. This is a known constraint of the crate — do not attempt `tokio::spawn()` with `RpcSystem`.
+**Connection model:** Connect-per-request. Each `commando_exec` or `commando_ping` call opens a fresh TCP connection to the target agent, authenticates, executes, and closes. This is simple and avoids stale connection bugs. The latency overhead (~1-5ms on LAN for TCP handshake + auth) is negligible for human-initiated commands. TCP connect timeout is `connect_timeout_secs` (default: 5s) — if the agent host is unreachable, the call fails fast rather than hanging for the OS default (~2 min).
 
-**Configuration** (`/etc/commando/gateway.toml`):
+**Error handling:** Before connecting, the gateway validates that the target exists in the registry and has a PSK configured in `[agent.psk]`. Missing targets return an MCP error: `"unknown target: <name>"`. Targets discovered via Proxmox but without a PSK return: `"no PSK configured for target: <name>"`. This makes unconfigured agents visible without silent failures.
+
+**Runtime:** The gateway uses a single-threaded tokio runtime (`tokio::runtime::Builder::new_current_thread()`). This sidesteps `capnp-rpc`'s `!Send` constraint entirely — `RpcSystem` uses `Rc` internally, but on a single-threaded runtime no `Send` bound is required. Concurrent MCP requests (e.g., two `commando_exec` calls) are handled via async I/O on the single thread, which is sufficient since all work is I/O-bound (waiting on agent TCP responses). Each Claude Code instance launches its own gateway process via SSH, so there is no cross-instance contention.
+
+**Configuration** (`/etc/commando/gateway.toml`, must be `chmod 600 root:root` — contains all agent PSKs and the Proxmox API token):
 ```toml
 [proxmox]
 nodes = [
-  { name = "akio-lab", host = "192.168.0.227", port = 8006 },
-  { name = "akio-garage", host = "192.168.0.197", port = 8006 },
+  { name = "node-1", host = "192.168.1.10", port = 8006 },
+  { name = "node-2", host = "192.168.1.11", port = 8006 },
 ]
 user = "root@pam"
 token_id = "commando"
@@ -270,14 +329,28 @@ discovery_interval_secs = 60
 
 [agent]
 default_port = 9876
-psk = "shared-secret-key-here"
 default_timeout_secs = 60
+connect_timeout_secs = 5       # TCP connect timeout to agents
+max_concurrent_per_target = 4  # semaphore limit per agent
 
-[manual_targets]
-config_path = "/etc/commando/targets.yaml"
+# Per-agent PSKs use fully qualified target names as keys.
+# Auto-discovered LXCs: "node-name/hostname", manual targets: plain name.
+# Each agent has a unique key, limiting blast radius if compromised.
+[agent.psk]
+"node-1/my-app" = "aaaa..."
+"node-1/my-db" = "bbbb..."
+my-desktop = "cccc..."
+# ... one entry per target
+
+[[targets]]
+name = "my-desktop"
+host = "my-desktop"
+port = 9876
+shell = "fish"
+tags = ["gpu", "desktop"]
 ```
 
-**MCP server configuration** (added to Claude Code on LXC 133):
+**MCP server configuration** (added to any Claude Code instance that needs homelab access):
 ```json
 {
   "mcpServers": {
@@ -286,7 +359,7 @@ config_path = "/etc/commando/targets.yaml"
       "args": [
         "-o", "ServerAliveInterval=15",
         "-o", "ServerAliveCountMax=3",
-        "root@akio-commando",
+        "root@gateway-host",
         "/usr/local/bin/commando-gateway",
         "--config", "/etc/commando/gateway.toml"
       ]
@@ -295,15 +368,23 @@ config_path = "/etc/commando/targets.yaml"
 }
 ```
 
-**Gateway lifecycle:** The gateway runs as a persistent systemd service on akio-commando. Claude Code connects to it via SSH stdio, which is a single long-lived SSH connection (not per-command). If the SSH connection drops (network blip, Claude restart), Claude Code reconnects and gets a warm gateway with a pre-populated registry — no re-discovery delay. The gateway process itself survives SSH disconnects because it's managed by systemd, not by the SSH session.
+**Gateway lifecycle:** Claude Code launches the gateway binary on-demand via SSH. The process lives for the duration of the SSH connection — when Claude Code disconnects (restart, network blip), the gateway process exits. On reconnect, Claude Code launches a fresh gateway instance which re-discovers targets within its first poll cycle (~60s). This is simple and stateless. No systemd service is needed for the gateway. The gateway can run on any always-on host — a dedicated LXC, a Proxmox host, or an existing utility machine. The only requirements are network access to agents (TCP 9876) and Proxmox API (HTTPS 8006). For redundancy, deploy the gateway binary to multiple hosts and configure separate MCP server entries in Claude Code — the gateway is stateless, so any instance can serve any request.
 
 ## Authentication
 
-**Pre-Shared Key (PSK):**
-- A shared secret configured on both gateway and all agents
-- Transmitted via the `auth()` RPC method — the mandatory first call on every new connection
-- Agent disconnects immediately if `auth(psk)` returns `ok = false`
-- **Note:** Cap'n Proto RPC traffic is unencrypted over TCP. On a trusted LAN this is acceptable (same machines, same admin), but it is NOT equivalent to SSH which encrypts the transport. If this matters later, wrap connections in TLS via `tokio-rustls`.
+**Per-Agent Pre-Shared Keys (PSK):**
+- Each agent has its own unique PSK — a compromised agent only exposes itself, not the fleet
+- The gateway stores all PSKs in `[agent.psk]` keyed by target name, and uses the correct one to compute HMAC responses when connecting to each agent
+- Each agent only knows its own PSK (configured in its local `agent.toml`)
+- Authenticated via HMAC challenge-response over the `Authenticator` capability interface: the gateway calls `challenge()` to receive a 32-byte random nonce, computes `HMAC-SHA256(psk, nonce)`, and passes the result to `authenticate()`. The PSK never crosses the wire. On success, returns a `CommandAgent` capability; on failure, throws an RPC exception and disconnects. Auth is enforced by the Cap'n Proto capability model: without a successful `authenticate()`, the client has no capability to call `exec` or `ping`
+- PSKs are generated per-agent during deployment: `openssl rand -hex 32`
+- **PSK rotation:** To rotate a PSK: (1) generate a new key, (2) update the gateway's `[agent.psk]` entry (picked up on next Claude Code reconnect), (3) update the agent's `agent.toml`, (4) restart the agent. Updating the gateway first avoids an auth mismatch window — the agent is only briefly unreachable during its restart in step 4. For fleet-wide rotation, use the deploy script to batch the update
+- **Security assumptions (trusted LAN):**
+  - Cap'n Proto RPC traffic is unencrypted over TCP — commands and output are visible on the wire. Not equivalent to SSH.
+  - HMAC challenge-response prevents passive PSK capture, but an attacker on the network can still observe command strings and output. Without TLS, active MITM remains possible.
+  - Gateway holds all agent PSKs — compromising the gateway exposes the full fleet. Per-agent PSKs only limit blast radius for individual agent compromise.
+  - Agents run as root (no `User=` in systemd unit) — all commands execute with root privileges. This is intentional: LXC containers in this homelab are single-purpose and root-only, and Claude Code needs full access for package management, Docker, and service control.
+  - All of this is acceptable for a single-admin homelab on a trusted LAN. If the threat model changes, wrap connections in TLS via `tokio-rustls`.
 
 **Proxmox API Token:**
 - A dedicated API token (`root@pam!commando`) for Proxmox auto-discovery
@@ -313,6 +394,23 @@ config_path = "/etc/commando/targets.yaml"
   pveum user token add root@pam commando --privsep 1
   pveum acl modify / --token 'root@pam!commando' --roles PVEAuditor
   ```
+
+## Logging
+
+Both components use `tracing` with structured JSON output (for future Loki/Grafana ingestion).
+
+**Agent logs:**
+- Connection accepted/rejected (peer IP, auth success/failure)
+- Command execution: target, command (truncated at 200 chars), working dir, exit code, duration, truncated, timed out
+- Process lifecycle: startup, shutdown, config loaded
+
+**Gateway logs:**
+- MCP tool calls: tool name, target, command (truncated), duration
+- Registry updates: targets added/removed/changed, discovery cycle duration, Proxmox API errors
+- Agent connections: target, connect/disconnect, RPC errors
+- Cache operations: load/save, staleness
+
+Log level controlled via `RUST_LOG` env var (default: `info`). Set `debug` for development, `trace` for deep troubleshooting.
 
 ## Repo Structure
 
@@ -331,7 +429,7 @@ commando/
 │   │   └── src/
 │   │       ├── main.rs           # Gateway binary entry point
 │   │       ├── mcp.rs            # MCP server (stdio JSON-RPC)
-│   │       ├── registry.rs       # Target registry (discovery + YAML)
+│   │       ├── registry.rs       # Target registry (discovery + manual targets)
 │   │       ├── proxmox.rs        # Proxmox API client
 │   │       └── rpc.rs            # Cap'n Proto RPC client to agents
 │   └── commando-common/
@@ -340,12 +438,10 @@ commando/
 │           └── lib.rs            # Shared types, config parsing, auth
 ├── deploy/
 │   ├── agent.service             # Systemd unit for agent
-│   ├── gateway.service           # Systemd unit for gateway
 │   └── deploy-agents.sh          # Script to push agent binary to all LXCs
 ├── config/
 │   ├── gateway.toml.example
-│   ├── agent.toml.example
-│   └── targets.yaml.example
+│   └── agent.toml.example
 └── README.md
 ```
 
@@ -357,9 +453,11 @@ commando/
 | `capnp-rpc` | Cap'n Proto RPC (async, tokio-based) |
 | `tokio` | Async runtime |
 | `serde`, `serde_json` | JSON for MCP protocol |
-| `toml` | Config file parsing |
-| `serde_yaml` | Manual targets YAML |
+| `toml` | Config file parsing (gateway.toml, agent.toml) |
 | `reqwest` | HTTP client for Proxmox API |
+| `hmac`, `sha2` | HMAC-SHA256 for challenge-response auth |
+| `rand` | Nonce generation for auth challenges |
+| `tracing`, `tracing-subscriber` | Structured logging (JSON output for Loki ingestion) |
 
 ## Deployment Plan
 
@@ -373,39 +471,47 @@ commando/
 
 ### Phase 2: Infrastructure
 
-1. Create `akio-commando` LXC from template 1000 on akio-lab
+1. Choose a host for the gateway (dedicated LXC, Proxmox host, or existing machine)
 2. Create Proxmox API token with scoped permissions:
    ```bash
    pveum user token add root@pam commando --privsep 1
    pveum acl modify / --token 'root@pam!commando' --roles PVEAuditor
    ```
-3. Generate PSK: `openssl rand -hex 32`
-4. Deploy `commando-gateway` to akio-commando with gateway.toml + targets.yaml
-5. Enable gateway systemd service
-6. Add MCP config to Claude Code settings on LXC 133
+3. Generate per-agent PSKs: `openssl rand -hex 32` (one per target)
+4. Deploy `commando-gateway` to the gateway host with gateway.toml
+5. Add MCP config to Claude Code instances that need homelab access
 
 ### Phase 3: Agent Rollout
 
-`deploy/deploy-agents.sh` automates the rollout:
-1. Query Proxmox API for all running LXCs on both nodes
-2. For each LXC: `pct push <VMID> commando-agent /usr/local/bin/commando-agent`
-3. Push agent.toml config (with PSK) and systemd unit
-4. Enable and start `commando-agent.service` via `pct exec`
-5. Deploy to akio-fractal separately via `scp` (with `shell = "fish"` config)
+`deploy/deploy-agents.sh` automates the rollout and remains the permanent bootstrap and fallback mechanism — it uses SSH + `pct` directly, so it works even when Commando itself is down or buggy. The script takes a list of Proxmox node hostnames as arguments (e.g., `./deploy-agents.sh node-1 node-2`). For each node, it SSHes in and runs `pct` commands — so it can be executed from any machine with SSH access to the Proxmox nodes (including the gateway host). Steps:
+1. For each Proxmox node: SSH in and query running LXCs via `pct list`
+2. For each LXC: `ssh root@<node> pct push <VMID> commando-agent /usr/local/bin/commando-agent`
+3. Generate a unique PSK per agent (`openssl rand -hex 32`), push agent.toml config + systemd unit
+4. Collect all generated PSKs and append them to the gateway's `[agent.psk]` table
+5. Enable and start `commando-agent.service` via `pct exec`
 6. Report success/failure per target
 7. Verify all agents with `commando_list` and `commando_ping`
 
+For non-LXC machines (e.g., desktops, bare-metal servers), deploy manually via `scp` with the appropriate `shell` and `bind` config.
+
 ### Phase 4: Template Update
 
-1. Bake `commando-agent` binary into LXC template 1000
+1. Bake `commando-agent` binary into the LXC template
 2. Add systemd unit to template
-3. Update homelab skill documentation with Commando usage
+3. New LXCs automatically have the agent pre-installed
 
 ## Future Enhancements (Not in Scope)
 
+- **TLS transport:** Wrap agent connections in TLS via `tokio-rustls` for encrypted-on-the-wire security — eliminates plaintext PSK and command visibility concerns
+- **Persistent gateway:** Run the gateway as a systemd service with a Unix socket stdio bridge, so it survives SSH disconnects and maintains a warm registry, connection pool, and audit log across Claude Code sessions
+- **Connection pooling:** Persistent connections with multiplexing for lower latency on high-frequency operations
+- **Streaming output:** Cap'n Proto streaming for long-running commands — important for UX on commands that take minutes
+- **Per-caller authorization:** Role-based permissions when multiple clients connect (beyond single Claude Code instance)
 - **File transfer:** Read/write files on targets without shell commands
-- **Streaming output:** Cap'n Proto streaming for long-running commands
 - **Service helpers:** Typed tools like `docker_compose(action, service)`, `systemctl(action, unit)`
 - **Web UI:** Dashboard showing all agents, status, recent commands
 - **Audit log:** Record all commands executed through Commando
 - **Agent auto-update:** Gateway pushes new agent binaries to targets
+- **Batch exec (`commando_exec_batch`):** Fan-out a command to multiple targets in parallel, returning results per target — useful for fleet-wide operations like `apt update`
+- **Graceful agent shutdown:** On SIGTERM, the agent should SIGTERM all active child process groups (5s grace + SIGKILL) before exiting, preventing orphaned processes during agent restarts
+- **Version negotiation:** `agentVersion` is already returned by `Authenticator.authenticate()` — add compatibility checks in the gateway to detect incompatible agents and surface clear errors during schema evolution
