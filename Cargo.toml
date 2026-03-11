@@ -1,0 +1,22 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+capnp = "0.25"
+capnp-rpc = "0.25"
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros", "signal", "process"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+anyhow = "1"
+thiserror = "2"

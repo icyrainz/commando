@@ -1,0 +1,14 @@
+[package]
+name = "commando-common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+capnp = { workspace = true }
+capnp-rpc = { workspace = true }
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.9"
+
+[build-dependencies]
+capnpc = "0.25"  # Must match capnp version
