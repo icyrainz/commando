@@ -1,18 +1,16 @@
-mod config;
-mod handler;
-mod mcp;
-mod proxmox;
-mod registry;
-mod rpc;
-mod sse;
-
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use clap::Parser;
 use tracing::{error, info, warn};
 
-use registry::{DiscoveredTarget, Registry};
+use commando_gateway::config;
+use commando_gateway::handler;
+use commando_gateway::mcp;
+use commando_gateway::proxmox;
+use commando_gateway::registry::{self, DiscoveredTarget, Registry};
+use commando_gateway::rpc;
+use commando_gateway::sse;
 
 #[derive(Parser)]
 #[command(name = "commando-gateway", about = "Commando MCP gateway")]

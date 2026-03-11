@@ -4,6 +4,10 @@ use std::net::IpAddr;
 use std::rc::Rc;
 use std::time::Instant;
 
+use anyhow::Result;
+use futures::AsyncReadExt;
+use tokio_util::compat::TokioAsyncReadCompatExt;
+
 use commando_common::auth;
 use commando_common::commando_capnp::{authenticator, command_agent};
 
@@ -160,7 +164,7 @@ impl authenticator::Server for AuthenticatorImpl {
     }
 }
 
-struct CommandAgentImpl {
+pub(crate) struct CommandAgentImpl {
     config: Rc<AgentConfig>,
     concurrency_guard: Rc<ConcurrencyGuard>,
     agent_start_time: Instant,
@@ -282,5 +286,77 @@ impl command_agent::Server for CommandAgentImpl {
         pong.set_version(env!("CARGO_PKG_VERSION"));
 
         Ok(())
+    }
+}
+
+/// Handle a single incoming connection: set up Cap'n Proto RPC with the authenticator.
+pub async fn handle_connection(
+    stream: tokio::net::TcpStream,
+    peer_ip: IpAddr,
+    config: Rc<AgentConfig>,
+    rate_limits: Rc<RefCell<HashMap<IpAddr, RateLimitState>>>,
+    concurrency_guard: Rc<ConcurrencyGuard>,
+    agent_start_time: Instant,
+) -> Result<()> {
+    stream.set_nodelay(true)?;
+    let stream = stream.compat();
+    let (reader, writer) = stream.split();
+
+    let network = capnp_rpc::twoparty::VatNetwork::new(
+        futures::io::BufReader::new(reader),
+        futures::io::BufWriter::new(writer),
+        capnp_rpc::rpc_twoparty_capnp::Side::Server,
+        Default::default(),
+    );
+
+    let authenticator = AuthenticatorImpl::new(
+        config,
+        peer_ip,
+        rate_limits,
+        concurrency_guard,
+        agent_start_time,
+    );
+    let auth_client: authenticator::Client = capnp_rpc::new_client(authenticator);
+
+    let rpc_system = capnp_rpc::RpcSystem::new(Box::new(network), Some(auth_client.client));
+
+    rpc_system.await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrency_guard_acquire_and_release() {
+        let guard = Rc::new(ConcurrencyGuard::new(2));
+        let p1 = guard.try_acquire();
+        assert!(p1.is_some());
+        let p2 = guard.try_acquire();
+        assert!(p2.is_some());
+        // At max — should fail
+        assert!(guard.try_acquire().is_none());
+        // Drop one permit
+        drop(p1);
+        // Now should succeed
+        assert!(guard.try_acquire().is_some());
+    }
+
+    #[test]
+    fn concurrency_guard_raii_drop() {
+        let guard = Rc::new(ConcurrencyGuard::new(1));
+        {
+            let _permit = guard.try_acquire().unwrap();
+            assert!(guard.try_acquire().is_none());
+        }
+        // Permit dropped — slot freed
+        assert!(guard.try_acquire().is_some());
+    }
+
+    #[test]
+    fn concurrency_guard_zero_max() {
+        let guard = Rc::new(ConcurrencyGuard::new(0));
+        assert!(guard.try_acquire().is_none());
     }
 }

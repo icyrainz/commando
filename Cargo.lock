@@ -309,6 +309,7 @@ dependencies = [
  "capnp",
  "capnp-rpc",
  "clap",
+ "commando-agent",
  "commando-common",
  "futures",
  "reqwest",

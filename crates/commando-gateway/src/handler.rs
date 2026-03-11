@@ -456,9 +456,8 @@ mod tests {
         assert!(!limiter.try_acquire("host-b"));
     }
 
-    #[tokio::test]
-    async fn dispatch_returns_none_for_notifications() {
-        let config = Arc::new(crate::config::GatewayConfig {
+    fn test_config() -> Arc<GatewayConfig> {
+        Arc::new(GatewayConfig {
             server: Default::default(),
             proxmox: crate::config::ProxmoxConfig {
                 nodes: vec![],
@@ -475,7 +474,231 @@ mod tests {
                 psk: Default::default(),
             },
             targets: vec![],
+        })
+    }
+
+    fn test_config_with_target() -> Arc<GatewayConfig> {
+        let mut psk = std::collections::HashMap::new();
+        psk.insert("my-box".to_string(), "secret123".to_string());
+        Arc::new(GatewayConfig {
+            server: Default::default(),
+            proxmox: crate::config::ProxmoxConfig {
+                nodes: vec![],
+                user: String::new(),
+                token_id: String::new(),
+                token_secret: String::new(),
+                discovery_interval_secs: 60,
+            },
+            agent: crate::config::AgentConnectionConfig {
+                default_port: 9876,
+                default_timeout_secs: 60,
+                connect_timeout_secs: 5,
+                max_concurrent_per_target: 4,
+                psk,
+            },
+            targets: vec![],
+        })
+    }
+
+    fn registry_with_target() -> Arc<Mutex<Registry>> {
+        let targets = vec![crate::registry::ManualTargetInput {
+            name: "my-box".to_string(),
+            host: "10.0.0.5".to_string(),
+            port: 9876,
+            shell: "bash".to_string(),
+            tags: vec!["test".to_string()],
+        }];
+        Arc::new(Mutex::new(Registry::from_manual(targets)))
+    }
+
+    #[tokio::test]
+    async fn exec_missing_target_param() {
+        let config = test_config();
+        let registry = Arc::new(Mutex::new(Registry::new()));
+        let limiter = Arc::new(ConcurrencyLimiter::new(4));
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "commando_exec",
+                "arguments": { "command": "echo hi" }
+            }
         });
+        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("missing required parameter: target"));
+    }
+
+    #[tokio::test]
+    async fn exec_unknown_target() {
+        let config = test_config();
+        let registry = Arc::new(Mutex::new(Registry::new()));
+        let limiter = Arc::new(ConcurrencyLimiter::new(4));
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "commando_exec",
+                "arguments": { "target": "nonexistent", "command": "echo hi" }
+            }
+        });
+        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("unknown target"));
+    }
+
+    #[tokio::test]
+    async fn exec_no_psk_configured() {
+        // Target exists in registry but no PSK in config
+        let config = test_config(); // no PSKs
+        let registry = registry_with_target();
+        let limiter = Arc::new(ConcurrencyLimiter::new(4));
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "commando_exec",
+                "arguments": { "target": "my-box", "command": "echo hi" }
+            }
+        });
+        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("no PSK configured"));
+    }
+
+    #[tokio::test]
+    async fn exec_concurrency_limit_reached() {
+        let config = test_config_with_target();
+        let registry = registry_with_target();
+        let limiter = Arc::new(ConcurrencyLimiter::new(1));
+
+        // Exhaust the limiter
+        assert!(limiter.try_acquire("my-box"));
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "commando_exec",
+                "arguments": { "target": "my-box", "command": "echo hi" }
+            }
+        });
+        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("concurrency limit"));
+    }
+
+    #[tokio::test]
+    async fn list_with_targets() {
+        let config = test_config();
+        let registry = registry_with_target();
+        let limiter = Arc::new(ConcurrencyLimiter::new(4));
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "commando_list",
+                "arguments": {}
+            }
+        });
+        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("my-box"));
+        assert!(text.contains("10.0.0.5"));
+    }
+
+    #[tokio::test]
+    async fn list_with_filter() {
+        let config = test_config();
+        let registry = registry_with_target();
+        let limiter = Arc::new(ConcurrencyLimiter::new(4));
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "commando_list",
+                "arguments": { "filter": "nonexistent" }
+            }
+        });
+        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("my-box"));
+    }
+
+    #[tokio::test]
+    async fn ping_missing_target() {
+        let config = test_config();
+        let registry = Arc::new(Mutex::new(Registry::new()));
+        let limiter = Arc::new(ConcurrencyLimiter::new(4));
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "commando_ping",
+                "arguments": { "target": "nonexistent" }
+            }
+        });
+        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("unknown target"));
+    }
+
+    #[tokio::test]
+    async fn ping_no_psk() {
+        let config = test_config(); // no PSKs
+        let registry = registry_with_target();
+        let limiter = Arc::new(ConcurrencyLimiter::new(4));
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "commando_ping",
+                "arguments": { "target": "my-box" }
+            }
+        });
+        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("no PSK configured"));
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_returns_error() {
+        let config = test_config();
+        let registry = Arc::new(Mutex::new(Registry::new()));
+        let limiter = Arc::new(ConcurrencyLimiter::new(4));
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "nonexistent_tool",
+                "arguments": {}
+            }
+        });
+        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("Unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_none_for_notifications() {
+        let config = test_config();
         let registry = Arc::new(Mutex::new(Registry::new()));
         let limiter = Arc::new(ConcurrencyLimiter::new(4));
 

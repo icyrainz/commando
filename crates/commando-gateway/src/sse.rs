@@ -40,19 +40,24 @@ struct MessageQuery {
     session_id: String,
 }
 
-pub async fn run_sse_server(
+/// Build the Axum router and spawn the RPC worker that bridges axum handlers
+/// to the LocalSet where Cap'n Proto RPC lives.
+///
+/// Returns `(Router, WorkSender)`. The caller must ensure the RPC worker
+/// task (spawned via `spawn_local`) stays alive for the router to function.
+pub fn build_app(
     config: Arc<GatewayConfig>,
     registry: Arc<Mutex<Registry>>,
     limiter: Arc<handler::ConcurrencyLimiter>,
-) -> Result<()> {
+) -> Router {
     let (work_tx, mut work_rx) = tokio::sync::mpsc::channel::<WorkItem>(64);
 
     // RPC worker: runs inside LocalSet, processes JSON-RPC requests concurrently.
     // axum::serve dispatches handlers via tokio::spawn (outside LocalSet),
     // so handlers send work here via the channel to bridge the !Send gap.
-    let worker_config = config.clone();
-    let worker_registry = registry.clone();
-    let worker_limiter = limiter.clone();
+    let worker_config = config;
+    let worker_registry = registry;
+    let worker_limiter = limiter;
     tokio::task::spawn_local(async move {
         while let Some(item) = work_rx.recv().await {
             let cfg = worker_config.clone();
@@ -71,13 +76,21 @@ pub async fn run_sse_server(
         work_tx,
     };
 
-    let app = Router::new()
+    Router::new()
         .route("/sse", get(handle_sse))
         .route("/messages", post(handle_message))
         .route("/health", get(handle_health))
-        .with_state(state);
+        .with_state(state)
+}
 
+pub async fn run_sse_server(
+    config: Arc<GatewayConfig>,
+    registry: Arc<Mutex<Registry>>,
+    limiter: Arc<handler::ConcurrencyLimiter>,
+) -> Result<()> {
     let addr = format!("{}:{}", config.server.bind, config.server.port);
+    let app = build_app(config, registry, limiter);
+
     let listener = TcpListener::bind(&addr).await?;
     info!(addr = %addr, "SSE server listening");
 

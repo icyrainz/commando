@@ -1,20 +1,14 @@
-mod config;
-mod process;
-mod rpc;
-
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use anyhow::Result;
 use clap::Parser;
-use futures::AsyncReadExt;
 use tokio::net::TcpListener;
-use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{info, warn};
 
-use commando_common::commando_capnp::authenticator;
-use rpc::{AuthenticatorImpl, ConcurrencyGuard};
+use commando_agent::config;
+use commando_agent::rpc::{self, ConcurrencyGuard};
 
 #[derive(Parser)]
 #[command(name = "commando-agent", about = "Commando command execution agent")]
@@ -82,7 +76,7 @@ async fn run_server(config: Rc<config::AgentConfig>) -> Result<()> {
         let concurrency_guard = concurrency_guard.clone();
 
         tokio::task::spawn_local(async move {
-            if let Err(e) = handle_connection(
+            if let Err(e) = rpc::handle_connection(
                 stream,
                 peer_addr.ip(),
                 config,
@@ -97,40 +91,4 @@ async fn run_server(config: Rc<config::AgentConfig>) -> Result<()> {
             info!(peer = %peer_addr, "connection closed");
         });
     }
-}
-
-async fn handle_connection(
-    stream: tokio::net::TcpStream,
-    peer_ip: std::net::IpAddr,
-    config: Rc<config::AgentConfig>,
-    rate_limits: Rc<RefCell<HashMap<std::net::IpAddr, rpc::RateLimitState>>>,
-    concurrency_guard: Rc<ConcurrencyGuard>,
-    agent_start_time: std::time::Instant,
-) -> Result<()> {
-    stream.set_nodelay(true)?;
-    let stream = stream.compat();
-    let (reader, writer) = stream.split();
-
-    let network = capnp_rpc::twoparty::VatNetwork::new(
-        futures::io::BufReader::new(reader),
-        futures::io::BufWriter::new(writer),
-        capnp_rpc::rpc_twoparty_capnp::Side::Server,
-        Default::default(),
-    );
-
-    let authenticator = AuthenticatorImpl::new(
-        config,
-        peer_ip,
-        rate_limits,
-        concurrency_guard,
-        agent_start_time,
-    );
-    let auth_client: authenticator::Client =
-        capnp_rpc::new_client(authenticator);
-
-    let rpc_system =
-        capnp_rpc::RpcSystem::new(Box::new(network), Some(auth_client.client));
-
-    rpc_system.await?;
-    Ok(())
 }
