@@ -357,7 +357,7 @@ Streamable HTTP transport (recommended — persistent service, no SSH):
 {
   "mcpServers": {
     "commando": {
-      "type": "streamable-http",
+      "type": "http",
       "url": "http://gateway-host:9877/mcp"
     }
   }
