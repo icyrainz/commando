@@ -373,6 +373,24 @@ async fn handle_ping(
     }
 }
 
+/// Send-safe wrapper around `dispatch_request` that runs the `!Send` future
+/// on the current `LocalSet` via `spawn_local`. Returns `None` for notifications.
+/// This is needed because axum handlers must return `Send` futures, but
+/// `dispatch_request` is `!Send` due to capnp-rpc types.
+pub async fn dispatch_request_send(
+    request: Value,
+    config: Arc<GatewayConfig>,
+    registry: Arc<Mutex<Registry>>,
+    limiter: Arc<ConcurrencyLimiter>,
+) -> Option<Value> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_local(async move {
+        let result = dispatch_request(&request, &config, &registry, &limiter).await;
+        let _ = tx.send(result);
+    });
+    rx.await.unwrap_or(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

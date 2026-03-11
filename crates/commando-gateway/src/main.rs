@@ -4,6 +4,7 @@ mod mcp;
 mod proxmox;
 mod registry;
 mod rpc;
+mod sse;
 
 use std::sync::{Arc, Mutex};
 
