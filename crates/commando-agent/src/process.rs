@@ -1,4 +1,5 @@
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -70,33 +71,46 @@ pub async fn execute(
     let mut stdout_handle = child.stdout.take().unwrap();
     let mut stderr_handle = child.stderr.take().unwrap();
 
-    // Read stdout and stderr concurrently, with a timeout.
-    // child is NOT moved into this future so we retain ownership for cleanup.
-    let io_future = async {
+    // Shared buffers: the inner clones are moved into the future; the outer
+    // handles remain here so the timeout branch can read partial output after
+    // the future is dropped.
+    let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+
+    let stdout_buf_clone = stdout_buf.clone();
+    let stderr_buf_clone = stderr_buf.clone();
+
+    let read_and_wait = async move {
         let (stdout_res, stderr_res) = tokio::join!(
             async {
                 let mut buf = Vec::new();
-                stdout_handle.read_to_end(&mut buf).await.map(|_| buf)
+                let res = stdout_handle.read_to_end(&mut buf).await;
+                *stdout_buf_clone.lock().unwrap() = buf;
+                res
             },
             async {
                 let mut buf = Vec::new();
-                stderr_handle.read_to_end(&mut buf).await.map(|_| buf)
+                let res = stderr_handle.read_to_end(&mut buf).await;
+                *stderr_buf_clone.lock().unwrap() = buf;
+                res
             },
         );
-        match (stdout_res, stderr_res) {
-            (Ok(out), Ok(err)) => Ok::<_, std::io::Error>((out, err)),
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        }
+        stdout_res?;
+        stderr_res?;
+        let status = child.wait().await?;
+        Ok::<_, anyhow::Error>(status)
     };
 
-    match timeout(Duration::from_secs(timeout_secs.into()), io_future).await {
-        Ok(Ok((stdout_raw, stderr_raw))) => {
-            // I/O completed within timeout; reap the child
-            let status = child.wait().await?;
-            let duration_ms = start.elapsed().as_millis() as u64;
+    let result = timeout(Duration::from_secs(timeout_secs.into()), read_and_wait).await;
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(Ok(status)) => {
+            let stdout = stdout_buf.lock().unwrap().clone();
+            let stderr = stderr_buf.lock().unwrap().clone();
             let exit_code = status.code().unwrap_or(-1);
             let (stdout, stderr, truncated) =
-                truncate_output(stdout_raw, stderr_raw, opts.max_output_bytes);
+                truncate_output(stdout, stderr, opts.max_output_bytes);
             Ok(ExecResult {
                 stdout,
                 stderr,
@@ -106,30 +120,25 @@ pub async fn execute(
                 truncated,
             })
         }
-        Ok(Err(e)) => Err(e.into()),
+        Ok(Err(e)) => Err(e),
         Err(_elapsed) => {
-            // Timeout — kill the process group (SIGTERM first)
+            // Timeout — kill the process group. child was moved into
+            // read_and_wait which is now dropped, so we use libc directly.
             kill_process_group(pid);
+            kill_process_group_force(pid);
 
-            // Grace period: wait up to 5s for SIGTERM to take effect
-            let grace = timeout(Duration::from_secs(5), child.wait()).await;
-            if grace.is_err() {
-                // Still alive after 5s, force-kill
-                kill_process_group_force(pid);
-                let _ = child.wait().await;
-            }
-
-            let duration_ms = start.elapsed().as_millis() as u64;
-
-            // Output was not captured (io_future was dropped on timeout);
-            // return empty buffers marked as timed_out.
+            // Read whatever partial output was written before the drop.
+            let stdout = stdout_buf.lock().unwrap().clone();
+            let stderr = stderr_buf.lock().unwrap().clone();
+            let (stdout, stderr, truncated) =
+                truncate_output(stdout, stderr, opts.max_output_bytes);
             Ok(ExecResult {
-                stdout: Vec::new(),
-                stderr: Vec::new(),
+                stdout,
+                stderr,
                 exit_code: 137, // SIGKILL convention
                 duration_ms,
                 timed_out: true,
-                truncated: false,
+                truncated,
             })
         }
     }
