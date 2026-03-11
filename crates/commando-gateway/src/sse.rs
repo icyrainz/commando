@@ -21,12 +21,18 @@ use crate::registry::Registry;
 type SseEvent = std::result::Result<Event, Infallible>;
 type SessionMap = Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<String>>>>;
 
+/// Work item sent from axum handlers (outside LocalSet) to the RPC worker (inside LocalSet).
+struct WorkItem {
+    request: Value,
+    response_tx: tokio::sync::oneshot::Sender<Option<Value>>,
+}
+
+type WorkSender = tokio::sync::mpsc::Sender<WorkItem>;
+
 #[derive(Clone)]
 struct AppState {
-    config: Arc<GatewayConfig>,
-    registry: Arc<Mutex<Registry>>,
-    limiter: Arc<handler::ConcurrencyLimiter>,
     sessions: SessionMap,
+    work_tx: WorkSender,
 }
 
 #[derive(Deserialize)]
@@ -39,11 +45,30 @@ pub async fn run_sse_server(
     registry: Arc<Mutex<Registry>>,
     limiter: Arc<handler::ConcurrencyLimiter>,
 ) -> Result<()> {
+    let (work_tx, mut work_rx) = tokio::sync::mpsc::channel::<WorkItem>(64);
+
+    // RPC worker: runs inside LocalSet, processes JSON-RPC requests concurrently.
+    // axum::serve dispatches handlers via tokio::spawn (outside LocalSet),
+    // so handlers send work here via the channel to bridge the !Send gap.
+    let worker_config = config.clone();
+    let worker_registry = registry.clone();
+    let worker_limiter = limiter.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(item) = work_rx.recv().await {
+            let cfg = worker_config.clone();
+            let reg = worker_registry.clone();
+            let lim = worker_limiter.clone();
+            tokio::task::spawn_local(async move {
+                let result =
+                    handler::dispatch_request(&item.request, &cfg, &reg, &lim).await;
+                let _ = item.response_tx.send(result);
+            });
+        }
+    });
+
     let state = AppState {
-        config: config.clone(),
-        registry,
-        limiter,
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        work_tx,
     };
 
     let app = Router::new()
@@ -90,8 +115,8 @@ async fn handle_sse(State(state): State<AppState>) -> impl IntoResponse {
     let sessions = state.sessions.clone();
     let sid = session_id.clone();
 
-    tokio::task::spawn_local(async move {
-        // Send the initial endpoint event
+    // tokio::spawn (not spawn_local) — only shuffles strings, no !Send types
+    tokio::spawn(async move {
         let endpoint_event = Event::default()
             .event("endpoint")
             .data(format!("/messages?session_id={sid}"));
@@ -100,7 +125,6 @@ async fn handle_sse(State(state): State<AppState>) -> impl IntoResponse {
             return;
         }
 
-        // Forward messages from msg_rx as SSE "message" events
         while let Some(data) = msg_rx.recv().await {
             let event = Event::default().event("message").data(data);
             if tx.send(Ok(event)).await.is_err() {
@@ -108,9 +132,11 @@ async fn handle_sse(State(state): State<AppState>) -> impl IntoResponse {
             }
         }
 
-        // Client disconnected — clean up session
         sessions.lock().unwrap().remove(&sid);
+        info!(session_id = %sid, "SSE session closed");
     });
+
+    info!(session_id = %session_id, "SSE session opened");
 
     Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
 }
@@ -152,14 +178,30 @@ async fn handle_message(
         }
     };
 
-    if let Some(response) = handler::dispatch_request_send(
-        request,
-        state.config.clone(),
-        state.registry.clone(),
-        state.limiter.clone(),
-    )
-    .await
+    // Notifications (no id) — acknowledge without dispatching
+    if request.get("id").is_none() || request["id"].is_null() {
+        return axum::http::StatusCode::ACCEPTED.into_response();
+    }
+
+    // Send to the LocalSet worker via channel and await response
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    if state
+        .work_tx
+        .send(WorkItem {
+            request,
+            response_tx,
+        })
+        .await
+        .is_err()
     {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Worker unavailable",
+        )
+            .into_response();
+    }
+
+    if let Ok(Some(response)) = response_rx.await {
         let json_str = serde_json::to_string(&response).unwrap_or_default();
         if sender.send(json_str).await.is_err() {
             state.sessions.lock().unwrap().remove(&query.session_id);
