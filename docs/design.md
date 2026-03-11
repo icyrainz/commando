@@ -49,7 +49,7 @@ One shell layer. Done.
 |-----------|-----------|-----|
 | Language | Rust | Performance, safety, fun |
 | RPC | Cap'n Proto | Zero-copy deserialization, typed schemas, built-in RPC |
-| MCP | JSON-RPC over stdio | Standard Claude Code MCP protocol |
+| MCP | JSON-RPC over SSE (HTTP) or stdio | Standard Claude Code MCP protocol |
 | Build | Cargo workspace (monorepo) | Two binary targets from one repo |
 | Target | `x86_64-unknown-linux-musl` | Static binaries, no runtime deps |
 
@@ -58,16 +58,16 @@ One shell layer. Done.
 ```
 Claude Code (any workstation)
     │
-    │ SSH stdio (MCP JSON-RPC)
+    │ HTTP/SSE (MCP JSON-RPC) — or stdio for local dev
     │
     ▼
 ┌─────────────────────────────────┐
 │  Commando Gateway               │
-│  (any always-on host)           │
+│  (persistent service on LXC)    │
 │                                 │
 │  ┌───────────┐  ┌────────────┐  │
-│  │ MCP Server│  │  Registry  │  │
-│  │ (stdio)   │──│            │  │
+│  │ SSE Server│  │  Registry  │  │
+│  │ (axum)    │──│            │  │
 │  └───────────┘  │ - Proxmox  │  │
 │       │         │   auto-disc│  │
 │       │         │ - TOML     │  │
@@ -351,24 +351,34 @@ tags = ["gpu", "desktop"]
 ```
 
 **MCP server configuration** (added to any Claude Code instance that needs homelab access):
+
+SSE transport (recommended — persistent service, no SSH):
 ```json
 {
   "mcpServers": {
     "commando": {
-      "command": "ssh",
-      "args": [
-        "-o", "ServerAliveInterval=15",
-        "-o", "ServerAliveCountMax=3",
-        "root@gateway-host",
-        "/usr/local/bin/commando-gateway",
-        "--config", "/etc/commando/gateway.toml"
-      ]
+      "type": "sse",
+      "url": "http://gateway-host:9877/sse"
     }
   }
 }
 ```
 
-**Gateway lifecycle:** Claude Code launches the gateway binary on-demand via SSH. The process lives for the duration of the SSH connection — when Claude Code disconnects (restart, network blip), the gateway process exits. On reconnect, Claude Code launches a fresh gateway instance which re-discovers targets within its first poll cycle (~60s). This is simple and stateless. No systemd service is needed for the gateway. The gateway can run on any always-on host — a dedicated LXC, a Proxmox host, or an existing utility machine. The only requirements are network access to agents (TCP 9876) and Proxmox API (HTTPS 8006). For redundancy, deploy the gateway binary to multiple hosts and configure separate MCP server entries in Claude Code — the gateway is stateless, so any instance can serve any request.
+Stdio transport (local development/testing):
+```json
+{
+  "mcpServers": {
+    "commando": {
+      "command": "commando-gateway",
+      "args": ["--config", "/etc/commando/gateway.toml"]
+    }
+  }
+}
+```
+
+**Gateway lifecycle:** The gateway runs as a persistent service (Docker container or systemd unit) on a dedicated LXC. Claude Code connects via HTTP/SSE — no SSH tunnel required. The gateway survives Claude Code restarts and maintains a warm registry. Multiple Claude Code sessions connect to the same gateway instance. The only requirements are network access to agents (TCP 9876) and Proxmox API (HTTPS 8006).
+
+For stdio transport, Claude Code launches the gateway on-demand. The process lives for the duration of the session — useful for local development but not recommended for production.
 
 ## Authentication
 
@@ -428,7 +438,9 @@ commando/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── main.rs           # Gateway binary entry point
-│   │       ├── mcp.rs            # MCP server (stdio JSON-RPC)
+│   │       ├── handler.rs        # MCP dispatch logic (shared by stdio + SSE)
+│   │       ├── mcp.rs            # Stdio transport (JSON-RPC over stdin/stdout)
+│   │       ├── sse.rs            # SSE transport (HTTP server via axum)
 │   │       ├── registry.rs       # Target registry (discovery + manual targets)
 │   │       ├── proxmox.rs        # Proxmox API client
 │   │       └── rpc.rs            # Cap'n Proto RPC client to agents
@@ -457,6 +469,8 @@ commando/
 | `reqwest` | HTTP client for Proxmox API |
 | `hmac`, `sha2` | HMAC-SHA256 for challenge-response auth |
 | `rand` | Nonce generation for auth challenges |
+| `axum` | HTTP server for SSE transport |
+| `tokio-stream` | Stream adapter for SSE events |
 | `tracing`, `tracing-subscriber` | Structured logging (JSON output for Loki ingestion) |
 
 ## Deployment Plan
@@ -503,7 +517,6 @@ For non-LXC machines (e.g., desktops, bare-metal servers), deploy manually via `
 ## Future Enhancements (Not in Scope)
 
 - **TLS transport:** Wrap agent connections in TLS via `tokio-rustls` for encrypted-on-the-wire security — eliminates plaintext PSK and command visibility concerns
-- **Persistent gateway:** Run the gateway as a systemd service with a Unix socket stdio bridge, so it survives SSH disconnects and maintains a warm registry, connection pool, and audit log across Claude Code sessions
 - **Connection pooling:** Persistent connections with multiplexing for lower latency on high-frequency operations
 - **Streaming output:** Cap'n Proto streaming for long-running commands — important for UX on commands that take minutes
 - **Per-caller authorization:** Role-based permissions when multiple clients connect (beyond single Claude Code instance)
