@@ -49,7 +49,7 @@ One shell layer. Done.
 |-----------|-----------|-----|
 | Language | Rust | Performance, safety, fun |
 | RPC | Cap'n Proto | Zero-copy deserialization, typed schemas, built-in RPC |
-| MCP | JSON-RPC over SSE (HTTP) or stdio | Standard Claude Code MCP protocol |
+| MCP | JSON-RPC over Streamable HTTP or stdio | Standard Claude Code MCP protocol |
 | Build | Cargo workspace (monorepo) | Two binary targets from one repo |
 | Target | `x86_64-unknown-linux-musl` | Static binaries, no runtime deps |
 
@@ -58,7 +58,7 @@ One shell layer. Done.
 ```
 Claude Code (any workstation)
     │
-    │ HTTP/SSE (MCP JSON-RPC) — or stdio for local dev
+    │ Streamable HTTP (MCP JSON-RPC) — or stdio for local dev
     │
     ▼
 ┌─────────────────────────────────┐
@@ -66,8 +66,8 @@ Claude Code (any workstation)
 │  (persistent service on LXC)    │
 │                                 │
 │  ┌───────────┐  ┌────────────┐  │
-│  │ SSE Server│  │  Registry  │  │
-│  │ (axum)    │──│            │  │
+│  │ Streamable│  │  Registry  │  │
+│  │ HTTP(axum)│──│            │  │
 │  └───────────┘  │ - Proxmox  │  │
 │       │         │   auto-disc│  │
 │       │         │ - TOML     │  │
@@ -352,13 +352,13 @@ tags = ["gpu", "desktop"]
 
 **MCP server configuration** (added to any Claude Code instance that needs homelab access):
 
-SSE transport (recommended — persistent service, no SSH):
+Streamable HTTP transport (recommended — persistent service, no SSH):
 ```json
 {
   "mcpServers": {
     "commando": {
-      "type": "sse",
-      "url": "http://gateway-host:9877/sse"
+      "type": "streamable-http",
+      "url": "http://gateway-host:9877/mcp"
     }
   }
 }
@@ -376,7 +376,7 @@ Stdio transport (local development/testing):
 }
 ```
 
-**Gateway lifecycle:** The gateway runs as a persistent service (Docker container or systemd unit) on a dedicated LXC. Claude Code connects via HTTP/SSE — no SSH tunnel required. The gateway survives Claude Code restarts and maintains a warm registry. Multiple Claude Code sessions connect to the same gateway instance. The only requirements are network access to agents (TCP 9876) and Proxmox API (HTTPS 8006).
+**Gateway lifecycle:** The gateway runs as a persistent service (Docker container or systemd unit) on a dedicated LXC. Claude Code connects via Streamable HTTP — no SSH tunnel required. The gateway survives Claude Code restarts and maintains a warm registry. Multiple Claude Code sessions connect to the same gateway instance. The only requirements are network access to agents (TCP 9876) and Proxmox API (HTTPS 8006).
 
 For stdio transport, Claude Code launches the gateway on-demand. The process lives for the duration of the session — useful for local development but not recommended for production.
 
@@ -438,9 +438,9 @@ commando/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── main.rs           # Gateway binary entry point
-│   │       ├── handler.rs        # MCP dispatch logic (shared by stdio + SSE)
+│   │       ├── handler.rs        # MCP dispatch logic (shared by stdio + streamable-http)
 │   │       ├── mcp.rs            # Stdio transport (JSON-RPC over stdin/stdout)
-│   │       ├── sse.rs            # SSE transport (HTTP server via axum)
+│   │       ├── streamable.rs     # Streamable HTTP transport (HTTP server via axum)
 │   │       ├── registry.rs       # Target registry (discovery + manual targets)
 │   │       ├── proxmox.rs        # Proxmox API client
 │   │       └── rpc.rs            # Cap'n Proto RPC client to agents
@@ -469,8 +469,7 @@ commando/
 | `reqwest` | HTTP client for Proxmox API |
 | `hmac`, `sha2` | HMAC-SHA256 for challenge-response auth |
 | `rand` | Nonce generation for auth challenges |
-| `axum` | HTTP server for SSE transport |
-| `tokio-stream` | Stream adapter for SSE events |
+| `axum` | HTTP server for Streamable HTTP transport |
 | `tracing`, `tracing-subscriber` | Structured logging (JSON output for Loki ingestion) |
 
 ## Deployment Plan

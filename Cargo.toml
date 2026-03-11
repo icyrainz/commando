@@ -21,4 +21,3 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 anyhow = "1"
 thiserror = "2"
 axum = "0.8"
-tokio-stream = "0.1"

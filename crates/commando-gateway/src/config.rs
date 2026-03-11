@@ -75,7 +75,7 @@ impl Default for ServerConfig {
     }
 }
 
-fn default_transport() -> String { "sse".to_string() }
+fn default_transport() -> String { "streamable-http".to_string() }
 fn default_bind() -> String { "0.0.0.0".to_string() }
 fn default_server_port() -> u16 { 9877 }
 
@@ -144,7 +144,7 @@ tags = ["gpu", "desktop"]
     fn parse_config_with_server_section() {
         let toml_str = r#"
 [server]
-transport = "sse"
+transport = "streamable-http"
 bind = "127.0.0.1"
 port = 9877
 
@@ -159,7 +159,7 @@ token_secret = "xxxx"
 [agent.psk]
 "#;
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.server.transport, "sse");
+        assert_eq!(config.server.transport, "streamable-http");
         assert_eq!(config.server.bind, "127.0.0.1");
         assert_eq!(config.server.port, 9877);
     }
@@ -178,7 +178,7 @@ token_secret = "xxxx"
 [agent.psk]
 "#;
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.server.transport, "sse");
+        assert_eq!(config.server.transport, "streamable-http");
         assert_eq!(config.server.bind, "0.0.0.0");
         assert_eq!(config.server.port, 9877);
     }

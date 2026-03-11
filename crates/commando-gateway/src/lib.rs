@@ -4,4 +4,4 @@ pub mod mcp;
 pub mod proxmox;
 pub mod registry;
 pub mod rpc;
-pub mod sse;
+pub mod streamable;

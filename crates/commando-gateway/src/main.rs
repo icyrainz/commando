@@ -10,7 +10,7 @@ use commando_gateway::mcp;
 use commando_gateway::proxmox;
 use commando_gateway::registry::{self, DiscoveredTarget, Registry};
 use commando_gateway::rpc;
-use commando_gateway::sse;
+use commando_gateway::streamable;
 
 #[derive(Parser)]
 #[command(name = "commando-gateway", about = "Commando MCP gateway")]
@@ -18,15 +18,15 @@ struct Cli {
     #[arg(long, default_value = "/etc/commando/gateway.toml")]
     config: std::path::PathBuf,
 
-    /// MCP transport: "sse" or "stdio"
+    /// MCP transport: "streamable-http" or "stdio"
     #[arg(long)]
     transport: Option<String>,
 
-    /// HTTP bind address (SSE only)
+    /// HTTP bind address (streamable-http only)
     #[arg(long)]
     bind: Option<String>,
 
-    /// HTTP port (SSE only)
+    /// HTTP port (streamable-http only)
     #[arg(long)]
     port: Option<u16>,
 }
@@ -143,8 +143,8 @@ async fn run_gateway(config: Arc<config::GatewayConfig>) -> Result<()> {
     // Run MCP server on selected transport
     match config.server.transport.as_str() {
         "stdio" => mcp::run_stdio_loop(config, registry, limiter).await,
-        "sse" => sse::run_sse_server(config, registry, limiter).await,
-        other => anyhow::bail!("unknown transport: {other} (expected 'stdio' or 'sse')"),
+        "streamable-http" => streamable::run_streamable_server(config, registry, limiter).await,
+        other => anyhow::bail!("unknown transport: {other} (expected 'stdio' or 'streamable-http')"),
     }
 }
 
