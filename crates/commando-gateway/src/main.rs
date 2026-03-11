@@ -1,4 +1,5 @@
 mod config;
+mod mcp;
 mod proxmox;
 mod registry;
 mod rpc;

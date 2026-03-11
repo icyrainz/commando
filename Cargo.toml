@@ -10,7 +10,7 @@ license = "MIT"
 [workspace.dependencies]
 capnp = "0.25"
 capnp-rpc = "0.25"
-tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros", "signal", "process"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "io-std", "time", "macros", "signal", "process"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
