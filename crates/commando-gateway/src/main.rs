@@ -19,11 +19,36 @@ use registry::{DiscoveredTarget, Registry};
 struct Cli {
     #[arg(long, default_value = "/etc/commando/gateway.toml")]
     config: std::path::PathBuf,
+
+    /// MCP transport: "sse" or "stdio"
+    #[arg(long)]
+    transport: Option<String>,
+
+    /// HTTP bind address (SSE only)
+    #[arg(long)]
+    bind: Option<String>,
+
+    /// HTTP port (SSE only)
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Arc::new(config::GatewayConfig::load(&cli.config)?);
+    let mut config = config::GatewayConfig::load(&cli.config)?;
+
+    // CLI overrides for server settings
+    if let Some(transport) = &cli.transport {
+        config.server.transport = transport.clone();
+    }
+    if let Some(bind) = &cli.bind {
+        config.server.bind = bind.clone();
+    }
+    if let Some(port) = cli.port {
+        config.server.port = port;
+    }
+
+    let config = Arc::new(config);
 
     // Structured JSON logging to stderr (stdout is for MCP protocol)
     tracing_subscriber::fmt()
@@ -39,6 +64,7 @@ fn main() -> Result<()> {
     info!(
         proxmox_nodes = config.proxmox.nodes.len(),
         manual_targets = config.targets.len(),
+        transport = %config.server.transport,
         "starting commando-gateway v{}",
         env!("CARGO_PKG_VERSION"),
     );
@@ -116,8 +142,12 @@ async fn run_gateway(config: Arc<config::GatewayConfig>) -> Result<()> {
         });
     }
 
-    // Run MCP server on stdio
-    mcp::run_stdio_loop(config, registry, limiter).await
+    // Run MCP server on selected transport
+    match config.server.transport.as_str() {
+        "stdio" => mcp::run_stdio_loop(config, registry, limiter).await,
+        "sse" => sse::run_sse_server(config, registry, limiter).await,
+        other => anyhow::bail!("unknown transport: {other} (expected 'stdio' or 'sse')"),
+    }
 }
 
 async fn run_discovery_cycle(
