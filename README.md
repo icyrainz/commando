@@ -107,47 +107,158 @@ List all registered targets with status, shell, tags, and reachability.
 
 Health check a specific agent. Returns hostname, uptime, shell, and version.
 
-## Releases
+## Getting Started
 
-CI builds on tagged releases (`v*`) and publishes:
-- **Gateway Docker image** → `ghcr.io/icyrainz/commando-gateway:latest`
-- **Agent binary** → GitHub release asset (`commando-agent-x86_64-linux`)
+### Prerequisites
 
-### Deploy Gateway
+- A Linux host for the gateway (LXC, VM, or bare metal) with Docker
+- SSH access to target machines (for agent deployment)
+- (Optional) Proxmox cluster for auto-discovery
 
-The gateway runs as a Docker container. After a release:
+### Step 1: Deploy the Gateway
+
+The gateway runs as a Docker container. On your gateway host:
 
 ```bash
-./deploy/deploy-gateway.sh          # pull latest, restart
-./deploy/deploy-gateway.sh v0.2.0   # deploy specific version
+# Create config directory
+mkdir -p /etc/commando
+
+# Create gateway config (edit values for your setup)
+cat > /etc/commando/gateway.toml << 'EOF'
+[server]
+transport = "sse"
+bind = "0.0.0.0"
+port = 9877
+
+# Optional: Proxmox auto-discovery (remove if not using Proxmox)
+[proxmox]
+nodes = []
+user = "root@pam"
+token_id = "commando"
+token_secret = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+[agent]
+default_port = 9876
+default_timeout_secs = 60
+connect_timeout_secs = 5
+max_concurrent_per_target = 4
+
+# PSKs are added here as you deploy agents (step 2)
+[agent.psk]
+EOF
+chmod 600 /etc/commando/gateway.toml
+
+# Create docker-compose.yml
+mkdir -p ~/docker-app
+cat > ~/docker-app/docker-compose.yml << 'EOF'
+services:
+  commando-gateway:
+    image: ghcr.io/icyrainz/commando-gateway:latest
+    container_name: commando-gateway
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /etc/commando:/etc/commando:ro
+    command: ["--config", "/etc/commando/gateway.toml"]
+EOF
+
+# Start the gateway
+cd ~/docker-app && docker compose up -d
 ```
 
-### Deploy Agents
-
-First-time setup (generates PSKs, installs systemd service):
+Verify it's running:
 
 ```bash
+curl http://localhost:9877/health
+# {"status":"ok"}
+```
+
+### Step 2: Deploy Agents to Target Machines
+
+Each target machine needs the agent binary, a config with a unique PSK, and a systemd service.
+
+**Option A: Automated (Proxmox LXCs)**
+
+```bash
+# From a machine with SSH access to Proxmox nodes
 ./deploy/deploy-agents.sh akio-lab akio-garage
 ```
 
-Update existing agents to the latest release:
+This pushes the agent to all running LXCs, generates PSKs, and prints them for you to add to `gateway.toml`.
+
+**Option B: Manual (any Linux machine)**
 
 ```bash
-./deploy/update-agents.sh akio-lab akio-garage
-COMMANDO_VERSION=v0.2.0 ./deploy/update-agents.sh akio-lab  # pin version
+# 1. Download the agent binary
+curl -fSL -o /usr/local/bin/commando-agent \
+  https://github.com/icyrainz/commando/releases/latest/download/commando-agent-x86_64-linux
+chmod +x /usr/local/bin/commando-agent
+
+# 2. Generate a unique PSK for this agent
+PSK=$(openssl rand -hex 32)
+echo "PSK: $PSK"  # save this — you'll need it for gateway.toml
+
+# 3. Create agent config
+mkdir -p /etc/commando
+cat > /etc/commando/agent.toml << EOF
+bind = "0.0.0.0"
+port = 9876
+shell = "bash"           # or "fish", "sh"
+psk = "$PSK"
+max_output_bytes = 131072
+max_concurrent = 8
+EOF
+chmod 600 /etc/commando/agent.toml
+
+# 4. Install systemd service
+cat > /etc/systemd/system/commando-agent.service << 'EOF'
+[Unit]
+Description=Commando Agent
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/commando-agent --config /etc/commando/agent.toml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now commando-agent
 ```
 
-### Building from Source
+### Step 3: Register the Agent in the Gateway
+
+Add the agent's PSK and target entry to the gateway config:
 
 ```bash
-cargo build --release --target x86_64-unknown-linux-musl
+# On the gateway host, edit /etc/commando/gateway.toml:
+
+# Add the PSK (under [agent.psk])
+[agent.psk]
+my-target = "the-psk-from-step-2"
+
+# Add a manual target entry (under [[targets]])
+[[targets]]
+name = "my-target"
+host = "192.168.1.50"     # IP or hostname of the target machine
+port = 9876
+shell = "bash"
+tags = ["web", "docker"]  # optional, for filtering with commando_list
 ```
 
-Requires: `sudo apt install capnproto musl-tools`
+Restart the gateway to pick up the new config:
 
-## Setup
+```bash
+cd ~/docker-app && docker compose restart
+```
 
-### Claude Code MCP Config
+### Step 4: Connect Claude Code
+
+Add the MCP server to your Claude Code config (`~/.claude.json`):
 
 ```json
 {
@@ -160,54 +271,52 @@ Requires: `sudo apt install capnproto musl-tools`
 }
 ```
 
-### Gateway Configuration
+Restart Claude Code. You should now see `commando_exec`, `commando_list`, and `commando_ping` as available tools.
 
-```toml
-# /etc/commando/gateway.toml
+### Verify
 
-[server]
-transport = "sse"    # "sse" (default) or "stdio"
-bind = "0.0.0.0"
-port = 9877
-
-[proxmox]
-nodes = [
-    { name = "node-1", host = "192.168.1.10", port = 8006 },
-]
-user = "root@pam"
-token_id = "commando"
-token_secret = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-
-[agent]
-default_port = 9876
-default_timeout_secs = 60
-connect_timeout_secs = 5
-max_concurrent_per_target = 4
-
-[agent.psk]
-"node-1/my-app" = "output-of-openssl-rand-hex-32"
-my-desktop = "output-of-openssl-rand-hex-32"
-
-[[targets]]
-name = "my-desktop"
-host = "my-desktop"
-port = 9876
-shell = "fish"
-tags = ["gpu", "desktop"]
+```
+commando_list()                                          # see all targets
+commando_ping(target="my-target")                        # health check
+commando_exec(target="my-target", command="hostname")    # run a command
 ```
 
-### Agent Configuration
+## Updating
 
-```toml
-# /etc/commando/agent.toml
+CI builds on tagged releases (`v*`) and publishes:
+- **Gateway Docker image** → `ghcr.io/icyrainz/commando-gateway:latest`
+- **Agent binary** → GitHub release asset (`commando-agent-x86_64-linux`)
 
-bind = "0.0.0.0"
-port = 9876
-shell = "bash"
-psk = "per-agent-unique-key"
+### Update Gateway
+
+```bash
+./deploy/deploy-gateway.sh          # pull latest, restart
+./deploy/deploy-gateway.sh v0.2.0   # deploy specific version
+
+# Or manually:
+cd ~/docker-app && docker compose pull && docker compose up -d
 ```
 
-Generate PSKs with: `openssl rand -hex 32`
+### Update Agents
+
+```bash
+./deploy/update-agents.sh akio-lab akio-garage
+COMMANDO_VERSION=v0.2.0 ./deploy/update-agents.sh akio-lab  # pin version
+
+# Or manually on each target:
+curl -fSL -o /usr/local/bin/commando-agent \
+  https://github.com/icyrainz/commando/releases/latest/download/commando-agent-x86_64-linux
+chmod +x /usr/local/bin/commando-agent
+systemctl restart commando-agent
+```
+
+### Building from Source
+
+```bash
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+Requires: `sudo apt install capnproto musl-tools`
 
 ## Security
 
