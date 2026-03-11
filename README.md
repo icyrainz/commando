@@ -17,7 +17,7 @@ Each layer (local shell → SSH → pct exec → bash -c) interprets quotes, mak
 Commando relays commands through MCP (JSON-RPC) and Cap'n Proto (binary serialization) — neither interprets the string as shell. Only one shell on the target ever touches the command.
 
 ```
-commando_exec(target="akio-ntfy", command="echo \"hello world\" | grep \"hello\"")
+commando_exec(target="my-server", command="echo \"hello world\" | grep \"hello\"")
 ```
 
 One shell layer. Done.
@@ -181,7 +181,7 @@ Each target machine needs the agent binary, a config with a unique PSK, and a sy
 
 ```bash
 # From a machine with SSH access to Proxmox nodes
-./deploy/deploy-agents.sh akio-lab akio-garage
+./deploy/deploy-agents.sh pve-node-1 pve-node-2
 ```
 
 This pushes the agent to all running LXCs, generates PSKs, and prints them for you to add to `gateway.toml`.
@@ -300,8 +300,8 @@ cd ~/docker-app && docker compose pull && docker compose up -d
 ### Update Agents
 
 ```bash
-./deploy/update-agents.sh akio-lab akio-garage
-COMMANDO_VERSION=v0.2.0 ./deploy/update-agents.sh akio-lab  # pin version
+./deploy/update-agents.sh pve-node-1 pve-node-2
+COMMANDO_VERSION=v0.2.0 ./deploy/update-agents.sh pve-node-1  # pin version
 
 # Or manually on each target:
 curl -fSL -o /usr/local/bin/commando-agent \
