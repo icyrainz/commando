@@ -1,0 +1,31 @@
+# Commando Gateway Configuration
+# Copy to /etc/commando/gateway.toml and set chmod 600 root:root
+
+[proxmox]
+nodes = [
+    { name = "node-1", host = "192.168.1.10", port = 8006 },
+]
+user = "root@pam"
+token_id = "commando"
+token_secret = "REPLACE_WITH_PROXMOX_API_TOKEN"
+discovery_interval_secs = 60
+
+[agent]
+default_port = 9876
+default_timeout_secs = 60
+connect_timeout_secs = 5
+max_concurrent_per_target = 4
+
+[agent.psk]
+# Auto-discovered LXCs use "node-name/hostname" keys
+# "node-1/my-app" = "output-of-openssl-rand-hex-32"
+
+# Manual targets use plain names
+# my-desktop = "output-of-openssl-rand-hex-32"
+
+# [[targets]]
+# name = "my-desktop"
+# host = "my-desktop"
+# port = 9876
+# shell = "fish"
+# tags = ["gpu", "desktop"]
