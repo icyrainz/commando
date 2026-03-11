@@ -57,7 +57,7 @@ pub async fn execute(
     cmd.stderr(Stdio::piped());
 
     // Place child in its own process group via setsid()
-    // Safety: setsid() is async-signal-safe and appropriate in pre_exec
+    // Safety: safe to call post-fork in pre_exec as the process is single-threaded at that point
     unsafe {
         cmd.pre_exec(|| {
             libc::setsid();
@@ -71,9 +71,9 @@ pub async fn execute(
     let mut stdout_handle = child.stdout.take().unwrap();
     let mut stderr_handle = child.stderr.take().unwrap();
 
-    // Shared buffers: the inner clones are moved into the future; the outer
-    // handles remain here so the timeout branch can read partial output after
-    // the future is dropped.
+    // Shared buffers written incrementally so partial output is available on
+    // timeout: each read() call appends directly to the shared buffer, meaning
+    // the outer Arc holds whatever arrived before the future was dropped.
     let stdout_buf = Arc::new(Mutex::new(Vec::new()));
     let stderr_buf = Arc::new(Mutex::new(Vec::new()));
 
@@ -81,22 +81,28 @@ pub async fn execute(
     let stderr_buf_clone = stderr_buf.clone();
 
     let read_and_wait = async move {
-        let (stdout_res, stderr_res) = tokio::join!(
+        tokio::join!(
             async {
-                let mut buf = Vec::new();
-                let res = stdout_handle.read_to_end(&mut buf).await;
-                *stdout_buf_clone.lock().unwrap() = buf;
-                res
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match stdout_handle.read(&mut chunk).await {
+                        Ok(0) => break,
+                        Ok(n) => stdout_buf_clone.lock().unwrap().extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    }
+                }
             },
             async {
-                let mut buf = Vec::new();
-                let res = stderr_handle.read_to_end(&mut buf).await;
-                *stderr_buf_clone.lock().unwrap() = buf;
-                res
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match stderr_handle.read(&mut chunk).await {
+                        Ok(0) => break,
+                        Ok(n) => stderr_buf_clone.lock().unwrap().extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    }
+                }
             },
         );
-        stdout_res?;
-        stderr_res?;
         let status = child.wait().await?;
         Ok::<_, anyhow::Error>(status)
     };
@@ -122,9 +128,10 @@ pub async fn execute(
         }
         Ok(Err(e)) => Err(e),
         Err(_elapsed) => {
-            // Timeout — kill the process group. child was moved into
-            // read_and_wait which is now dropped, so we use libc directly.
+            // Timeout — SIGTERM first, then wait 5 s grace period, then SIGKILL.
+            // child was moved into read_and_wait (now dropped) so we use libc directly.
             kill_process_group(pid);
+            tokio::time::sleep(Duration::from_secs(5)).await;
             kill_process_group_force(pid);
 
             // Read whatever partial output was written before the drop.
@@ -154,12 +161,12 @@ fn truncate_output(
 
     if stdout.len() > max_bytes {
         let start = stdout.len() - max_bytes;
-        stdout = stdout[start..].to_vec();
+        stdout.drain(0..start);
         truncated = true;
     }
     if stderr.len() > max_bytes {
         let start = stderr.len() - max_bytes;
-        stderr = stderr[start..].to_vec();
+        stderr.drain(0..start);
         truncated = true;
     }
 
@@ -260,7 +267,7 @@ mod tests {
     async fn exec_timeout() {
         let result = execute("sleep 30", "", 1, &[], &default_opts()).await.unwrap();
         assert!(result.timed_out);
-        assert_ne!(result.exit_code, 0);
+        assert_eq!(result.exit_code, 137);
     }
 
     #[tokio::test]
