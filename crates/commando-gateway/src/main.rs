@@ -4,6 +4,198 @@ mod proxmox;
 mod registry;
 mod rpc;
 
-fn main() {
-    println!("commando-gateway");
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use anyhow::Result;
+use clap::Parser;
+use tracing::{error, info, warn};
+
+use registry::{DiscoveredTarget, Registry};
+
+#[derive(Parser)]
+#[command(name = "commando-gateway", about = "Commando MCP gateway")]
+struct Cli {
+    #[arg(long, default_value = "/etc/commando/gateway.toml")]
+    config: std::path::PathBuf,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let config = Rc::new(config::GatewayConfig::load(&cli.config)?);
+
+    // Structured JSON logging to stderr (stdout is for MCP protocol)
+    tracing_subscriber::fmt()
+        .json()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("commando_gateway=info".parse().unwrap()),
+        )
+        .with_target(false)
+        .init();
+
+    info!(
+        proxmox_nodes = config.proxmox.nodes.len(),
+        manual_targets = config.targets.len(),
+        "starting commando-gateway v{}",
+        env!("CARGO_PKG_VERSION"),
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, run_gateway(config))
+}
+
+async fn run_gateway(config: Rc<config::GatewayConfig>) -> Result<()> {
+    // Build initial registry from manual targets
+    let manual_inputs: Vec<registry::ManualTargetInput> = config
+        .targets
+        .iter()
+        .map(|t| registry::ManualTargetInput {
+            name: t.name.clone(),
+            host: t.host.clone(),
+            port: t.port,
+            shell: t.shell.clone(),
+            tags: t.tags.clone(),
+        })
+        .collect();
+
+    let registry = Rc::new(RefCell::new(Registry::from_manual(manual_inputs)));
+
+    // Try to load cached registry
+    let cache_path = std::path::Path::new("/var/lib/commando/registry.json");
+    if cache_path.exists() {
+        match std::fs::read_to_string(cache_path) {
+            Ok(json) => match Registry::from_cache_json(&json) {
+                Ok(cached) => {
+                    let discovered: Vec<DiscoveredTarget> = cached
+                        .targets
+                        .values()
+                        .filter(|t| t.source == registry::TargetSource::Discovered)
+                        .map(|t| DiscoveredTarget {
+                            name: t.name.clone(),
+                            host: t.host.clone(),
+                            port: t.port,
+                            status: t.status.clone(),
+                        })
+                        .collect();
+                    registry.borrow_mut().update_discovered(discovered);
+                    info!("loaded cached registry from disk");
+                }
+                Err(e) => warn!(error = %e, "failed to parse cached registry"),
+            },
+            Err(e) => warn!(error = %e, "failed to read registry cache"),
+        }
+    } else if !config.proxmox.nodes.is_empty() {
+        info!("no registry cache, running initial discovery");
+        run_discovery_cycle(&config, &registry).await;
+    }
+
+    let limiter = Rc::new(mcp::ConcurrencyLimiter::new(
+        config.agent.max_concurrent_per_target,
+    ));
+
+    // Spawn background discovery loop
+    if !config.proxmox.nodes.is_empty() {
+        let config_clone = config.clone();
+        let registry_clone = registry.clone();
+        tokio::task::spawn_local(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                config_clone.proxmox.discovery_interval_secs,
+            ));
+            interval.tick().await; // Skip immediate first tick
+            loop {
+                interval.tick().await;
+                run_discovery_cycle(&config_clone, &registry_clone).await;
+            }
+        });
+    }
+
+    // Run MCP server on stdio
+    mcp::run_mcp_loop(config, registry, limiter).await
+}
+
+async fn run_discovery_cycle(
+    config: &config::GatewayConfig,
+    registry: &Rc<RefCell<Registry>>,
+) {
+    let http_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true) // Proxmox uses self-signed certs
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+
+    let mut all_discovered = Vec::new();
+
+    for node in &config.proxmox.nodes {
+        match proxmox::discover_node(&http_client, node, &config.proxmox, config.agent.default_port).await {
+            Ok(targets) => {
+                info!(node = %node.name, count = targets.len(), "discovered LXC targets");
+                all_discovered.extend(targets);
+            }
+            Err(e) => {
+                error!(node = %node.name, error = %e, "Proxmox discovery failed");
+            }
+        }
+    }
+
+    registry.borrow_mut().update_discovered(all_discovered);
+
+    // Ping all targets with PSKs to check reachability
+    let targets_to_ping: Vec<(String, String, u16, String)> = {
+        let reg = registry.borrow();
+        reg.targets
+            .values()
+            .filter_map(|t| {
+                config.agent.psk.get(&t.name)
+                    .map(|psk| (t.name.clone(), t.host.clone(), t.port, psk.clone()))
+            })
+            .collect()
+    };
+
+    let ping_futures: Vec<_> = targets_to_ping
+        .iter()
+        .map(|(name, host, port, psk)| {
+            let name = name.clone();
+            let host = host.clone();
+            let port = *port;
+            let psk = psk.clone();
+            let connect_timeout = config.agent.connect_timeout_secs;
+            async move {
+                let reachable = rpc::remote_ping(&host, port, &psk, connect_timeout).await.is_ok();
+                (name, reachable)
+            }
+        })
+        .collect();
+
+    let ping_results = futures::future::join_all(ping_futures).await;
+    {
+        let mut reg = registry.borrow_mut();
+        for (name, reachable) in ping_results {
+            reg.set_reachable(
+                &name,
+                if reachable { registry::Reachability::Reachable } else { registry::Reachability::Unreachable },
+            );
+        }
+    }
+
+    // Save cache to disk
+    let cache_dir = std::path::Path::new("/var/lib/commando");
+    if let Err(e) = std::fs::create_dir_all(cache_dir) {
+        warn!(error = %e, "failed to create cache directory");
+        return;
+    }
+    let cache_path = cache_dir.join("registry.json");
+    match registry.borrow().to_cache_json() {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&cache_path, json) {
+                warn!(error = %e, "failed to write registry cache");
+            }
+        }
+        Err(e) => warn!(error = %e, "failed to serialize registry cache"),
+    }
 }
