@@ -107,6 +107,44 @@ List all registered targets with status, shell, tags, and reachability.
 
 Health check a specific agent. Returns hostname, uptime, shell, and version.
 
+## Releases
+
+CI builds on tagged releases (`v*`) and publishes:
+- **Gateway Docker image** → `ghcr.io/icyrainz/commando-gateway:latest`
+- **Agent binary** → GitHub release asset (`commando-agent-x86_64-linux`)
+
+### Deploy Gateway
+
+The gateway runs as a Docker container. After a release:
+
+```bash
+./deploy/deploy-gateway.sh          # pull latest, restart
+./deploy/deploy-gateway.sh v0.2.0   # deploy specific version
+```
+
+### Deploy Agents
+
+First-time setup (generates PSKs, installs systemd service):
+
+```bash
+./deploy/deploy-agents.sh akio-lab akio-garage
+```
+
+Update existing agents to the latest release:
+
+```bash
+./deploy/update-agents.sh akio-lab akio-garage
+COMMANDO_VERSION=v0.2.0 ./deploy/update-agents.sh akio-lab  # pin version
+```
+
+### Building from Source
+
+```bash
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+Requires: `sudo apt install capnproto musl-tools`
+
 ## Setup
 
 ### Claude Code MCP Config
@@ -121,21 +159,6 @@ Health check a specific agent. Returns hostname, uptime, shell, and version.
   }
 }
 ```
-
-### Build
-
-```bash
-cargo build --release
-```
-
-For static musl binaries (deployment):
-
-```bash
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
-```
-
-Requires `capnproto` system package: `sudo apt install capnproto`
 
 ### Gateway Configuration
 
