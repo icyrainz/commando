@@ -1,5 +1,6 @@
 mod config;
 mod process;
+mod rpc;
 
 use clap::Parser;
 use std::path::PathBuf;
