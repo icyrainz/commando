@@ -2,15 +2,7 @@ use anyhow::Result;
 use serde::Deserialize;
 
 use crate::config::ProxmoxConfig;
-
-// Forward declare DiscoveredTarget here (it will be defined in registry.rs later,
-// but for now we define it locally since registry doesn't exist yet)
-pub struct DiscoveredTarget {
-    pub name: String,
-    pub host: String,
-    pub port: u16,
-    pub status: String,
-}
+pub use crate::registry::DiscoveredTarget;
 
 #[derive(Debug, Deserialize)]
 struct ProxmoxResponse<T> {
