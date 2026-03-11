@@ -1,6 +1,12 @@
 # Commando Gateway Configuration
 # Copy to /etc/commando/gateway.toml and set chmod 600 root:root
 
+# MCP server transport: "sse" (HTTP, default) or "stdio" (stdin/stdout)
+# [server]
+# transport = "sse"
+# bind = "0.0.0.0"
+# port = 9877
+
 [proxmox]
 nodes = [
     { name = "node-1", host = "192.168.1.10", port = 8006 },

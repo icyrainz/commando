@@ -3,6 +3,8 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayConfig {
+    #[serde(default)]
+    pub server: ServerConfig,
     pub proxmox: ProxmoxConfig,
     pub agent: AgentConnectionConfig,
     #[serde(default)]
@@ -52,6 +54,30 @@ pub struct ManualTarget {
     #[serde(default)]
     pub tags: Vec<String>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    #[serde(default = "default_bind")]
+    pub bind: String,
+    #[serde(default = "default_server_port")]
+    pub port: u16,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            transport: default_transport(),
+            bind: default_bind(),
+            port: default_server_port(),
+        }
+    }
+}
+
+fn default_transport() -> String { "sse".to_string() }
+fn default_bind() -> String { "0.0.0.0".to_string() }
+fn default_server_port() -> u16 { 9877 }
 
 fn default_discovery_interval() -> u64 { 60 }
 fn default_proxmox_port() -> u16 { 8006 }
@@ -112,6 +138,49 @@ tags = ["gpu", "desktop"]
         assert_eq!(config.targets.len(), 1);
         assert_eq!(config.targets[0].name, "my-desktop");
         assert_eq!(config.targets[0].tags, vec!["gpu", "desktop"]);
+    }
+
+    #[test]
+    fn parse_config_with_server_section() {
+        let toml_str = r#"
+[server]
+transport = "sse"
+bind = "127.0.0.1"
+port = 9877
+
+[proxmox]
+nodes = []
+user = "root@pam"
+token_id = "commando"
+token_secret = "xxxx"
+
+[agent]
+
+[agent.psk]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.server.transport, "sse");
+        assert_eq!(config.server.bind, "127.0.0.1");
+        assert_eq!(config.server.port, 9877);
+    }
+
+    #[test]
+    fn server_section_defaults() {
+        let toml_str = r#"
+[proxmox]
+nodes = []
+user = "root@pam"
+token_id = "commando"
+token_secret = "xxxx"
+
+[agent]
+
+[agent.psk]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.server.transport, "sse");
+        assert_eq!(config.server.bind, "0.0.0.0");
+        assert_eq!(config.server.port, 9877);
     }
 
     #[test]
