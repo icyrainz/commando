@@ -1,11 +1,11 @@
 mod config;
+mod handler;
 mod mcp;
 mod proxmox;
 mod registry;
 mod rpc;
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use clap::Parser;
@@ -22,7 +22,7 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Rc::new(config::GatewayConfig::load(&cli.config)?);
+    let config = Arc::new(config::GatewayConfig::load(&cli.config)?);
 
     // Structured JSON logging to stderr (stdout is for MCP protocol)
     tracing_subscriber::fmt()
@@ -50,7 +50,7 @@ fn main() -> Result<()> {
     local.block_on(&rt, run_gateway(config))
 }
 
-async fn run_gateway(config: Rc<config::GatewayConfig>) -> Result<()> {
+async fn run_gateway(config: Arc<config::GatewayConfig>) -> Result<()> {
     // Build initial registry from manual targets
     let manual_inputs: Vec<registry::ManualTargetInput> = config
         .targets
@@ -64,7 +64,7 @@ async fn run_gateway(config: Rc<config::GatewayConfig>) -> Result<()> {
         })
         .collect();
 
-    let registry = Rc::new(RefCell::new(Registry::from_manual(manual_inputs)));
+    let registry = Arc::new(Mutex::new(Registry::from_manual(manual_inputs)));
 
     // Try to load cached registry
     let cache_path = std::path::Path::new("/var/lib/commando/registry.json");
@@ -83,7 +83,7 @@ async fn run_gateway(config: Rc<config::GatewayConfig>) -> Result<()> {
                             status: t.status.clone(),
                         })
                         .collect();
-                    registry.borrow_mut().update_discovered(discovered);
+                    registry.lock().unwrap().update_discovered(discovered);
                     info!("loaded cached registry from disk");
                 }
                 Err(e) => warn!(error = %e, "failed to parse cached registry"),
@@ -95,7 +95,7 @@ async fn run_gateway(config: Rc<config::GatewayConfig>) -> Result<()> {
         run_discovery_cycle(&config, &registry).await;
     }
 
-    let limiter = Rc::new(mcp::ConcurrencyLimiter::new(
+    let limiter = Arc::new(handler::ConcurrencyLimiter::new(
         config.agent.max_concurrent_per_target,
     ));
 
@@ -116,12 +116,12 @@ async fn run_gateway(config: Rc<config::GatewayConfig>) -> Result<()> {
     }
 
     // Run MCP server on stdio
-    mcp::run_mcp_loop(config, registry, limiter).await
+    mcp::run_stdio_loop(config, registry, limiter).await
 }
 
 async fn run_discovery_cycle(
     config: &config::GatewayConfig,
-    registry: &Rc<RefCell<Registry>>,
+    registry: &Arc<Mutex<Registry>>,
 ) {
     let http_client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true) // Proxmox uses self-signed certs
@@ -143,11 +143,11 @@ async fn run_discovery_cycle(
         }
     }
 
-    registry.borrow_mut().update_discovered(all_discovered);
+    registry.lock().unwrap().update_discovered(all_discovered);
 
     // Ping all targets with PSKs to check reachability
     let targets_to_ping: Vec<(String, String, u16, String)> = {
-        let reg = registry.borrow();
+        let reg = registry.lock().unwrap();
         reg.targets
             .values()
             .filter_map(|t| {
@@ -174,7 +174,7 @@ async fn run_discovery_cycle(
 
     let ping_results = futures::future::join_all(ping_futures).await;
     {
-        let mut reg = registry.borrow_mut();
+        let mut reg = registry.lock().unwrap();
         for (name, reachable) in ping_results {
             reg.set_reachable(
                 &name,
@@ -190,7 +190,7 @@ async fn run_discovery_cycle(
         return;
     }
     let cache_path = cache_dir.join("registry.json");
-    match registry.borrow().to_cache_json() {
+    match registry.lock().unwrap().to_cache_json() {
         Ok(json) => {
             if let Err(e) = std::fs::write(&cache_path, json) {
                 warn!(error = %e, "failed to write registry cache");
