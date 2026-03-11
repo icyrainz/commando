@@ -1,1 +1,1 @@
-// Modules will be added as they are implemented.
+capnp::generated_code!(pub mod commando_capnp);
