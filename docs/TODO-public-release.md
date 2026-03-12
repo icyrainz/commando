@@ -6,9 +6,6 @@ Last verified: 2026-03-12
 
 ## Still Open
 
-### Gateway has zero auth
-The `/mcp` HTTP endpoint accepts any request with no token, API key, or IP allowlist. Anyone who can reach port 9877 gets arbitrary command execution on all agents as root. At minimum, add a bearer token / API key check.
-
 ### No TLS between gateway and agents
 Commands and stdout/stderr are plaintext on the wire. HMAC protects the PSK during auth, but command output (which may contain secrets) is visible to anyone sniffing the LAN. Consider optional TLS or document the threat model clearly.
 
@@ -30,6 +27,7 @@ PSKs are generated in deploy scripts and printed to stdout for copy-paste into `
 - ~~Stopped LXCs vanish from commando_list~~ — stopped LXCs show in list with status, exec returns clear error
 - ~~Output truncation is silent~~ — `[output truncated]` message appended when truncation occurs
 - ~~Registry cache path hardcoded~~ — `--cache-dir` CLI flag added, configurable in gateway.toml
+- ~~Gateway has zero auth~~ — Bearer token auth on `/mcp` endpoint via `COMMANDO_API_KEY` env var, constant-time comparison, `/health` stays open
 
 ## What's Already Good (keep these)
 
