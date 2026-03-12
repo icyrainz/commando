@@ -103,11 +103,17 @@ connect_timeout_secs = 5
 EOF
 chmod 600 /etc/commando/gateway.toml
 
-# Download and start
+# Generate an API key for MCP endpoint authentication
+API_KEY=$(openssl rand -hex 32)
+echo "Your API key: $API_KEY"
+
+# Download and start (set COMMANDO_API_KEY in docker-compose.yml or env)
 curl -fSL -o docker-compose.yml \
   https://raw.githubusercontent.com/icyrainz/commando/main/docker-compose.yml
-docker compose up -d
+COMMANDO_API_KEY=$API_KEY docker compose up -d
 ```
+
+The `COMMANDO_API_KEY` environment variable is **required** — the gateway refuses to start without it. Save this key; you'll need it to configure your AI agent.
 
 Verify: `curl http://localhost:9877/health` → `{"status":"ok"}`
 
@@ -146,17 +152,26 @@ To pin a version: `curl -sL ... | COMMANDO_VERSION=v0.3.2 bash`
 
 ### 3. Connect Your AI Agent
 
-Add the MCP server to Claude Code (`~/.claude.json`):
+Add the MCP server to Claude Code (`~/.claude.json`), using the API key from step 1:
 
 ```json
 {
   "mcpServers": {
     "commando": {
       "type": "http",
-      "url": "http://gateway-host:9877/mcp"
+      "url": "http://gateway-host:9877/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_API_KEY"
+      }
     }
   }
 }
+```
+
+Or via CLI:
+```bash
+claude mcp add commando --transport http --url http://gateway-host:9877/mcp \
+  --header "Authorization: Bearer YOUR_API_KEY"
 ```
 
 Your agent now has three tools:
@@ -217,7 +232,8 @@ cd ~/docker-app && docker compose pull && docker compose up -d
 
 ## Security
 
-- **HMAC challenge-response** — PSKs never cross the wire
+- **Bearer token auth** — MCP endpoint requires `Authorization: Bearer <key>` (constant-time comparison). `/health` stays open.
+- **HMAC challenge-response** — Agent PSKs never cross the wire
 - **Per-agent PSKs** — compromised agent only exposes itself, not the fleet
 - **Capability-based access** — Cap'n Proto type system enforces auth before exec
 - **Trusted LAN only** — no TLS (commands/output are plaintext on the wire)
