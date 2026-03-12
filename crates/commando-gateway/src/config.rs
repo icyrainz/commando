@@ -58,7 +58,7 @@ pub struct ManualTarget {
     pub tags: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_transport")]
     pub transport: String,
@@ -66,6 +66,21 @@ pub struct ServerConfig {
     pub bind: String,
     #[serde(default = "default_server_port")]
     pub port: u16,
+    /// API key for bearer token auth on the /mcp endpoint.
+    /// Can also be set via COMMANDO_API_KEY env var (takes precedence).
+    /// Required for streamable-http transport.
+    pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("transport", &self.transport)
+            .field("bind", &self.bind)
+            .field("port", &self.port)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl Default for ServerConfig {
@@ -74,6 +89,7 @@ impl Default for ServerConfig {
             transport: default_transport(),
             bind: default_bind(),
             port: default_server_port(),
+            api_key: None,
         }
     }
 }

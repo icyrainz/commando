@@ -2,9 +2,12 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use axum::Router;
+use axum::extract::Request;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use serde_json::{Value, json};
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -33,6 +36,7 @@ pub fn build_app(
     limiter: Arc<handler::ConcurrencyLimiter>,
 ) -> Router {
     let (work_tx, mut work_rx) = tokio::sync::mpsc::channel::<WorkItem>(64);
+    let api_key = Arc::new(config.server.api_key.clone().unwrap_or_default());
 
     // RPC worker: runs inside LocalSet, processes JSON-RPC requests.
     // axum::serve dispatches handlers via tokio::spawn (outside LocalSet),
@@ -48,16 +52,22 @@ pub fn build_app(
             });
         }
     });
-
     let state = AppState { work_tx };
 
-    Router::new()
+    let mcp_routes = Router::new()
         .route(
             "/mcp",
             post(handle_post).get(handle_get).delete(handle_delete),
         )
+        .layer(middleware::from_fn_with_state(
+            api_key,
+            bearer_auth_middleware,
+        ))
+        .with_state(state);
+
+    Router::new()
+        .merge(mcp_routes)
         .route("/health", get(handle_health))
-        .with_state(state)
 }
 
 pub async fn run_streamable_server(
@@ -88,6 +98,38 @@ pub async fn run_streamable_server(
         .await?;
 
     Ok(())
+}
+
+async fn bearer_auth_middleware(
+    axum::extract::State(api_key): axum::extract::State<Arc<String>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let auth_header = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    let token = match auth_header {
+        Some(h) if h.starts_with("Bearer ") => &h[7..],
+        _ => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "unauthorized"})),
+            )
+                .into_response();
+        }
+    };
+
+    if token.as_bytes().ct_eq(api_key.as_bytes()).into() {
+        next.run(request).await
+    } else {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        )
+            .into_response()
+    }
 }
 
 async fn handle_post(

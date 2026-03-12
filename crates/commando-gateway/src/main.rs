@@ -53,6 +53,21 @@ fn main() -> Result<()> {
         config.cache_dir = cache_dir.clone();
     }
 
+    // COMMANDO_API_KEY env var overrides config file
+    if let Ok(env_key) = std::env::var("COMMANDO_API_KEY") {
+        if !env_key.is_empty() {
+            config.server.api_key = Some(env_key);
+        }
+    }
+
+    // Require API key for streamable-http transport
+    if config.server.transport == "streamable-http" && config.server.api_key.is_none() {
+        anyhow::bail!(
+            "API key required for streamable-http transport. \
+             Set COMMANDO_API_KEY env var or api_key in [server] config."
+        );
+    }
+
     let config = Arc::new(config);
 
     // Structured JSON logging to stderr (stdout is for MCP protocol)

@@ -4,14 +4,16 @@ Zero-escaping command relay for homelab. See `docs/design.md` for full design.
 
 ## Build
 
+Requires Rust nightly (edition 2024):
+
 ```bash
-cargo build --release
+cargo +nightly build --release
 ```
 
 For static musl binaries (deployment):
 ```bash
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
+rustup target add x86_64-unknown-linux-musl --toolchain nightly
+cargo +nightly build --release --target x86_64-unknown-linux-musl
 ```
 
 Requires `capnproto` system package: `sudo apt install capnproto`
@@ -19,7 +21,7 @@ Requires `capnproto` system package: `sudo apt install capnproto`
 ## Test
 
 ```bash
-cargo test
+cargo +nightly test
 ```
 
 ## Architecture

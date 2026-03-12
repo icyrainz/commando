@@ -10,12 +10,15 @@ use commando_gateway::handler::ConcurrencyLimiter;
 use commando_gateway::registry::Registry;
 use commando_gateway::streamable;
 
+const TEST_API_KEY: &str = "test-secret-key-12345";
+
 fn test_config() -> Arc<GatewayConfig> {
     Arc::new(GatewayConfig {
         server: ServerConfig {
             transport: "streamable-http".to_string(),
             bind: "127.0.0.1".to_string(),
             port: 0,
+            api_key: Some(TEST_API_KEY.to_string()),
         },
         proxmox: None,
         agent: AgentConnectionConfig {
@@ -46,6 +49,10 @@ async fn start_server() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+fn auth_header() -> String {
+    format!("Bearer {TEST_API_KEY}")
+}
+
 fn run_local<F: std::future::Future<Output = ()>>(f: F) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -74,6 +81,7 @@ fn post_initialize_returns_json() {
         let resp = client
             .post(format!("{base}/mcp"))
             .header("Content-Type", "application/json")
+            .header("Authorization", auth_header())
             .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
             .send()
             .await
@@ -93,6 +101,7 @@ fn post_notification_returns_202() {
         let resp = client
             .post(format!("{base}/mcp"))
             .header("Content-Type", "application/json")
+            .header("Authorization", auth_header())
             .body(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
             .send()
             .await
@@ -109,6 +118,7 @@ fn post_invalid_json_returns_parse_error() {
         let resp = client
             .post(format!("{base}/mcp"))
             .header("Content-Type", "application/json")
+            .header("Authorization", auth_header())
             .body("not json {{{")
             .send()
             .await
@@ -127,6 +137,7 @@ fn post_batch_request_returns_error() {
         let resp = client
             .post(format!("{base}/mcp"))
             .header("Content-Type", "application/json")
+            .header("Authorization", auth_header())
             .body(r#"[{"jsonrpc":"2.0","id":1,"method":"initialize"}]"#)
             .send()
             .await
@@ -142,7 +153,13 @@ fn post_batch_request_returns_error() {
 fn get_mcp_returns_405() {
     run_local(async {
         let base = start_server().await;
-        let resp = reqwest::get(format!("{base}/mcp")).await.unwrap();
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{base}/mcp"))
+            .header("Authorization", auth_header())
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 405);
     });
 }
@@ -152,7 +169,12 @@ fn delete_mcp_returns_405() {
     run_local(async {
         let base = start_server().await;
         let client = reqwest::Client::new();
-        let resp = client.delete(format!("{base}/mcp")).send().await.unwrap();
+        let resp = client
+            .delete(format!("{base}/mcp"))
+            .header("Authorization", auth_header())
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 405);
     });
 }
@@ -165,6 +187,7 @@ fn post_unknown_method_returns_error() {
         let resp = client
             .post(format!("{base}/mcp"))
             .header("Content-Type", "application/json")
+            .header("Authorization", auth_header())
             .body(r#"{"jsonrpc":"2.0","id":1,"method":"nonexistent/method"}"#)
             .send()
             .await
@@ -172,5 +195,47 @@ fn post_unknown_method_returns_error() {
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["error"]["code"], -32601);
+    });
+}
+
+#[test]
+fn mcp_without_auth_returns_401() {
+    run_local(async {
+        let base = start_server().await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base}/mcp"))
+            .header("Content-Type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    });
+}
+
+#[test]
+fn mcp_with_wrong_token_returns_401() {
+    run_local(async {
+        let base = start_server().await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base}/mcp"))
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer wrong-key")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    });
+}
+
+#[test]
+fn health_does_not_require_auth() {
+    run_local(async {
+        let base = start_server().await;
+        let resp = reqwest::get(format!("{base}/health")).await.unwrap();
+        assert_eq!(resp.status(), 200);
     });
 }
