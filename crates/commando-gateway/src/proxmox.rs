@@ -61,7 +61,18 @@ pub async fn discover_node(
     let mut targets = Vec::new();
 
     for lxc in &lxc_list.data {
-        // Get interfaces for IP discovery
+        if lxc.status != "running" {
+            // Stopped/paused LXCs have no guest agent — skip the interface lookup
+            targets.push(DiscoveredTarget {
+                name: format!("{}/{}", node.name, lxc.name),
+                host: "".to_string(),
+                port: default_port,
+                status: lxc.status.clone(),
+            });
+            continue;
+        }
+
+        // Get interfaces for IP discovery (running LXCs only)
         let iface_url = format!(
             "{}/nodes/{}/lxc/{}/interfaces",
             base_url, node.name, lxc.vmid

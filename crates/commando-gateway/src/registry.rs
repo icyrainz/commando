@@ -265,6 +265,30 @@ mod tests {
     }
 
     #[test]
+    fn stopped_target_visible_in_list() {
+        let mut registry = Registry::new();
+        registry.update_discovered(vec![
+            DiscoveredTarget {
+                name: "node-1/running-app".to_string(),
+                host: "10.0.0.1".to_string(),
+                port: 9876,
+                status: "running".to_string(),
+            },
+            DiscoveredTarget {
+                name: "node-1/stopped-app".to_string(),
+                host: "".to_string(),
+                port: 9876,
+                status: "stopped".to_string(),
+            },
+        ]);
+        let all = registry.list(None);
+        assert_eq!(all.len(), 2);
+        let stopped = all.iter().find(|t| t.name == "node-1/stopped-app").unwrap();
+        assert!(stopped.host.is_empty());
+        assert_eq!(stopped.status, "stopped");
+    }
+
+    #[test]
     fn cache_round_trip() {
         let mut registry = Registry::new();
         registry.update_discovered(vec![DiscoveredTarget {

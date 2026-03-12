@@ -240,6 +240,14 @@ async fn handle_exec(
         }
     };
 
+    if host.is_empty() {
+        let status = {
+            let reg = registry.lock().unwrap();
+            reg.get(target_name).map(|t| t.status.clone()).unwrap_or_default()
+        };
+        return make_tool_error(id, &format!("target '{}' is {} (no IP available)", target_name, status));
+    }
+
     let psk = match config.agent.psk.get(target_name) {
         Some(p) => p.clone(),
         None => return make_tool_error(id, &format!("no PSK configured for target: {target_name}")),
@@ -355,6 +363,14 @@ async fn handle_ping(
             None => return make_tool_error(id, &format!("unknown target: {target_name}")),
         }
     };
+
+    if host.is_empty() {
+        let status = {
+            let reg = registry.lock().unwrap();
+            reg.get(target_name).map(|t| t.status.clone()).unwrap_or_default()
+        };
+        return make_tool_error(id, &format!("target '{}' is {} (no IP available)", target_name, status));
+    }
 
     let psk = match config.agent.psk.get(target_name) {
         Some(p) => p.clone(),
@@ -696,6 +712,106 @@ mod tests {
         let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
         assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("Unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn exec_stopped_target_returns_clear_error() {
+        let limiter = Arc::new(ConcurrencyLimiter::new(4));
+
+        let mut registry = Registry::new();
+        registry.update_discovered(vec![crate::registry::DiscoveredTarget {
+            name: "node-1/stopped-app".to_string(),
+            host: "".to_string(),
+            port: 9876,
+            status: "stopped".to_string(),
+        }]);
+        let registry = Arc::new(Mutex::new(registry));
+
+        let mut psk = std::collections::HashMap::new();
+        psk.insert("node-1/stopped-app".to_string(), "secret123".to_string());
+        let config = Arc::new(GatewayConfig {
+            server: Default::default(),
+            proxmox: crate::config::ProxmoxConfig {
+                nodes: vec![],
+                user: String::new(),
+                token_id: String::new(),
+                token_secret: String::new(),
+                discovery_interval_secs: 60,
+            },
+            agent: crate::config::AgentConnectionConfig {
+                default_port: 9876,
+                default_timeout_secs: 60,
+                connect_timeout_secs: 5,
+                max_concurrent_per_target: 4,
+                psk,
+            },
+            targets: vec![],
+            cache_dir: "/tmp/commando-test".to_string(),
+        });
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "commando_exec",
+                "arguments": { "target": "node-1/stopped-app", "command": "echo hi" }
+            }
+        });
+        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("stopped"), "error should mention target status, got: {text}");
+    }
+
+    #[tokio::test]
+    async fn ping_stopped_target_returns_clear_error() {
+        let limiter = Arc::new(ConcurrencyLimiter::new(4));
+
+        let mut registry = Registry::new();
+        registry.update_discovered(vec![crate::registry::DiscoveredTarget {
+            name: "node-1/stopped-app".to_string(),
+            host: "".to_string(),
+            port: 9876,
+            status: "stopped".to_string(),
+        }]);
+        let registry = Arc::new(Mutex::new(registry));
+
+        let mut psk = std::collections::HashMap::new();
+        psk.insert("node-1/stopped-app".to_string(), "secret123".to_string());
+        let config = Arc::new(GatewayConfig {
+            server: Default::default(),
+            proxmox: crate::config::ProxmoxConfig {
+                nodes: vec![],
+                user: String::new(),
+                token_id: String::new(),
+                token_secret: String::new(),
+                discovery_interval_secs: 60,
+            },
+            agent: crate::config::AgentConnectionConfig {
+                default_port: 9876,
+                default_timeout_secs: 60,
+                connect_timeout_secs: 5,
+                max_concurrent_per_target: 4,
+                psk,
+            },
+            targets: vec![],
+            cache_dir: "/tmp/commando-test".to_string(),
+        });
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "commando_ping",
+                "arguments": { "target": "node-1/stopped-app" }
+            }
+        });
+        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("stopped"), "error should mention target status, got: {text}");
     }
 
     #[tokio::test]
