@@ -1,3 +1,4 @@
 FROM scratch
-COPY --chmod=755 target/x86_64-unknown-linux-musl/release/commando-gateway /commando-gateway
+ARG TARGETARCH=amd64
+COPY --chmod=755 binaries-${TARGETARCH}/commando-gateway /commando-gateway
 ENTRYPOINT ["/commando-gateway"]
