@@ -1,0 +1,13 @@
+services:
+  commando-gateway:
+    image: ghcr.io/icyrainz/commando-gateway:latest
+    container_name: commando-gateway
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /etc/commando:/etc/commando:ro
+      - commando-cache:/var/lib/commando  # registry cache persists across restarts
+    command: ["--config", "/etc/commando/gateway.toml"]
+
+volumes:
+  commando-cache:

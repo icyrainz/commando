@@ -5,10 +5,13 @@ use std::collections::HashMap;
 pub struct GatewayConfig {
     #[serde(default)]
     pub server: ServerConfig,
-    pub proxmox: ProxmoxConfig,
+    #[serde(default)]
+    pub proxmox: Option<ProxmoxConfig>,
     pub agent: AgentConnectionConfig,
     #[serde(default)]
     pub targets: Vec<ManualTarget>,
+    #[serde(default = "default_cache_dir")]
+    pub cache_dir: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,7 +88,8 @@ fn default_agent_port() -> u16 { 9876 }
 fn default_timeout() -> u32 { 60 }
 fn default_connect_timeout() -> u64 { 5 }
 fn default_max_concurrent() -> usize { 4 }
-fn default_shell() -> String { "sh".to_string() }
+pub fn default_shell() -> String { "sh".to_string() }
+pub fn default_cache_dir() -> String { "/var/lib/commando".to_string() }
 
 impl GatewayConfig {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
@@ -131,8 +135,9 @@ shell = "fish"
 tags = ["gpu", "desktop"]
 "#;
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.proxmox.nodes.len(), 2);
-        assert_eq!(config.proxmox.nodes[0].name, "node-1");
+        let proxmox = config.proxmox.unwrap();
+        assert_eq!(proxmox.nodes.len(), 2);
+        assert_eq!(proxmox.nodes[0].name, "node-1");
         assert_eq!(config.agent.psk.len(), 3);
         assert_eq!(config.agent.psk["my-desktop"], "cccc");
         assert_eq!(config.targets.len(), 1);
@@ -184,6 +189,23 @@ token_secret = "xxxx"
     }
 
     #[test]
+    fn cache_dir_defaults() {
+        let toml_str = r#"
+[proxmox]
+nodes = []
+user = "root@pam"
+token_id = "commando"
+token_secret = "xxxx"
+
+[agent]
+
+[agent.psk]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.cache_dir, "/var/lib/commando");
+    }
+
+    #[test]
     fn parse_minimal_config() {
         let toml_str = r#"
 [proxmox]
@@ -202,5 +224,24 @@ token_secret = "xxxx"
         assert_eq!(config.agent.connect_timeout_secs, 5);
         assert_eq!(config.agent.max_concurrent_per_target, 4);
         assert!(config.targets.is_empty());
+    }
+
+    #[test]
+    fn parse_config_without_proxmox() {
+        let toml_str = r#"
+[agent]
+default_port = 9876
+
+[agent.psk]
+my-target = "secret"
+
+[[targets]]
+name = "my-target"
+host = "192.168.1.50"
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.proxmox.is_none());
+        assert_eq!(config.targets.len(), 1);
+        assert_eq!(config.agent.psk["my-target"], "secret");
     }
 }

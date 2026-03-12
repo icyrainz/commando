@@ -1,20 +1,21 @@
 # Commando Gateway Configuration
 # Copy to /etc/commando/gateway.toml and set chmod 600 root:root
 
-# MCP server transport: "sse" (HTTP, default) or "stdio" (stdin/stdout)
+# MCP server transport: "streamable-http" (HTTP, default) or "stdio" (stdin/stdout)
 # [server]
-# transport = "sse"
+# transport = "streamable-http"
 # bind = "0.0.0.0"
 # port = 9877
 
-[proxmox]
-nodes = [
-    { name = "node-1", host = "192.168.1.10", port = 8006 },
-]
-user = "root@pam"
-token_id = "commando"
-token_secret = "REPLACE_WITH_PROXMOX_API_TOKEN"
-discovery_interval_secs = 60
+# Optional: Proxmox auto-discovery (omit this section for manual-only setup)
+# [proxmox]
+# nodes = [
+#     { name = "node-1", host = "192.168.1.10", port = 8006 },
+# ]
+# user = "root@pam"
+# token_id = "commando"
+# token_secret = "REPLACE_WITH_PROXMOX_API_TOKEN"
+# discovery_interval_secs = 60
 
 [agent]
 default_port = 9876
@@ -23,15 +24,11 @@ connect_timeout_secs = 5
 max_concurrent_per_target = 4
 
 [agent.psk]
-# Auto-discovered LXCs use "node-name/hostname" keys
-# "node-1/my-app" = "output-of-openssl-rand-hex-32"
-
-# Manual targets use plain names
-# my-desktop = "output-of-openssl-rand-hex-32"
+# my-target = "output-of-openssl-rand-hex-32"
 
 # [[targets]]
-# name = "my-desktop"
-# host = "my-desktop"
+# name = "my-target"
+# host = "192.168.1.50"
 # port = 9876
-# shell = "fish"
-# tags = ["gpu", "desktop"]
+# shell = "sh"
+# tags = ["web"]

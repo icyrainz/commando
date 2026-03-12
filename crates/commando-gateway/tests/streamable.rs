@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 use commando_gateway::config::{
-    AgentConnectionConfig, GatewayConfig, ProxmoxConfig, ServerConfig,
+    AgentConnectionConfig, GatewayConfig, ServerConfig,
 };
 use commando_gateway::handler::ConcurrencyLimiter;
 use commando_gateway::registry::Registry;
@@ -19,13 +19,7 @@ fn test_config() -> Arc<GatewayConfig> {
             bind: "127.0.0.1".to_string(),
             port: 0,
         },
-        proxmox: ProxmoxConfig {
-            nodes: vec![],
-            user: String::new(),
-            token_id: String::new(),
-            token_secret: String::new(),
-            discovery_interval_secs: 60,
-        },
+        proxmox: None,
         agent: AgentConnectionConfig {
             default_port: 9876,
             default_timeout_secs: 60,
@@ -34,6 +28,7 @@ fn test_config() -> Arc<GatewayConfig> {
             psk: Default::default(),
         },
         targets: vec![],
+        cache_dir: "/tmp/commando-test".to_string(),
     })
 }
 
