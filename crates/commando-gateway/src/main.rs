@@ -195,6 +195,9 @@ async fn run_discovery_cycle(
         reg.targets
             .values()
             .filter_map(|t| {
+                if t.host.is_empty() {
+                    return None; // Skip stopped/unreachable targets with no IP
+                }
                 config.agent.psk.get(&t.name)
                     .map(|psk| (t.name.clone(), t.host.clone(), t.port, psk.clone()))
             })
