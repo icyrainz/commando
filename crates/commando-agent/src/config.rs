@@ -14,10 +14,18 @@ pub struct AgentConfig {
     pub max_concurrent: usize,
 }
 
-fn default_port() -> u16 { 9876 }
-fn default_shell() -> String { "sh".to_string() }
-fn default_max_output_bytes() -> usize { 131_072 }
-fn default_max_concurrent() -> usize { 8 }
+fn default_port() -> u16 {
+    9876
+}
+fn default_shell() -> String {
+    "sh".to_string()
+}
+fn default_max_output_bytes() -> usize {
+    131_072
+}
+fn default_max_concurrent() -> usize {
+    8
+}
 
 impl AgentConfig {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {

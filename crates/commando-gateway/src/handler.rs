@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::info;
 
 use crate::config::GatewayConfig;
@@ -187,9 +187,7 @@ pub async fn dispatch_request(
     let response = match method {
         "initialize" => process_initialize(request),
         "tools/list" => process_tools_list(request),
-        "tools/call" => {
-            handle_tools_call(request, config, registry, limiter).await
-        }
+        "tools/call" => handle_tools_call(request, config, registry, limiter).await,
         _ => make_error_response(id.clone(), -32601, &format!("Method not found: {method}")),
     };
 
@@ -230,7 +228,9 @@ async fn handle_exec(
         None => return make_tool_error(id, "missing required parameter: command"),
     };
     let work_dir = args["work_dir"].as_str().unwrap_or("");
-    let timeout_secs = args["timeout"].as_u64().unwrap_or(config.agent.default_timeout_secs as u64) as u32;
+    let timeout_secs = args["timeout"]
+        .as_u64()
+        .unwrap_or(config.agent.default_timeout_secs as u64) as u32;
 
     let (host, port, status) = {
         let reg = registry.lock().unwrap();
@@ -241,16 +241,24 @@ async fn handle_exec(
     };
 
     if host.is_empty() {
-        return make_tool_error(id, &format!("target '{}' is {} (no IP available)", target_name, status));
+        return make_tool_error(
+            id,
+            &format!("target '{}' is {} (no IP available)", target_name, status),
+        );
     }
 
     let psk = match config.agent.psk.get(target_name) {
         Some(p) => p.clone(),
-        None => return make_tool_error(id, &format!("no PSK configured for target: {target_name}")),
+        None => {
+            return make_tool_error(id, &format!("no PSK configured for target: {target_name}"));
+        }
     };
 
     if !limiter.try_acquire(target_name) {
-        return make_tool_error(id, &format!("concurrency limit reached for target: {target_name}"));
+        return make_tool_error(
+            id,
+            &format!("concurrency limit reached for target: {target_name}"),
+        );
     }
 
     let extra_env: Vec<(String, String)> = args["env"]
@@ -272,9 +280,17 @@ async fn handle_exec(
     );
 
     let result = rpc::remote_exec(
-        &host, port, &psk, command, work_dir, timeout_secs,
-        &extra_env, &request_id, config.agent.connect_timeout_secs,
-    ).await;
+        &host,
+        port,
+        &psk,
+        command,
+        work_dir,
+        timeout_secs,
+        &extra_env,
+        &request_id,
+        config.agent.connect_timeout_secs,
+    )
+    .await;
 
     limiter.release(target_name);
 
@@ -288,12 +304,18 @@ async fn handle_exec(
                 text.push_str(&stdout);
             }
             if !stderr.is_empty() {
-                if !text.is_empty() { text.push('\n'); }
+                if !text.is_empty() {
+                    text.push('\n');
+                }
                 text.push_str("[stderr]\n");
                 text.push_str(&stderr);
             }
-            if r.timed_out { text.push_str("\n[timed out]"); }
-            if r.truncated { text.push_str("\n[output truncated]"); }
+            if r.timed_out {
+                text.push_str("\n[timed out]");
+            }
+            if r.truncated {
+                text.push_str("\n[output truncated]");
+            }
 
             let metadata = format!(
                 "\n---\nexit_code: {} | duration: {}ms | request_id: {}",
@@ -338,7 +360,10 @@ fn handle_list(
         })
         .collect();
 
-    make_tool_result(id, &serde_json::to_string_pretty(&targets).unwrap_or_default())
+    make_tool_result(
+        id,
+        &serde_json::to_string_pretty(&targets).unwrap_or_default(),
+    )
 }
 
 async fn handle_ping(
@@ -361,12 +386,17 @@ async fn handle_ping(
     };
 
     if host.is_empty() {
-        return make_tool_error(id, &format!("target '{}' is {} (no IP available)", target_name, status));
+        return make_tool_error(
+            id,
+            &format!("target '{}' is {} (no IP available)", target_name, status),
+        );
     }
 
     let psk = match config.agent.psk.get(target_name) {
         Some(p) => p.clone(),
-        None => return make_tool_error(id, &format!("no PSK configured for target: {target_name}")),
+        None => {
+            return make_tool_error(id, &format!("no PSK configured for target: {target_name}"));
+        }
     };
 
     match rpc::remote_ping(&host, port, &psk, config.agent.connect_timeout_secs).await {
@@ -524,9 +554,16 @@ mod tests {
                 "arguments": { "command": "echo hi" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        let resp = dispatch_request(&request, &config, &registry, &limiter)
+            .await
+            .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
-        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("missing required parameter: target"));
+        assert!(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("missing required parameter: target")
+        );
     }
 
     #[tokio::test]
@@ -544,9 +581,16 @@ mod tests {
                 "arguments": { "target": "nonexistent", "command": "echo hi" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        let resp = dispatch_request(&request, &config, &registry, &limiter)
+            .await
+            .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
-        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("unknown target"));
+        assert!(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unknown target")
+        );
     }
 
     #[tokio::test]
@@ -565,9 +609,16 @@ mod tests {
                 "arguments": { "target": "my-box", "command": "echo hi" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        let resp = dispatch_request(&request, &config, &registry, &limiter)
+            .await
+            .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
-        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("no PSK configured"));
+        assert!(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("no PSK configured")
+        );
     }
 
     #[tokio::test]
@@ -588,9 +639,16 @@ mod tests {
                 "arguments": { "target": "my-box", "command": "echo hi" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        let resp = dispatch_request(&request, &config, &registry, &limiter)
+            .await
+            .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
-        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("concurrency limit"));
+        assert!(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("concurrency limit")
+        );
     }
 
     #[tokio::test]
@@ -608,7 +666,9 @@ mod tests {
                 "arguments": {}
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        let resp = dispatch_request(&request, &config, &registry, &limiter)
+            .await
+            .unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("my-box"));
         assert!(text.contains("10.0.0.5"));
@@ -629,7 +689,9 @@ mod tests {
                 "arguments": { "filter": "nonexistent" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        let resp = dispatch_request(&request, &config, &registry, &limiter)
+            .await
+            .unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(!text.contains("my-box"));
     }
@@ -649,9 +711,16 @@ mod tests {
                 "arguments": { "target": "nonexistent" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        let resp = dispatch_request(&request, &config, &registry, &limiter)
+            .await
+            .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
-        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("unknown target"));
+        assert!(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unknown target")
+        );
     }
 
     #[tokio::test]
@@ -669,9 +738,16 @@ mod tests {
                 "arguments": { "target": "my-box" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        let resp = dispatch_request(&request, &config, &registry, &limiter)
+            .await
+            .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
-        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("no PSK configured"));
+        assert!(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("no PSK configured")
+        );
     }
 
     #[tokio::test]
@@ -689,9 +765,16 @@ mod tests {
                 "arguments": {}
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        let resp = dispatch_request(&request, &config, &registry, &limiter)
+            .await
+            .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
-        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("Unknown tool"));
+        assert!(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown tool")
+        );
     }
 
     #[tokio::test]
@@ -732,10 +815,15 @@ mod tests {
                 "arguments": { "target": "node-1/stopped-app", "command": "echo hi" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        let resp = dispatch_request(&request, &config, &registry, &limiter)
+            .await
+            .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("stopped"), "error should mention target status, got: {text}");
+        assert!(
+            text.contains("stopped"),
+            "error should mention target status, got: {text}"
+        );
     }
 
     #[tokio::test]
@@ -776,10 +864,15 @@ mod tests {
                 "arguments": { "target": "node-1/stopped-app" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter).await.unwrap();
+        let resp = dispatch_request(&request, &config, &registry, &limiter)
+            .await
+            .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("stopped"), "error should mention target status, got: {text}");
+        assert!(
+            text.contains("stopped"),
+            "error should mention target status, got: {text}"
+        );
     }
 
     #[tokio::test]
@@ -793,7 +886,11 @@ mod tests {
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
         });
-        assert!(dispatch_request(&notification, &config, &registry, &limiter).await.is_none());
+        assert!(
+            dispatch_request(&notification, &config, &registry, &limiter)
+                .await
+                .is_none()
+        );
 
         // Notification: null id
         let null_id = json!({
@@ -801,7 +898,11 @@ mod tests {
             "id": null,
             "method": "notifications/initialized"
         });
-        assert!(dispatch_request(&null_id, &config, &registry, &limiter).await.is_none());
+        assert!(
+            dispatch_request(&null_id, &config, &registry, &limiter)
+                .await
+                .is_none()
+        );
 
         // Request: has id — should return Some
         let request = json!({
@@ -810,6 +911,10 @@ mod tests {
             "method": "initialize",
             "params": {}
         });
-        assert!(dispatch_request(&request, &config, &registry, &limiter).await.is_some());
+        assert!(
+            dispatch_request(&request, &config, &registry, &limiter)
+                .await
+                .is_some()
+        );
     }
 }

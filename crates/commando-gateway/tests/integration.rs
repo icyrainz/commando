@@ -121,10 +121,7 @@ fn e2e_exec_echo() {
         .unwrap();
 
         assert_eq!(result.exit_code, 0);
-        assert_eq!(
-            String::from_utf8_lossy(&result.stdout).trim(),
-            "hello"
-        );
+        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "hello");
         assert!(!result.timed_out);
         assert!(!result.truncated);
         assert_eq!(result.request_id, "test-req-1");
@@ -175,10 +172,7 @@ fn e2e_exec_with_env() {
         .unwrap();
 
         assert_eq!(result.exit_code, 0);
-        assert_eq!(
-            String::from_utf8_lossy(&result.stdout).trim(),
-            "works"
-        );
+        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "works");
     });
 }
 
@@ -202,10 +196,7 @@ fn e2e_exec_stderr() {
         .unwrap();
 
         assert_eq!(result.exit_code, 0);
-        assert_eq!(
-            String::from_utf8_lossy(&result.stderr).trim(),
-            "err"
-        );
+        assert_eq!(String::from_utf8_lossy(&result.stderr).trim(), "err");
     });
 }
 
@@ -216,9 +207,7 @@ fn e2e_ping() {
     run_local(async {
         let port = start_agent().await;
 
-        let result = remote_ping("127.0.0.1", port, TEST_PSK, 5)
-            .await
-            .unwrap();
+        let result = remote_ping("127.0.0.1", port, TEST_PSK, 5).await.unwrap();
 
         assert!(!result.hostname.is_empty());
         assert!(!result.shell.is_empty());

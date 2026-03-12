@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 pub struct ExecOpts {
     pub shell: String,
@@ -36,7 +36,10 @@ pub async fn execute(
     cmd.env_clear();
     cmd.env("HOME", "/root");
     cmd.env("USER", "root");
-    cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    cmd.env(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    );
     cmd.env("SHELL", &opts.shell);
     cmd.env("LANG", "C.UTF-8");
     cmd.env("TERM", "dumb");
@@ -87,7 +90,10 @@ pub async fn execute(
                 loop {
                     match stdout_handle.read(&mut chunk).await {
                         Ok(0) => break,
-                        Ok(n) => stdout_buf_clone.lock().unwrap().extend_from_slice(&chunk[..n]),
+                        Ok(n) => stdout_buf_clone
+                            .lock()
+                            .unwrap()
+                            .extend_from_slice(&chunk[..n]),
                         Err(_) => break,
                     }
                 }
@@ -97,7 +103,10 @@ pub async fn execute(
                 loop {
                     match stderr_handle.read(&mut chunk).await {
                         Ok(0) => break,
-                        Ok(n) => stderr_buf_clone.lock().unwrap().extend_from_slice(&chunk[..n]),
+                        Ok(n) => stderr_buf_clone
+                            .lock()
+                            .unwrap()
+                            .extend_from_slice(&chunk[..n]),
                         Err(_) => break,
                     }
                 }
@@ -198,13 +207,9 @@ mod tests {
 
     #[tokio::test]
     async fn exec_echo() {
-        let result = execute(
-            "echo hello",
-            "",
-            60,
-            &[],
-            &default_opts(),
-        ).await.unwrap();
+        let result = execute("echo hello", "", 60, &[], &default_opts())
+            .await
+            .unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "hello");
         assert!(result.stderr.is_empty());
@@ -214,39 +219,37 @@ mod tests {
 
     #[tokio::test]
     async fn exec_exit_code() {
-        let result = execute("exit 42", "", 60, &[], &default_opts()).await.unwrap();
+        let result = execute("exit 42", "", 60, &[], &default_opts())
+            .await
+            .unwrap();
         assert_eq!(result.exit_code, 42);
     }
 
     #[tokio::test]
     async fn exec_stderr() {
-        let result = execute(
-            "echo err >&2",
-            "",
-            60,
-            &[],
-            &default_opts(),
-        ).await.unwrap();
+        let result = execute("echo err >&2", "", 60, &[], &default_opts())
+            .await
+            .unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(String::from_utf8_lossy(&result.stderr).trim(), "err");
     }
 
     #[tokio::test]
     async fn exec_work_dir() {
-        let result = execute("pwd", "/tmp", 60, &[], &default_opts()).await.unwrap();
-        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "/tmp");
+        let result = execute("pwd", "/tmp", 60, &[], &default_opts())
+            .await
+            .unwrap();
+        let output = String::from_utf8_lossy(&result.stdout).trim().to_string();
+        // macOS: /tmp is a symlink to /private/tmp
+        assert!(output == "/tmp" || output == "/private/tmp");
     }
 
     #[tokio::test]
     async fn exec_env_vars() {
         let env = [("MY_VAR".to_string(), "hello".to_string())];
-        let result = execute(
-            "echo $MY_VAR",
-            "",
-            60,
-            &env,
-            &default_opts(),
-        ).await.unwrap();
+        let result = execute("echo $MY_VAR", "", 60, &env, &default_opts())
+            .await
+            .unwrap();
         assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "hello");
     }
 
@@ -259,13 +262,17 @@ mod tests {
             60,
             &[],
             &default_opts(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "unset");
     }
 
     #[tokio::test]
     async fn exec_timeout() {
-        let result = execute("sleep 30", "", 1, &[], &default_opts()).await.unwrap();
+        let result = execute("sleep 30", "", 1, &[], &default_opts())
+            .await
+            .unwrap();
         assert!(result.timed_out);
         assert_eq!(result.exit_code, 137);
     }
@@ -277,13 +284,9 @@ mod tests {
             max_output_bytes: 100,
         };
         // Generate more than 100 bytes of output
-        let result = execute(
-            "yes | head -n 200",
-            "",
-            60,
-            &[],
-            &opts,
-        ).await.unwrap();
+        let result = execute("yes | head -n 200", "", 60, &[], &opts)
+            .await
+            .unwrap();
         assert!(result.truncated);
         assert!(result.stdout.len() <= 100);
     }
@@ -296,7 +299,9 @@ mod tests {
             60,
             &[],
             &default_opts(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "1");
     }

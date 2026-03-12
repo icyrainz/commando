@@ -6,8 +6,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Compute HMAC-SHA256(psk, nonce). Used by gateway to prove PSK knowledge.
 pub fn compute_hmac(psk: &[u8], nonce: &[u8]) -> Vec<u8> {
-    let mut mac =
-        HmacSha256::new_from_slice(psk).expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(psk).expect("HMAC accepts any key length");
     mac.update(nonce);
     mac.finalize().into_bytes().to_vec()
 }
@@ -15,8 +14,7 @@ pub fn compute_hmac(psk: &[u8], nonce: &[u8]) -> Vec<u8> {
 /// Verify an HMAC against expected PSK and nonce. Used by agent to validate.
 /// Constant-time comparison to prevent timing attacks.
 pub fn verify_hmac(psk: &[u8], nonce: &[u8], received: &[u8]) -> bool {
-    let mut mac =
-        HmacSha256::new_from_slice(psk).expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(psk).expect("HMAC accepts any key length");
     mac.update(nonce);
     mac.verify_slice(received).is_ok()
 }

@@ -1,10 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use axum::Router;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
-use axum::Router;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -43,8 +43,7 @@ pub fn build_app(
             let reg = registry.clone();
             let lim = limiter.clone();
             tokio::task::spawn_local(async move {
-                let result =
-                    handler::dispatch_request(&item.request, &cfg, &reg, &lim).await;
+                let result = handler::dispatch_request(&item.request, &cfg, &reg, &lim).await;
                 let _ = item.response_tx.send(result);
             });
         }
@@ -53,7 +52,10 @@ pub fn build_app(
     let state = AppState { work_tx };
 
     Router::new()
-        .route("/mcp", post(handle_post).get(handle_get).delete(handle_delete))
+        .route(
+            "/mcp",
+            post(handle_post).get(handle_get).delete(handle_delete),
+        )
         .route("/health", get(handle_health))
         .with_state(state)
 }
@@ -72,10 +74,8 @@ pub async fn run_streamable_server(
     info!(addr = %addr, "Streamable HTTP server listening");
 
     let shutdown = async {
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        )
-        .expect("failed to register SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {},
             _ = sigterm.recv() => {},
@@ -99,22 +99,16 @@ async fn handle_post(
     let request: Value = match serde_json::from_str(&body_str) {
         Ok(v) => v,
         Err(e) => {
-            let error = handler::make_error_response(
-                Value::Null,
-                -32700,
-                &format!("Parse error: {e}"),
-            );
+            let error =
+                handler::make_error_response(Value::Null, -32700, &format!("Parse error: {e}"));
             return Json(error).into_response();
         }
     };
 
     // Reject batch requests (JSON arrays)
     if request.is_array() {
-        let error = handler::make_error_response(
-            Value::Null,
-            -32600,
-            "batch requests not supported",
-        );
+        let error =
+            handler::make_error_response(Value::Null, -32600, "batch requests not supported");
         return Json(error).into_response();
     }
 

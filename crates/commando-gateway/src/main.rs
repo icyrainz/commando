@@ -132,36 +132,32 @@ async fn run_gateway(config: Arc<config::GatewayConfig>) -> Result<()> {
     ));
 
     // Spawn background discovery loop
-    if let Some(proxmox) = &config.proxmox {
-        if !proxmox.nodes.is_empty() {
-            let discovery_interval = proxmox.discovery_interval_secs;
-            let config_clone = config.clone();
-            let registry_clone = registry.clone();
-            tokio::task::spawn_local(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                    discovery_interval,
-                ));
-                interval.tick().await; // Skip immediate first tick
-                loop {
-                    interval.tick().await;
-                    run_discovery_cycle(&config_clone, &registry_clone).await;
-                }
-            });
-        }
+    if let Some(proxmox) = config.proxmox.as_ref().filter(|p| !p.nodes.is_empty()) {
+        let discovery_interval = proxmox.discovery_interval_secs;
+        let config_clone = config.clone();
+        let registry_clone = registry.clone();
+        tokio::task::spawn_local(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(discovery_interval));
+            interval.tick().await; // Skip immediate first tick
+            loop {
+                interval.tick().await;
+                run_discovery_cycle(&config_clone, &registry_clone).await;
+            }
+        });
     }
 
     // Run MCP server on selected transport
     match config.server.transport.as_str() {
         "stdio" => mcp::run_stdio_loop(config, registry, limiter).await,
         "streamable-http" => streamable::run_streamable_server(config, registry, limiter).await,
-        other => anyhow::bail!("unknown transport: {other} (expected 'stdio' or 'streamable-http')"),
+        other => {
+            anyhow::bail!("unknown transport: {other} (expected 'stdio' or 'streamable-http')")
+        }
     }
 }
 
-async fn run_discovery_cycle(
-    config: &config::GatewayConfig,
-    registry: &Arc<Mutex<Registry>>,
-) {
+async fn run_discovery_cycle(config: &config::GatewayConfig, registry: &Arc<Mutex<Registry>>) {
     let proxmox_config = match &config.proxmox {
         Some(p) => p,
         None => return,
@@ -176,7 +172,14 @@ async fn run_discovery_cycle(
     let mut all_discovered = Vec::new();
 
     for node in &proxmox_config.nodes {
-        match proxmox::discover_node(&http_client, node, proxmox_config, config.agent.default_port).await {
+        match proxmox::discover_node(
+            &http_client,
+            node,
+            proxmox_config,
+            config.agent.default_port,
+        )
+        .await
+        {
             Ok(targets) => {
                 info!(node = %node.name, count = targets.len(), "discovered LXC targets");
                 all_discovered.extend(targets);
@@ -198,7 +201,10 @@ async fn run_discovery_cycle(
                 if t.host.is_empty() {
                     return None; // Skip stopped/unreachable targets with no IP
                 }
-                config.agent.psk.get(&t.name)
+                config
+                    .agent
+                    .psk
+                    .get(&t.name)
                     .map(|psk| (t.name.clone(), t.host.clone(), t.port, psk.clone()))
             })
             .collect()
@@ -213,7 +219,9 @@ async fn run_discovery_cycle(
             let psk = psk.clone();
             let connect_timeout = config.agent.connect_timeout_secs;
             async move {
-                let reachable = rpc::remote_ping(&host, port, &psk, connect_timeout).await.is_ok();
+                let reachable = rpc::remote_ping(&host, port, &psk, connect_timeout)
+                    .await
+                    .is_ok();
                 (name, reachable)
             }
         })
@@ -225,7 +233,11 @@ async fn run_discovery_cycle(
         for (name, reachable) in ping_results {
             reg.set_reachable(
                 &name,
-                if reachable { registry::Reachability::Reachable } else { registry::Reachability::Unreachable },
+                if reachable {
+                    registry::Reachability::Reachable
+                } else {
+                    registry::Reachability::Unreachable
+                },
             );
         }
     }

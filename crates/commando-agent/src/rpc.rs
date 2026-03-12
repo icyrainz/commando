@@ -62,7 +62,9 @@ impl ConcurrencyGuard {
             return None;
         }
         *active += 1;
-        Some(ConcurrencyPermit { guard: self.clone() })
+        Some(ConcurrencyPermit {
+            guard: self.clone(),
+        })
     }
 }
 
@@ -132,14 +134,18 @@ impl authenticator::Server for AuthenticatorImpl {
         if !valid {
             // Record failure
             let mut limits = self.rate_limits.borrow_mut();
-            let state = limits.entry(self.peer_ip).or_insert_with(|| RateLimitState {
-                failures: 0,
-                last_failure: Instant::now(),
-            });
+            let state = limits
+                .entry(self.peer_ip)
+                .or_insert_with(|| RateLimitState {
+                    failures: 0,
+                    last_failure: Instant::now(),
+                });
             state.failures += 1;
             state.last_failure = Instant::now();
             tracing::warn!(peer = %self.peer_ip, "authentication failed");
-            return Err(capnp::Error::failed("authentication failed: invalid HMAC".to_string()));
+            return Err(capnp::Error::failed(
+                "authentication failed: invalid HMAC".to_string(),
+            ));
         }
 
         // Clear failure count on success
@@ -176,9 +182,10 @@ impl command_agent::Server for CommandAgentImpl {
         params: command_agent::ExecParams,
         mut results: command_agent::ExecResults,
     ) -> Result<(), capnp::Error> {
-        let _permit = self.concurrency_guard.try_acquire().ok_or_else(|| {
-            capnp::Error::failed("too many concurrent exec requests".to_string())
-        })?;
+        let _permit = self
+            .concurrency_guard
+            .try_acquire()
+            .ok_or_else(|| capnp::Error::failed("too many concurrent exec requests".to_string()))?;
 
         let params_reader = params
             .get()

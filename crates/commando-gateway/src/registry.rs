@@ -50,6 +50,12 @@ pub struct Registry {
     manual_targets: HashMap<String, Target>,
 }
 
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Registry {
     pub fn new() -> Self {
         Registry {
@@ -71,7 +77,9 @@ impl Registry {
                 status: "unknown".to_string(),
                 reachable: Reachability::Unknown,
             };
-            registry.manual_targets.insert(input.name.clone(), target.clone());
+            registry
+                .manual_targets
+                .insert(input.name.clone(), target.clone());
             registry.targets.insert(input.name, target);
         }
         registry
@@ -115,9 +123,7 @@ impl Registry {
             Some(f) => self
                 .targets
                 .values()
-                .filter(|t| {
-                    t.name.contains(f) || t.tags.iter().any(|tag| tag.contains(f))
-                })
+                .filter(|t| t.name.contains(f) || t.tags.iter().any(|tag| tag.contains(f)))
                 .collect(),
         };
         results.sort_by(|a, b| a.name.cmp(&b.name));

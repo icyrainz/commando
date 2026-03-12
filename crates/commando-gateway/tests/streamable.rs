@@ -5,9 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::net::TcpListener;
 
-use commando_gateway::config::{
-    AgentConnectionConfig, GatewayConfig, ServerConfig,
-};
+use commando_gateway::config::{AgentConnectionConfig, GatewayConfig, ServerConfig};
 use commando_gateway::handler::ConcurrencyLimiter;
 use commando_gateway::registry::Registry;
 use commando_gateway::streamable;
@@ -154,11 +152,7 @@ fn delete_mcp_returns_405() {
     run_local(async {
         let base = start_server().await;
         let client = reqwest::Client::new();
-        let resp = client
-            .delete(format!("{base}/mcp"))
-            .send()
-            .await
-            .unwrap();
+        let resp = client.delete(format!("{base}/mcp")).send().await.unwrap();
         assert_eq!(resp.status(), 405);
     });
 }

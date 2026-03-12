@@ -24,15 +24,12 @@ struct InterfaceEntry {
 
 /// Extract the first non-loopback IPv4 address from interface list.
 fn extract_ip(interfaces: &[InterfaceEntry]) -> Option<String> {
-    interfaces
-        .iter()
-        .filter(|i| i.name != "lo")
-        .find_map(|i| {
-            i.inet.as_ref().map(|addr| {
-                // Strip CIDR notation: "10.0.0.5/24" → "10.0.0.5"
-                addr.split('/').next().unwrap_or(addr).to_string()
-            })
+    interfaces.iter().filter(|i| i.name != "lo").find_map(|i| {
+        i.inet.as_ref().map(|addr| {
+            // Strip CIDR notation: "10.0.0.5/24" → "10.0.0.5"
+            addr.split('/').next().unwrap_or(addr).to_string()
         })
+    })
 }
 
 /// Discover all LXC containers on a Proxmox node.
@@ -154,12 +151,10 @@ mod tests {
 
     #[test]
     fn extract_ip_skips_loopback() {
-        let interfaces = vec![
-            InterfaceEntry {
-                name: "lo".to_string(),
-                inet: Some("127.0.0.1/8".to_string()),
-            },
-        ];
+        let interfaces = vec![InterfaceEntry {
+            name: "lo".to_string(),
+            inet: Some("127.0.0.1/8".to_string()),
+        }];
         assert_eq!(extract_ip(&interfaces), None);
     }
 }

@@ -10,7 +10,23 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y capnproto
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       matrix:

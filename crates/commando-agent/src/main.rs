@@ -11,7 +11,11 @@ use commando_agent::config;
 use commando_agent::rpc::{self, ConcurrencyGuard};
 
 #[derive(Parser)]
-#[command(name = "commando-agent", version, about = "Commando command execution agent")]
+#[command(
+    name = "commando-agent",
+    version,
+    about = "Commando command execution agent"
+)]
 struct Cli {
     #[arg(long, default_value = "/etc/commando/agent.toml")]
     config: std::path::PathBuf,

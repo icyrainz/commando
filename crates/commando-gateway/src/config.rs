@@ -78,18 +78,40 @@ impl Default for ServerConfig {
     }
 }
 
-fn default_transport() -> String { "streamable-http".to_string() }
-fn default_bind() -> String { "0.0.0.0".to_string() }
-fn default_server_port() -> u16 { 9877 }
+fn default_transport() -> String {
+    "streamable-http".to_string()
+}
+fn default_bind() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_server_port() -> u16 {
+    9877
+}
 
-fn default_discovery_interval() -> u64 { 60 }
-fn default_proxmox_port() -> u16 { 8006 }
-fn default_agent_port() -> u16 { 9876 }
-fn default_timeout() -> u32 { 60 }
-fn default_connect_timeout() -> u64 { 5 }
-fn default_max_concurrent() -> usize { 4 }
-pub fn default_shell() -> String { "sh".to_string() }
-pub fn default_cache_dir() -> String { "/var/lib/commando".to_string() }
+fn default_discovery_interval() -> u64 {
+    60
+}
+fn default_proxmox_port() -> u16 {
+    8006
+}
+fn default_agent_port() -> u16 {
+    9876
+}
+fn default_timeout() -> u32 {
+    60
+}
+fn default_connect_timeout() -> u64 {
+    5
+}
+fn default_max_concurrent() -> usize {
+    4
+}
+pub fn default_shell() -> String {
+    "sh".to_string()
+}
+pub fn default_cache_dir() -> String {
+    "/var/lib/commando".to_string()
+}
 
 impl GatewayConfig {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
