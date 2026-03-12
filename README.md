@@ -24,11 +24,11 @@ One shell layer. Done.
 
 ## Performance
 
-The gateway runs as a persistent SSE server, so Claude Code maintains a long-lived HTTP connection. Commands execute without SSH handshake overhead.
+The gateway runs as a persistent HTTP server. Commands execute without SSH handshake overhead.
 
 | Method | Latency | Notes |
 |--------|---------|-------|
-| **Commando (SSE)** | **~18ms** | HTTP POST on persistent connection |
+| **Commando** | **~18ms** | HTTP POST on persistent connection |
 | **Direct SSH + pct exec** | **~1050ms** | SSH handshake + pct exec per command |
 
 **~58x faster** for command execution. Measured on LAN with `hostname` as the test command.
@@ -38,7 +38,7 @@ The gateway runs as a persistent SSE server, so Claude Code maintains a long-liv
 ```
 Claude Code (any workstation)
     │
-    │ HTTP/SSE (MCP JSON-RPC)
+    │ HTTP (MCP JSON-RPC)
     │
     ▼
 ┌─────────────────────────────────┐
@@ -46,7 +46,7 @@ Claude Code (any workstation)
 │  (persistent service on LXC)    │
 │                                 │
 │  ┌───────────┐  ┌────────────┐  │
-│  │ SSE Server│  │  Registry  │  │
+│  │HTTP Server│  │  Registry  │  │
 │  │ (axum)    │──│            │  │
 │  └───────────┘  │ - Proxmox  │  │
 │       │         │   auto-disc│  │
@@ -70,7 +70,7 @@ Claude Code (any workstation)
 
 **Components:**
 
-- **Gateway** (`commando-gateway`) — MCP server that receives tool calls from Claude Code over HTTP/SSE and routes commands to agents via Cap'n Proto RPC
+- **Gateway** (`commando-gateway`) — MCP server that receives tool calls from Claude Code over HTTP and routes commands to agents via Cap'n Proto RPC
 - **Agent** (`commando-agent`) — Lightweight binary on each target machine that executes commands natively
 - **Common** (`commando-common`) — Shared Cap'n Proto schema and HMAC auth helpers
 
@@ -80,10 +80,10 @@ The gateway supports two MCP transports:
 
 | Transport | Use Case | Config |
 |-----------|----------|--------|
-| **SSE** (default) | Persistent remote service | `{"type": "sse", "url": "http://host:9877/sse"}` |
+| **Streamable HTTP** (default) | Persistent remote service | `{"type": "http", "url": "http://host:9877/mcp"}` |
 | **stdio** | Local development/testing | `{"type": "stdio", "command": "commando-gateway", ...}` |
 
-SSE is the primary transport. The gateway runs as a persistent service and Claude Code connects over HTTP — no SSH tunnel, no per-session container spawning.
+Streamable HTTP is the primary transport. The gateway runs as a persistent service and Claude Code connects over HTTP — no SSH tunnel, no per-session container spawning.
 
 ## MCP Tools
 
@@ -115,6 +115,8 @@ Health check a specific agent. Returns hostname, uptime, shell, and version.
 - SSH access to target machines (for agent deployment)
 - (Optional) Proxmox cluster for auto-discovery
 
+> **Not using Proxmox?** Skip the `[proxmox]` section in `gateway.toml` entirely. Add targets manually with `[[targets]]` entries and their PSKs under `[agent.psk]`. See Step 3 below.
+
 ### Step 1: Deploy the Gateway
 
 The gateway runs as a Docker container. On your gateway host:
@@ -126,7 +128,7 @@ mkdir -p /etc/commando
 # Create gateway config (edit values for your setup)
 cat > /etc/commando/gateway.toml << 'EOF'
 [server]
-transport = "sse"
+transport = "streamable-http"
 bind = "0.0.0.0"
 port = 9877
 
@@ -148,19 +150,12 @@ max_concurrent_per_target = 4
 EOF
 chmod 600 /etc/commando/gateway.toml
 
-# Create docker-compose.yml
-mkdir -p ~/docker-app
-cat > ~/docker-app/docker-compose.yml << 'EOF'
-services:
-  commando-gateway:
-    image: ghcr.io/icyrainz/commando-gateway:latest
-    container_name: commando-gateway
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - /etc/commando:/etc/commando:ro
-    command: ["--config", "/etc/commando/gateway.toml"]
-EOF
+# Copy docker-compose.yml from the repo (or download it)
+cp docker-compose.yml ~/docker-app/
+
+# Or if deploying remotely:
+curl -fSL -o ~/docker-app/docker-compose.yml \
+  https://raw.githubusercontent.com/icyrainz/commando/main/docker-compose.yml
 
 # Start the gateway
 cd ~/docker-app && docker compose up -d
@@ -221,6 +216,9 @@ Type=simple
 ExecStart=/usr/local/bin/commando-agent --config /etc/commando/agent.toml
 Restart=always
 RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -264,8 +262,8 @@ Add the MCP server to your Claude Code config (`~/.claude.json`):
 {
   "mcpServers": {
     "commando": {
-      "type": "sse",
-      "url": "http://gateway-host:9877/sse"
+      "type": "http",
+      "url": "http://gateway-host:9877/mcp"
     }
   }
 }
@@ -290,8 +288,8 @@ CI builds on tagged releases (`v*`) and publishes:
 ### Update Gateway
 
 ```bash
-./deploy/deploy-gateway.sh          # pull latest, restart
-./deploy/deploy-gateway.sh v0.2.0   # deploy specific version
+./deploy/deploy-gateway.sh pve-node-1 100          # pull latest, restart
+./deploy/deploy-gateway.sh pve-node-1 100 v0.2.0   # deploy specific version
 
 # Or manually:
 cd ~/docker-app && docker compose pull && docker compose up -d
@@ -312,11 +310,18 @@ systemctl restart commando-agent
 
 ### Building from Source
 
+Requires system packages:
+
+| Distro | Command |
+|--------|---------|
+| Debian/Ubuntu | `sudo apt install capnproto musl-tools` |
+| Fedora | `sudo dnf install capnproto musl-gcc` |
+| Arch | `sudo pacman -S capnproto musl` |
+| macOS | `brew install capnp` (musl not needed — native build) |
+
 ```bash
 cargo build --release --target x86_64-unknown-linux-musl
 ```
-
-Requires: `sudo apt install capnproto musl-tools`
 
 ## Security
 
@@ -333,7 +338,7 @@ Requires: `sudo apt install capnproto musl-tools`
 | Language | Rust |
 | Agent RPC | Cap'n Proto |
 | Gateway HTTP | axum |
-| MCP Transport | SSE (HTTP) / stdio |
+| MCP Transport | Streamable HTTP / stdio |
 | Build target | `x86_64-unknown-linux-musl` (static) |
 | Runtime | Single-threaded tokio + LocalSet |
 
