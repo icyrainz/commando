@@ -34,6 +34,7 @@ fn test_config() -> Arc<GatewayConfig> {
             psk: Default::default(),
         },
         targets: vec![],
+        cache_dir: "/tmp/commando-test".to_string(),
     })
 }
 

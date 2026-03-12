@@ -474,6 +474,7 @@ mod tests {
                 psk: Default::default(),
             },
             targets: vec![],
+            cache_dir: "/tmp/commando-test".to_string(),
         })
     }
 
@@ -497,6 +498,7 @@ mod tests {
                 psk,
             },
             targets: vec![],
+            cache_dir: "/tmp/commando-test".to_string(),
         })
     }
 

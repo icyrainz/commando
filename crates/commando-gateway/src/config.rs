@@ -9,6 +9,8 @@ pub struct GatewayConfig {
     pub agent: AgentConnectionConfig,
     #[serde(default)]
     pub targets: Vec<ManualTarget>,
+    #[serde(default = "default_cache_dir")]
+    pub cache_dir: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -86,6 +88,7 @@ fn default_timeout() -> u32 { 60 }
 fn default_connect_timeout() -> u64 { 5 }
 fn default_max_concurrent() -> usize { 4 }
 pub fn default_shell() -> String { "sh".to_string() }
+pub fn default_cache_dir() -> String { "/var/lib/commando".to_string() }
 
 impl GatewayConfig {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
@@ -181,6 +184,23 @@ token_secret = "xxxx"
         assert_eq!(config.server.transport, "streamable-http");
         assert_eq!(config.server.bind, "0.0.0.0");
         assert_eq!(config.server.port, 9877);
+    }
+
+    #[test]
+    fn cache_dir_defaults() {
+        let toml_str = r#"
+[proxmox]
+nodes = []
+user = "root@pam"
+token_id = "commando"
+token_secret = "xxxx"
+
+[agent]
+
+[agent.psk]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.cache_dir, "/var/lib/commando");
     }
 
     #[test]

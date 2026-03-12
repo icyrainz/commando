@@ -29,6 +29,10 @@ struct Cli {
     /// HTTP port (streamable-http only)
     #[arg(long)]
     port: Option<u16>,
+
+    /// Registry cache directory
+    #[arg(long)]
+    cache_dir: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -44,6 +48,9 @@ fn main() -> Result<()> {
     }
     if let Some(port) = cli.port {
         config.server.port = port;
+    }
+    if let Some(cache_dir) = &cli.cache_dir {
+        config.cache_dir = cache_dir.clone();
     }
 
     let config = Arc::new(config);
@@ -92,7 +99,7 @@ async fn run_gateway(config: Arc<config::GatewayConfig>) -> Result<()> {
     let registry = Arc::new(Mutex::new(Registry::from_manual(manual_inputs)));
 
     // Try to load cached registry
-    let cache_path = std::path::Path::new("/var/lib/commando/registry.json");
+    let cache_path = std::path::Path::new(&config.cache_dir).join("registry.json");
     if cache_path.exists() {
         match std::fs::read_to_string(cache_path) {
             Ok(json) => match Registry::from_cache_json(&json) {
@@ -213,7 +220,7 @@ async fn run_discovery_cycle(
     }
 
     // Save cache to disk
-    let cache_dir = std::path::Path::new("/var/lib/commando");
+    let cache_dir = std::path::Path::new(&config.cache_dir);
     if let Err(e) = std::fs::create_dir_all(cache_dir) {
         warn!(error = %e, "failed to create cache directory");
         return;
