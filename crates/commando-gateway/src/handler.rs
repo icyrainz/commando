@@ -232,19 +232,15 @@ async fn handle_exec(
     let work_dir = args["work_dir"].as_str().unwrap_or("");
     let timeout_secs = args["timeout"].as_u64().unwrap_or(config.agent.default_timeout_secs as u64) as u32;
 
-    let (host, port) = {
+    let (host, port, status) = {
         let reg = registry.lock().unwrap();
         match reg.get(target_name) {
-            Some(t) => (t.host.clone(), t.port),
+            Some(t) => (t.host.clone(), t.port, t.status.clone()),
             None => return make_tool_error(id, &format!("unknown target: {target_name}")),
         }
     };
 
     if host.is_empty() {
-        let status = {
-            let reg = registry.lock().unwrap();
-            reg.get(target_name).map(|t| t.status.clone()).unwrap_or_default()
-        };
         return make_tool_error(id, &format!("target '{}' is {} (no IP available)", target_name, status));
     }
 
@@ -356,19 +352,15 @@ async fn handle_ping(
         None => return make_tool_error(id, "missing required parameter: target"),
     };
 
-    let (host, port) = {
+    let (host, port, status) = {
         let reg = registry.lock().unwrap();
         match reg.get(target_name) {
-            Some(t) => (t.host.clone(), t.port),
+            Some(t) => (t.host.clone(), t.port, t.status.clone()),
             None => return make_tool_error(id, &format!("unknown target: {target_name}")),
         }
     };
 
     if host.is_empty() {
-        let status = {
-            let reg = registry.lock().unwrap();
-            reg.get(target_name).map(|t| t.status.clone()).unwrap_or_default()
-        };
         return make_tool_error(id, &format!("target '{}' is {} (no IP available)", target_name, status));
     }
 

@@ -17,11 +17,9 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             arch: amd64
-            linker: ""
             packages: "musl-tools"
           - target: aarch64-unknown-linux-musl
             arch: arm64
-            linker: aarch64-linux-gnu-gcc
             packages: "gcc-aarch64-linux-gnu"
             use_zigbuild: true
     steps:

@@ -26,9 +26,9 @@ max_concurrent_per_target = 4
 [agent.psk]
 # my-target = "output-of-openssl-rand-hex-32"
 
-[[targets]]
-name = "my-target"
-host = "192.168.1.50"
-port = 9876
-shell = "sh"
-tags = ["web"]
+# [[targets]]
+# name = "my-target"
+# host = "192.168.1.50"
+# port = 9876
+# shell = "sh"
+# tags = ["web"]
