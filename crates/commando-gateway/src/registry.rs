@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::config;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TargetSource {
     Manual,
@@ -87,7 +89,7 @@ impl Registry {
                     name: d.name.clone(),
                     host: d.host,
                     port: d.port,
-                    shell: "bash".to_string(),
+                    shell: config::default_shell(),
                     tags: vec![],
                     source: TargetSource::Discovered,
                     status: d.status,

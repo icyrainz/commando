@@ -85,7 +85,7 @@ fn default_agent_port() -> u16 { 9876 }
 fn default_timeout() -> u32 { 60 }
 fn default_connect_timeout() -> u64 { 5 }
 fn default_max_concurrent() -> usize { 4 }
-fn default_shell() -> String { "sh".to_string() }
+pub fn default_shell() -> String { "sh".to_string() }
 
 impl GatewayConfig {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
