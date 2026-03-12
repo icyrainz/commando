@@ -78,10 +78,11 @@ for NODE in "$@"; do
         fi
 
         echo "  [$HOSTNAME] Updating..."
+        ssh "root@$NODE" "pct exec $VMID -- systemctl stop commando-agent"
         ssh "root@$NODE" "pct push $VMID $REMOTE_BINARY /usr/local/bin/commando-agent --perms 755"
         ssh "root@$NODE" "pct push $VMID $REMOTE_SERVICE /etc/systemd/system/commando-agent.service"
         ssh "root@$NODE" "pct exec $VMID -- systemctl daemon-reload"
-        ssh "root@$NODE" "pct exec $VMID -- systemctl restart commando-agent"
+        ssh "root@$NODE" "pct exec $VMID -- systemctl start commando-agent"
         echo "  [$HOSTNAME] OK"
     done
 
