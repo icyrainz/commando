@@ -24,6 +24,19 @@ Each layer (local shell → SSH → container exec → bash -c) interprets quote
 
 Commando transports commands through MCP (JSON-RPC) and Cap'n Proto (binary serialization) — neither interprets the string as shell. The command arrives at the target machine untouched. Only one `sh -c` ever runs it.
 
+## AI Agent Efficiency
+
+SSH is expensive for AI coding agents — not just in latency, but in tokens and context window.
+
+| | SSH | Commando |
+|--|-----|----------|
+| Command | `ssh root@node "pct exec 100 -- bash -c 'cmd'"` | `command="cmd"` |
+| Escaping | Agent reasons about nested quotes every call | Zero — command passed as-is |
+| Target lookup | `ssh + pct list`, parse output, map hostname→VMID | `commando_list()` — one call |
+| Escaping failures | Common → retry loop burns tokens and context | Doesn't happen |
+
+Every failed SSH command with broken quoting costs 3-4 rounds of agent reasoning to fix. With Commando, that entire class of errors is eliminated.
+
 ## Performance
 
 The gateway is a persistent HTTP server. No SSH handshake per command.
