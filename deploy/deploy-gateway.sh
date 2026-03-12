@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
-# Deploy commando-gateway to akio-commando (LXC 134).
+# Deploy commando-gateway to a Proxmox LXC.
 # Pulls the latest image from ghcr.io and restarts the container.
 #
-# Usage: ./deploy-gateway.sh [version]
+# Usage: ./deploy-gateway.sh <node> <vmid> [version]
+#   node:    Proxmox node hostname (e.g., pve-node-1)
+#   vmid:    LXC container ID (e.g., 100)
 #   version: tag to deploy (default: latest)
 #
 # Example:
-#   ./deploy-gateway.sh          # deploy latest
-#   ./deploy-gateway.sh v0.2.0   # deploy specific version
+#   ./deploy-gateway.sh pve-node-1 100          # deploy latest
+#   ./deploy-gateway.sh pve-node-1 100 v0.2.0   # deploy specific version
 
 set -euo pipefail
 
-NODE="akio-lab"
-VMID=134
-VERSION="${1:-latest}"
+NODE="${1:?Usage: $0 <node> <vmid> [version]}"
+VMID="${2:?Usage: $0 <node> <vmid> [version]}"
+VERSION="${3:-latest}"
 IMAGE="ghcr.io/icyrainz/commando-gateway:${VERSION}"
 
 echo "Deploying $IMAGE to LXC $VMID..."
