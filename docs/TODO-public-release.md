@@ -6,9 +6,6 @@ Last verified: 2026-03-12
 
 ## Still Open
 
-### No TLS between gateway and agents
-Commands and stdout/stderr are plaintext on the wire. HMAC protects the PSK during auth, but command output (which may contain secrets) is visible to anyone sniffing the LAN. Consider optional TLS or document the threat model clearly.
-
 ### PSK management is manual and brittle
 PSKs are generated in deploy scripts and printed to stdout for copy-paste into `gateway.toml`. No tooling to verify the PSK table matches deployed agents, rotate keys, or diagnose mismatches. Consider a `commando-gateway verify-psks` subcommand.
 
@@ -28,6 +25,7 @@ PSKs are generated in deploy scripts and printed to stdout for copy-paste into `
 - ~~Output truncation is silent~~ — `[output truncated]` message appended when truncation occurs
 - ~~Registry cache path hardcoded~~ — `--cache-dir` CLI flag added, configurable in gateway.toml
 - ~~Gateway has zero auth~~ — Bearer token auth on `/mcp` endpoint via `COMMANDO_API_KEY` env var, constant-time comparison, `/health` stays open
+- ~~No TLS between gateway and agents~~ — Documented threat model in README: trusted LAN only, recommends reverse proxy (Caddy example) for HTTPS and Tailscale/WireGuard for full encryption
 
 ## What's Already Good (keep these)
 

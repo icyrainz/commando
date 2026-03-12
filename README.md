@@ -236,8 +236,57 @@ cd ~/docker-app && docker compose pull && docker compose up -d
 - **HMAC challenge-response** — Agent PSKs never cross the wire
 - **Per-agent PSKs** — compromised agent only exposes itself, not the fleet
 - **Capability-based access** — Cap'n Proto type system enforces auth before exec
-- **Trusted LAN only** — no TLS (commands/output are plaintext on the wire)
 - **Agents run as root** — designed for single-admin environments
+
+### Threat Model
+
+Commando is designed for **trusted LANs only**. It gives root shell access to every machine in your fleet — do not expose it to the public internet.
+
+**What's encrypted:**
+- Bearer token auth protects the MCP endpoint from unauthorized access
+- HMAC challenge-response ensures PSKs never cross the wire during agent auth
+
+**What's not encrypted:**
+- Commands and their output (stdout/stderr) travel as plaintext between gateway and agents (Cap'n Proto RPC) and between your AI agent and the gateway (HTTP)
+- The bearer token itself is sent in plaintext HTTP headers
+
+If your AI agent connects from outside your LAN (e.g., cloud-hosted coding agent), you **must** add TLS in front of the gateway. If you're concerned about LAN sniffing, use a network-level overlay.
+
+### Recommended: Reverse Proxy with TLS
+
+Put Caddy, Traefik, or nginx in front of the gateway for HTTPS. Example with Caddy:
+
+```
+commando.lan {
+    reverse_proxy localhost:9877
+}
+```
+
+Caddy handles TLS automatically (self-signed for `.lan` domains, or ACME for public domains). Your MCP config then uses `https://`:
+
+```json
+{
+  "mcpServers": {
+    "commando": {
+      "type": "http",
+      "url": "https://commando.lan/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_API_KEY"
+      }
+    }
+  }
+}
+```
+
+### Recommended: WireGuard or Tailscale
+
+For encrypting all traffic (including gateway ↔ agent), use a network-level overlay like [Tailscale](https://tailscale.com/) or [WireGuard](https://www.wireguard.com/). This encrypts everything without any code changes:
+
+- Gateway and agents communicate over the encrypted overlay
+- Your AI agent connects to the gateway's Tailscale/WireGuard IP
+- No certificates to manage, no reverse proxy needed
+
+This is the simplest path to full encryption and is standard practice in homelabs.
 
 ## Building from Source
 
