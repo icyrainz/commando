@@ -475,13 +475,7 @@ mod tests {
     fn test_config() -> Arc<GatewayConfig> {
         Arc::new(GatewayConfig {
             server: Default::default(),
-            proxmox: crate::config::ProxmoxConfig {
-                nodes: vec![],
-                user: String::new(),
-                token_id: String::new(),
-                token_secret: String::new(),
-                discovery_interval_secs: 60,
-            },
+            proxmox: None,
             agent: crate::config::AgentConnectionConfig {
                 default_port: 9876,
                 default_timeout_secs: 60,
@@ -499,13 +493,7 @@ mod tests {
         psk.insert("my-box".to_string(), "secret123".to_string());
         Arc::new(GatewayConfig {
             server: Default::default(),
-            proxmox: crate::config::ProxmoxConfig {
-                nodes: vec![],
-                user: String::new(),
-                token_id: String::new(),
-                token_secret: String::new(),
-                discovery_interval_secs: 60,
-            },
+            proxmox: None,
             agent: crate::config::AgentConnectionConfig {
                 default_port: 9876,
                 default_timeout_secs: 60,
@@ -731,13 +719,7 @@ mod tests {
         psk.insert("node-1/stopped-app".to_string(), "secret123".to_string());
         let config = Arc::new(GatewayConfig {
             server: Default::default(),
-            proxmox: crate::config::ProxmoxConfig {
-                nodes: vec![],
-                user: String::new(),
-                token_id: String::new(),
-                token_secret: String::new(),
-                discovery_interval_secs: 60,
-            },
+            proxmox: None,
             agent: crate::config::AgentConnectionConfig {
                 default_port: 9876,
                 default_timeout_secs: 60,
@@ -781,13 +763,7 @@ mod tests {
         psk.insert("node-1/stopped-app".to_string(), "secret123".to_string());
         let config = Arc::new(GatewayConfig {
             server: Default::default(),
-            proxmox: crate::config::ProxmoxConfig {
-                nodes: vec![],
-                user: String::new(),
-                token_id: String::new(),
-                token_secret: String::new(),
-                discovery_interval_secs: 60,
-            },
+            proxmox: None,
             agent: crate::config::AgentConnectionConfig {
                 default_port: 9876,
                 default_timeout_secs: 60,

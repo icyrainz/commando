@@ -67,7 +67,7 @@ fn main() -> Result<()> {
         .init();
 
     info!(
-        proxmox_nodes = config.proxmox.nodes.len(),
+        proxmox_nodes = config.proxmox.as_ref().map(|p| p.nodes.len()).unwrap_or(0),
         manual_targets = config.targets.len(),
         transport = %config.server.transport,
         "starting commando-gateway v{}",
@@ -122,7 +122,7 @@ async fn run_gateway(config: Arc<config::GatewayConfig>) -> Result<()> {
             },
             Err(e) => warn!(error = %e, "failed to read registry cache"),
         }
-    } else if !config.proxmox.nodes.is_empty() {
+    } else if config.proxmox.as_ref().is_some_and(|p| !p.nodes.is_empty()) {
         info!("no registry cache, running initial discovery");
         run_discovery_cycle(&config, &registry).await;
     }
@@ -132,19 +132,22 @@ async fn run_gateway(config: Arc<config::GatewayConfig>) -> Result<()> {
     ));
 
     // Spawn background discovery loop
-    if !config.proxmox.nodes.is_empty() {
-        let config_clone = config.clone();
-        let registry_clone = registry.clone();
-        tokio::task::spawn_local(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                config_clone.proxmox.discovery_interval_secs,
-            ));
-            interval.tick().await; // Skip immediate first tick
-            loop {
-                interval.tick().await;
-                run_discovery_cycle(&config_clone, &registry_clone).await;
-            }
-        });
+    if let Some(proxmox) = &config.proxmox {
+        if !proxmox.nodes.is_empty() {
+            let discovery_interval = proxmox.discovery_interval_secs;
+            let config_clone = config.clone();
+            let registry_clone = registry.clone();
+            tokio::task::spawn_local(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                    discovery_interval,
+                ));
+                interval.tick().await; // Skip immediate first tick
+                loop {
+                    interval.tick().await;
+                    run_discovery_cycle(&config_clone, &registry_clone).await;
+                }
+            });
+        }
     }
 
     // Run MCP server on selected transport
@@ -159,6 +162,11 @@ async fn run_discovery_cycle(
     config: &config::GatewayConfig,
     registry: &Arc<Mutex<Registry>>,
 ) {
+    let proxmox_config = match &config.proxmox {
+        Some(p) => p,
+        None => return,
+    };
+
     let http_client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true) // Proxmox uses self-signed certs
         .timeout(std::time::Duration::from_secs(10))
@@ -167,8 +175,8 @@ async fn run_discovery_cycle(
 
     let mut all_discovered = Vec::new();
 
-    for node in &config.proxmox.nodes {
-        match proxmox::discover_node(&http_client, node, &config.proxmox, config.agent.default_port).await {
+    for node in &proxmox_config.nodes {
+        match proxmox::discover_node(&http_client, node, proxmox_config, config.agent.default_port).await {
             Ok(targets) => {
                 info!(node = %node.name, count = targets.len(), "discovered LXC targets");
                 all_discovered.extend(targets);
