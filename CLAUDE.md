@@ -31,6 +31,16 @@ cargo +nightly test
 - `crates/commando-gateway/` — Gateway binary (MCP stdio server, routes to agents)
 - `schema/commando.capnp` — Cap'n Proto interface definition (single source of truth)
 
+## Before Pushing
+
+Always run these before pushing to remote:
+
+```bash
+cargo +nightly fmt -- --check
+cargo +nightly clippy -- -D warnings
+cargo +nightly test
+```
+
 ## Conventions
 
 - Single-threaded tokio runtime (`current_thread`) — required for capnp-rpc `!Send` types

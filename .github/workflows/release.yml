@@ -25,6 +25,12 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
+
   build:
     needs: test
     runs-on: ubuntu-latest

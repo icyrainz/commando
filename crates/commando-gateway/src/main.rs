@@ -54,10 +54,10 @@ fn main() -> Result<()> {
     }
 
     // COMMANDO_API_KEY env var overrides config file
-    if let Ok(env_key) = std::env::var("COMMANDO_API_KEY") {
-        if !env_key.is_empty() {
-            config.server.api_key = Some(env_key);
-        }
+    if let Ok(env_key) = std::env::var("COMMANDO_API_KEY")
+        && !env_key.is_empty()
+    {
+        config.server.api_key = Some(env_key);
     }
 
     // Require API key for streamable-http transport
