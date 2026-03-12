@@ -234,7 +234,7 @@ cd ~/docker-app && docker compose pull && docker compose up -d
 
 - **Bearer token auth** — MCP endpoint requires `Authorization: Bearer <key>` (constant-time comparison). `/health` stays open.
 - **HMAC challenge-response** — Agent PSKs never cross the wire
-- **Per-agent PSKs** — compromised agent only exposes itself, not the fleet
+- **Per-agent PSKs** — compromised agent only exposes itself, not the fleet. PSKs are generated during agent install and stored in `gateway.toml`. They're set-and-forget — to rotate, re-run `install-agent.sh` on the target and update the PSK in `gateway.toml`. Mismatches produce a clear auth error in gateway logs.
 - **Capability-based access** — Cap'n Proto type system enforces auth before exec
 - **Agents run as root** — designed for single-admin environments
 

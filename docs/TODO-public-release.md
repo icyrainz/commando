@@ -6,9 +6,6 @@ Last verified: 2026-03-12
 
 ## Still Open
 
-### PSK management is manual and brittle
-PSKs are generated in deploy scripts and printed to stdout for copy-paste into `gateway.toml`. No tooling to verify the PSK table matches deployed agents, rotate keys, or diagnose mismatches. Consider a `commando-gateway verify-psks` subcommand.
-
 ### Dockerfile requires pre-built binary
 `Dockerfile.gateway` is `FROM scratch` + `COPY` pre-built binaries. `docker build` fails without pre-built artifacts. The release workflow handles this, but local `docker build` won't work. Consider a multi-stage Dockerfile that builds from source.
 
@@ -26,6 +23,7 @@ PSKs are generated in deploy scripts and printed to stdout for copy-paste into `
 - ~~Registry cache path hardcoded~~ — `--cache-dir` CLI flag added, configurable in gateway.toml
 - ~~Gateway has zero auth~~ — Bearer token auth on `/mcp` endpoint via `COMMANDO_API_KEY` env var, constant-time comparison, `/health` stays open
 - ~~No TLS between gateway and agents~~ — Documented threat model in README: trusted LAN only, recommends reverse proxy (Caddy example) for HTTPS and Tailscale/WireGuard for full encryption
+- ~~PSK management is manual and brittle~~ — Documented in README: set-and-forget, rotate via re-running install script, mismatches show clear auth errors in logs
 
 ## What's Already Good (keep these)
 
