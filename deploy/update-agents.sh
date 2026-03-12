@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
-# Update commando-agent binary on all running LXCs.
-# Downloads from GitHub releases and restarts the service.
-# Does NOT touch config or PSKs — use deploy-agents.sh for first-time setup.
+# Update commando-agent binary + service file on all running Proxmox LXCs.
+# Downloads from GitHub releases, pushes to every LXC that already has an agent,
+# and restarts the service. Does NOT touch config or PSKs.
 #
-# Usage: ./update-agents.sh <proxmox-node> [proxmox-node-2] ...
-#   Downloads the latest release by default.
-#   Set COMMANDO_VERSION=v0.2.0 to pin a specific version.
+# Prerequisites:
+#   - SSH root access to the specified Proxmox nodes
+#   - deploy/commando-agent.service must exist alongside this script
+#   - Agents must already be installed (skips LXCs without /usr/local/bin/commando-agent)
 #
-# Example:
-#   ./update-agents.sh akio-lab
-#   COMMANDO_VERSION=v0.1.0 ./update-agents.sh akio-lab akio-garage
+# Usage: ./deploy/update-agents.sh <proxmox-node> [proxmox-node-2] ...
+#
+# Environment:
+#   COMMANDO_VERSION  - GitHub release tag (default: "latest")
+#
+# Examples:
+#   ./deploy/update-agents.sh akio-lab akio-garage
+#   COMMANDO_VERSION=v0.3.2 ./deploy/update-agents.sh akio-lab
+#
+# For non-Proxmox hosts, use install-agent.sh instead (SSH in and curl-pipe-bash).
 
 set -euo pipefail
 

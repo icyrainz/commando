@@ -1,14 +1,27 @@
 #!/usr/bin/env bash
-# Install or update commando-agent on any Linux machine.
-# Detects architecture, downloads the binary from GitHub releases,
-# installs the systemd service, and starts/restarts the agent.
+# Install or update commando-agent on any Linux machine (x86_64 or aarch64).
+# Works for both Proxmox LXCs and standalone hosts — architecture-agnostic.
 #
-# Usage:
+# What it does:
+#   - Downloads the correct binary from GitHub releases
+#   - Installs/updates /usr/local/bin/commando-agent and the systemd service
+#   - First install: generates a PSK, creates /etc/commando/agent.toml,
+#     and prints the TOML snippets to add to gateway.toml
+#   - Update: preserves existing config, only replaces binary + service file
+#
+# Prerequisites:
+#   - Root access (run as root or with sudo)
+#   - curl, openssl, systemctl
+#
+# Usage (SSH into the target, then):
 #   curl -sL https://raw.githubusercontent.com/icyrainz/commando/main/deploy/install-agent.sh | bash
-#   curl -sL ... | COMMANDO_VERSION=v0.3.0 bash
+#   curl -sL https://raw.githubusercontent.com/icyrainz/commando/main/deploy/install-agent.sh | COMMANDO_VERSION=v0.3.2 bash
 #
-# First-time install will prompt for PSK and bind address.
-# Updates preserve the existing config.
+# Environment:
+#   COMMANDO_VERSION  - GitHub release tag (default: "latest")
+#
+# After first install, copy the printed [agent.psk] and [[targets]] entries
+# into the gateway's gateway.toml and restart the gateway.
 
 set -euo pipefail
 

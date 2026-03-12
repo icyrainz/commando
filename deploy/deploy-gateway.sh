@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
-# Deploy commando-gateway to a Proxmox LXC.
-# Pulls the latest image from ghcr.io and restarts the container.
+# Deploy or update the commando-gateway Docker container on a Proxmox LXC.
+# Pulls the image from ghcr.io/icyrainz/commando-gateway and restarts via docker compose.
 #
-# Usage: ./deploy-gateway.sh <node> <vmid> [version]
-#   node:    Proxmox node hostname (e.g., pve-node-1)
-#   vmid:    LXC container ID (e.g., 100)
-#   version: tag to deploy (default: latest)
+# Prerequisites:
+#   - SSH root access to the Proxmox node
+#   - The target LXC must already have Docker installed and a docker-compose.yml
+#     at /root/docker-app/ that references the commando-gateway image
 #
-# Example:
-#   ./deploy-gateway.sh pve-node-1 100          # deploy latest
-#   ./deploy-gateway.sh pve-node-1 100 v0.2.0   # deploy specific version
+# Usage: ./deploy/deploy-gateway.sh <proxmox-node> <vmid> [version]
+#
+# Arguments:
+#   proxmox-node  - Proxmox node hostname (e.g., akio-lab)
+#   vmid          - LXC container ID where gateway runs (e.g., 111)
+#   version       - Docker image tag (default: "latest")
+#
+# Examples:
+#   ./deploy/deploy-gateway.sh akio-lab 111            # deploy latest
+#   ./deploy/deploy-gateway.sh akio-lab 111 v0.3.2     # deploy specific version
 
 set -euo pipefail
 

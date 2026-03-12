@@ -1,11 +1,24 @@
 #!/usr/bin/env bash
-# Deploy commando-agent to all LXCs on specified Proxmox nodes.
-# Usage: ./deploy-agents.sh node-1 node-2
+# First-time deploy of commando-agent to ALL running LXCs on Proxmox nodes.
+# Pushes binary + service + config to every LXC, generates unique PSKs,
+# and prints the [agent.psk] entries to paste into gateway.toml.
+#
+# WARNING: Overwrites existing agent configs. For updates, use update-agents.sh instead.
 #
 # Prerequisites:
-# - SSH access to Proxmox nodes as root
-# - commando-agent binary built at target/x86_64-unknown-linux-musl/release/commando-agent
-# - This script generates unique PSKs per agent
+#   - SSH root access to the specified Proxmox nodes
+#   - Agent binary pre-built at target/x86_64-unknown-linux-musl/release/commando-agent
+#     (build with: cargo build --release --target x86_64-unknown-linux-musl -p commando-agent)
+#
+# Usage: ./deploy/deploy-agents.sh <proxmox-node> [proxmox-node-2] ...
+#
+# Examples:
+#   ./deploy/deploy-agents.sh akio-lab akio-garage
+#
+# After running, copy the printed PSK entries into your gateway.toml [agent.psk] section
+# and restart the gateway.
+#
+# For non-Proxmox hosts, use install-agent.sh instead (SSH in and curl-pipe-bash).
 
 set -euo pipefail
 
