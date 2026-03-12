@@ -6,9 +6,6 @@ Last verified: 2026-03-12
 
 ## Still Open
 
-### Dockerfile requires pre-built binary
-`Dockerfile.gateway` is `FROM scratch` + `COPY` pre-built binaries. `docker build` fails without pre-built artifacts. The release workflow handles this, but local `docker build` won't work. Consider a multi-stage Dockerfile that builds from source.
-
 ## Fixed
 
 - ~~Agents always run as root, no systemd hardening~~ — `NoNewPrivileges=yes`, `ProtectSystem=true`, `PrivateTmp=yes` added to service file
@@ -24,6 +21,7 @@ Last verified: 2026-03-12
 - ~~Gateway has zero auth~~ — Bearer token auth on `/mcp` endpoint via `COMMANDO_API_KEY` env var, constant-time comparison, `/health` stays open
 - ~~No TLS between gateway and agents~~ — Documented threat model in README: trusted LAN only, recommends reverse proxy (Caddy example) for HTTPS and Tailscale/WireGuard for full encryption
 - ~~PSK management is manual and brittle~~ — Documented in README: set-and-forget, rotate via re-running install script, mismatches show clear auth errors in logs
+- ~~Dockerfile requires pre-built binary~~ — By design: `FROM scratch` keeps image at ~3MB, CI release workflow handles builds with caching and cross-compilation, users pull from `ghcr.io`
 
 ## What's Already Good (keep these)
 
