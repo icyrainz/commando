@@ -13,7 +13,7 @@ use commando_gateway::rpc;
 use commando_gateway::streamable;
 
 #[derive(Parser)]
-#[command(name = "commando-gateway", about = "Commando MCP gateway")]
+#[command(name = "commando-gateway", version, about = "Commando MCP gateway")]
 struct Cli {
     #[arg(long, default_value = "/etc/commando/gateway.toml")]
     config: std::path::PathBuf,

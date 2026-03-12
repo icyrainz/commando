@@ -16,9 +16,16 @@ set -euo pipefail
 REPO="icyrainz/commando"
 VERSION="${COMMANDO_VERSION:-latest}"
 BINARY_NAME="commando-agent-x86_64-linux"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SERVICE_FILE="$SCRIPT_DIR/commando-agent.service"
 
 if [ $# -eq 0 ]; then
     echo "Usage: $0 <proxmox-node-1> [proxmox-node-2] ..."
+    exit 1
+fi
+
+if [ ! -f "$SERVICE_FILE" ]; then
+    echo "Error: Service file not found at $SERVICE_FILE"
     exit 1
 fi
 
@@ -40,7 +47,9 @@ for NODE in "$@"; do
     echo "=== Updating agents on $NODE ==="
 
     REMOTE_BINARY="/tmp/commando-agent"
+    REMOTE_SERVICE="/tmp/commando-agent.service"
     scp "$TMPBIN" "root@$NODE:$REMOTE_BINARY"
+    scp "$SERVICE_FILE" "root@$NODE:$REMOTE_SERVICE"
 
     VMIDS=$(ssh "root@$NODE" "pct list" | tail -n +2 | awk '{print $1}')
 
@@ -62,11 +71,13 @@ for NODE in "$@"; do
 
         echo "  [$HOSTNAME] Updating..."
         ssh "root@$NODE" "pct push $VMID $REMOTE_BINARY /usr/local/bin/commando-agent --perms 755"
+        ssh "root@$NODE" "pct push $VMID $REMOTE_SERVICE /etc/systemd/system/commando-agent.service"
+        ssh "root@$NODE" "pct exec $VMID -- systemctl daemon-reload"
         ssh "root@$NODE" "pct exec $VMID -- systemctl restart commando-agent"
         echo "  [$HOSTNAME] OK"
     done
 
-    ssh "root@$NODE" "rm -f $REMOTE_BINARY"
+    ssh "root@$NODE" "rm -f $REMOTE_BINARY $REMOTE_SERVICE"
 done
 
 rm -f "$TMPBIN"
