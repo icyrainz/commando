@@ -1108,4 +1108,376 @@ mod tests {
                 .is_some()
         );
     }
+
+    // ---- Streaming / pagination tests ----
+
+    fn streaming_config(page_max_bytes: usize) -> StreamingConfig {
+        StreamingConfig {
+            page_timeout_secs: 1, // short timeout for tests
+            page_max_bytes,
+            session_idle_timeout_secs: 60,
+        }
+    }
+
+    /// Helper: populate a session with data and optionally mark completed.
+    fn populate_session(
+        session_map: &Rc<RefCell<SessionMap>>,
+        token: &str,
+        stdout: &[u8],
+        stderr: &[u8],
+        completed: bool,
+        exit_code: i32,
+    ) {
+        let mut map = session_map.borrow_mut();
+        let session = map.get_by_token_mut(token).unwrap();
+        session.stdout_buffer.extend_from_slice(stdout);
+        session.stderr_buffer.extend_from_slice(stderr);
+        if completed {
+            session.completed = true;
+            session.exec_result = Some(crate::session::StreamExecResult {
+                exit_code,
+                duration_ms: 42,
+                timed_out: false,
+            });
+        }
+        session.notify.notify_one();
+    }
+
+    // -- format_page_response tests --
+
+    #[test]
+    fn format_page_stdout_only() {
+        let id = json!(1);
+        let page =
+            json!({ "stdout": "hello world", "stderr": "", "exit_code": 0, "duration_ms": 10 });
+        let resp = format_page_response(&id, &page);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("hello world"));
+        assert!(text.contains("exit_code: 0"));
+        assert!(text.contains("duration: 10ms"));
+        assert!(!resp["result"]["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[test]
+    fn format_page_stderr_included() {
+        let id = json!(1);
+        let page =
+            json!({ "stdout": "out", "stderr": "err msg", "exit_code": 0, "duration_ms": 5 });
+        let resp = format_page_response(&id, &page);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("out"));
+        assert!(text.contains("[stderr]\nerr msg"));
+    }
+
+    #[test]
+    fn format_page_nonzero_exit_is_error() {
+        let id = json!(1);
+        let page = json!({ "stdout": "", "stderr": "fail", "exit_code": 1, "duration_ms": 0 });
+        let resp = format_page_response(&id, &page);
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[test]
+    fn format_page_timed_out() {
+        let id = json!(1);
+        let page = json!({ "stdout": "partial", "stderr": "", "exit_code": -1, "duration_ms": 5000, "timed_out": true });
+        let resp = format_page_response(&id, &page);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("[timed out]"));
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[test]
+    fn format_page_streaming_next_page() {
+        let id = json!(1);
+        let page = json!({ "stdout": "chunk1", "stderr": "", "next_page": "abc123" });
+        let resp = format_page_response(&id, &page);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("[streaming] next_page=abc123"));
+        // No exit_code means not an error
+        assert!(!resp["result"]["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[test]
+    fn format_page_empty_output() {
+        let id = json!(1);
+        let page = json!({ "stdout": "", "stderr": "", "next_page": "tok123" });
+        let resp = format_page_response(&id, &page);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        // Should still have the streaming token
+        assert!(text.contains("[streaming] next_page=tok123"));
+    }
+
+    // -- build_page tests --
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_completed_session_returns_final() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        populate_session(&sm, &token, b"output data", b"", true, 0);
+
+        let config = streaming_config(32768);
+        let page = build_page(&sm, &token, &config).await.unwrap();
+
+        assert_eq!(page["stdout"], "output data");
+        assert_eq!(page["exit_code"], 0);
+        assert_eq!(page["duration_ms"], 42);
+        assert!(page["next_page"].is_null()); // final page has no next_page
+        // Session should be removed after final page
+        assert!(sm.borrow().get_by_token(&token).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_running_session_rotates_token() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        populate_session(&sm, &token, b"partial output", b"", false, 0);
+
+        let config = streaming_config(32768);
+        let page = build_page(&sm, &token, &config).await.unwrap();
+
+        assert_eq!(page["stdout"], "partial output");
+        assert!(page["exit_code"].is_null()); // not final
+        let next_page = page["next_page"].as_str().unwrap();
+        assert!(!next_page.is_empty());
+        // Old token should be invalid
+        assert!(sm.borrow().get_by_token(&token).is_none());
+        // New token should work
+        assert!(sm.borrow().get_by_token(next_page).is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_respects_page_max_bytes() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        // 100 bytes of stdout, page limit of 50
+        let big_data = vec![b'A'; 100];
+        populate_session(&sm, &token, &big_data, b"", false, 0);
+
+        let config = streaming_config(50);
+        let page = build_page(&sm, &token, &config).await.unwrap();
+
+        // Should only get 50 bytes
+        assert_eq!(page["stdout"].as_str().unwrap().len(), 50);
+        // Should have a next_page (still has data)
+        assert!(page["next_page"].as_str().is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_large_output_completed_not_final_until_drained() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        // 100 bytes of stdout, page limit of 50, command completed
+        let big_data = vec![b'X'; 100];
+        populate_session(&sm, &token, &big_data, b"", true, 0);
+
+        let config = streaming_config(50);
+
+        // First page: should get 50 bytes but NOT be final (50 bytes remain)
+        let page1 = build_page(&sm, &token, &config).await.unwrap();
+        assert_eq!(page1["stdout"].as_str().unwrap().len(), 50);
+        assert!(page1["exit_code"].is_null(), "should not be final page yet");
+        let token2 = page1["next_page"].as_str().unwrap();
+
+        // Second page: drain remaining 50 bytes, now it's final
+        let page2 = build_page(&sm, token2, &config).await.unwrap();
+        assert_eq!(page2["stdout"].as_str().unwrap().len(), 50);
+        assert_eq!(page2["exit_code"], 0);
+        assert!(page2["next_page"].is_null());
+        // Session cleaned up
+        assert!(sm.borrow().get_by_token(token2).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_stdout_and_stderr_share_budget() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        // 40 bytes stdout + 40 bytes stderr, page max 50
+        populate_session(&sm, &token, &vec![b'O'; 40], &vec![b'E'; 40], true, 0);
+
+        let config = streaming_config(50);
+        let page = build_page(&sm, &token, &config).await.unwrap();
+
+        // stdout gets first 40, stderr gets remaining budget (50-40=10)
+        assert_eq!(page["stdout"].as_str().unwrap().len(), 40);
+        assert_eq!(page["stderr"].as_str().unwrap().len(), 10);
+        // Still has remaining stderr data, so NOT final even though completed
+        assert!(page["exit_code"].is_null());
+        assert!(page["next_page"].as_str().is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_invalid_token_returns_error() {
+        let sm = test_session_map();
+        let config = streaming_config(32768);
+        let result = build_page(&sm, "bogus-token", &config).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid or expired"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_empty_completed_session() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        // No output, but completed
+        populate_session(&sm, &token, b"", b"", true, 0);
+
+        let config = streaming_config(32768);
+        let page = build_page(&sm, &token, &config).await.unwrap();
+
+        assert_eq!(page["stdout"], "");
+        assert_eq!(page["stderr"], "");
+        assert_eq!(page["exit_code"], 0);
+        assert!(page["next_page"].is_null());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_timeout_with_no_data() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        // Don't populate any data — session exists but empty and not completed.
+
+        let config = streaming_config(32768);
+        let page = build_page(&sm, &token, &config).await.unwrap();
+
+        // After timeout, should return an empty intermediate page
+        assert_eq!(page["stdout"], "");
+        assert_eq!(page["stderr"], "");
+        assert!(page["next_page"].as_str().is_some());
+    }
+
+    // -- handle_output tests --
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_output_missing_page_param() {
+        let sm = test_session_map();
+        let config = streaming_config(32768);
+        let id = json!(1);
+        let args = json!({});
+        let resp = handle_output(&id, &args, &sm, &config).await;
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+        assert!(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("missing required parameter: page")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_output_invalid_token() {
+        let sm = test_session_map();
+        let config = streaming_config(32768);
+        let id = json!(1);
+        let args = json!({ "page": "nonexistent-token" });
+        let resp = handle_output(&id, &args, &sm, &config).await;
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+        assert!(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("invalid or expired")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_output_returns_data_and_next_page() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        populate_session(&sm, &token, b"streamed output", b"", false, 0);
+
+        let config = streaming_config(32768);
+        let id = json!(1);
+        let args = json!({ "page": token });
+        let resp = handle_output(&id, &args, &sm, &config).await;
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("streamed output"));
+        assert!(text.contains("[streaming] next_page="));
+        assert!(!resp["result"]["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_output_final_page() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        populate_session(&sm, &token, b"final output", b"", true, 0);
+
+        let config = streaming_config(32768);
+        let id = json!(1);
+        let args = json!({ "page": token });
+        let resp = handle_output(&id, &args, &sm, &config).await;
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("final output"));
+        assert!(text.contains("exit_code: 0"));
+        assert!(!text.contains("[streaming]"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_page_polling_flow() {
+        let sm = test_session_map();
+        let (token, _sid) = sm.borrow_mut().create_session();
+        let config = streaming_config(20); // tiny pages
+
+        // Simulate: 50 bytes of stdout arrives, command still running
+        populate_session(
+            &sm,
+            &token,
+            b"AAAAAAAAAABBBBBBBBBBCCCCCCCCCC",
+            b"",
+            false,
+            0,
+        );
+
+        let id = json!(1);
+
+        // Page 1: first 20 bytes
+        let args1 = json!({ "page": token });
+        let resp1 = handle_output(&id, &args1, &sm, &config).await;
+        let text1 = resp1["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text1.contains("AAAAAAAAAABBBBBBBBBB")); // first 20
+        // Extract next_page token
+        let next1 = text1
+            .lines()
+            .find(|l| l.contains("next_page="))
+            .unwrap()
+            .split("next_page=")
+            .nth(1)
+            .unwrap();
+
+        // Page 2: next 10 bytes (remaining) — command still running
+        let args2 = json!({ "page": next1 });
+        let resp2 = handle_output(&id, &args2, &sm, &config).await;
+        let text2 = resp2["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text2.contains("CCCCCCCCCC")); // remaining 10
+        let next2 = text2
+            .lines()
+            .find(|l| l.contains("next_page="))
+            .unwrap()
+            .split("next_page=")
+            .nth(1)
+            .unwrap()
+            .to_string();
+
+        // Now mark the command as completed
+        {
+            let mut map = sm.borrow_mut();
+            let session = map.get_by_token_mut(&next2).unwrap();
+            session.completed = true;
+            session.exec_result = Some(crate::session::StreamExecResult {
+                exit_code: 0,
+                duration_ms: 100,
+                timed_out: false,
+            });
+            session.notify.notify_one();
+        }
+
+        // Page 3: final page with exit code
+        let args3 = json!({ "page": next2 });
+        let resp3 = handle_output(&id, &args3, &sm, &config).await;
+        let text3 = resp3["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text3.contains("exit_code: 0"));
+        assert!(!text3.contains("[streaming]")); // no more pages
+    }
 }
