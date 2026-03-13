@@ -520,10 +520,10 @@ For non-LXC machines (e.g., desktops, bare-metal servers), deploy manually via `
 - **Streaming output:** Cap'n Proto streaming for long-running commands — important for UX on commands that take minutes
 - **Per-caller authorization:** Role-based permissions when multiple clients connect (beyond single Claude Code instance)
 - **File transfer:** Read/write files on targets without shell commands
-- **Service helpers:** Typed tools like `docker_compose(action, service)`, `systemctl(action, unit)`
 - **Web UI:** Dashboard showing all agents, status, recent commands
 - **Audit log:** Record all commands executed through Commando
 - **Agent auto-update:** Gateway pushes new agent binaries to targets
 - **Batch exec (`commando_exec_batch`):** Fan-out a command to multiple targets in parallel, returning results per target — useful for fleet-wide operations like `apt update`
 - **Graceful agent shutdown:** On SIGTERM, the agent should SIGTERM all active child process groups (5s grace + SIGKILL) before exiting, preventing orphaned processes during agent restarts
 - **Version negotiation:** `agentVersion` is already returned by `Authenticator.authenticate()` — add compatibility checks in the gateway to detect incompatible agents and surface clear errors during schema evolution
+- **LLM-optimized truncation guidance:** When output is truncated, append actionable hints (e.g., "pipe through `tail`/`head`/`grep` to narrow output") so the LLM knows how to explore the rest instead of blindly retrying. Needs proper spec — the gateway presentation layer should guide the LLM without assuming why the command was run
