@@ -9,7 +9,7 @@ When Claude Code runs a long command via `commando_exec` (e.g., `apt dist-upgrad
 
 ## Solution
 
-Add paginated output to `commando_exec`. The gateway breaks command output into pages based on time (5s) or size (128KB), whichever comes first. Fast commands complete in a single page — same experience as today. Long commands return partial output with a `next_page` token that the LLM polls to get subsequent pages.
+Add paginated output to `commando_exec`. The gateway breaks command output into pages based on time (5s) or size (32KB), whichever comes first. Fast commands complete in a single page — same experience as today. Long commands return partial output with a `next_page` token that the LLM polls to get subsequent pages.
 
 ### Non-Goals
 
@@ -100,7 +100,7 @@ Each MCP response (both `commando_exec` and `commando_output`) waits up to **5 s
 
 A page is emitted when any of these conditions is met:
 - **5 seconds elapsed** since the page started
-- **128KB of new output** accumulated since the page started
+- **32KB of new output** accumulated since the page started
 - **Command completed** (regardless of time or size)
 
 ### Flow
@@ -110,7 +110,7 @@ A page is emitted when any of these conditions is met:
 3. Gateway waits up to 5s for output/completion
 4. Returns first page:
    - Command completed within 5s → full output + `exit_code`, no `next_page` (same as today)
-   - Still running or hit 128KB → delta output + `next_page` token
+   - Still running or hit 32KB → delta output + `next_page` token
 5. `commando_output(page: "token")` → arrives as work item via channel → `LocalSet` worker reads session, returns delta since last poll, waits up to 5s, resets idle timer
 6. Last page: command completed, remaining output + `exit_code` + `duration_ms`, no `next_page`
 
@@ -204,7 +204,7 @@ New gateway config fields under `[streaming]`:
 ```toml
 [streaming]
 page_timeout_secs = 5         # max wait per page before returning
-page_max_bytes = 131072       # 128KB max output per page
+page_max_bytes = 32768        # 32KB max output per page
 session_idle_timeout_secs = 60 # kill command if LLM stops polling
 ```
 
