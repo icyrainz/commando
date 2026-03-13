@@ -105,3 +105,14 @@ Pulls the Docker image from `ghcr.io/icyrainz/commando-gateway` and restarts the
 - `deploy-agents.sh` and `update-agents.sh` are Proxmox-specific (use `pct` commands). For non-Proxmox hosts, use `install-agent.sh` via SSH.
 - After `install-agent.sh` or `deploy-agents.sh`, the PSK output must be added to the gateway's `gateway.toml` under `[agent.psk]` and the gateway restarted.
 - The agent cannot update itself via `commando_exec` — stopping the agent kills its child processes. Always update agents via SSH using the scripts above.
+
+## Release Workflow
+
+1. Run pre-push checks: `cargo +nightly fmt -- --check && cargo +nightly clippy -- -D warnings && cargo +nightly test`
+2. Bump version in `Cargo.toml` (workspace-level), `cargo +nightly check` to update `Cargo.lock`
+3. Commit, tag (`vX.Y.Z`), push with `--tags`
+4. Wait for CI Release workflow: `gh run watch <id> --exit-status`
+5. Update LXC agents: `COMMANDO_VERSION=vX.Y.Z ./deploy/update-agents.sh <proxmox-node> ...`
+6. Update standalone agents: `ssh root@<host> "curl -sL .../install-agent.sh | COMMANDO_VERSION=vX.Y.Z bash"`
+7. Update gateway: pull latest Docker image and restart on the gateway LXC
+8. Verify: `commando_ping` a few targets to confirm version
