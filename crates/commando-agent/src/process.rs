@@ -5,6 +5,17 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
+/// Shell metacharacters that indicate a complex command requiring a real shell.
+const SHELL_META: &[char] = &[
+    '|', '&', ';', '(', ')', '<', '>', '$', '`', '!', '{', '}', '*', '?', '[', ']', '~', '#', '\n',
+];
+
+/// Returns true if the command is a simple single command with no shell features.
+/// Simple commands can be passed directly to RTK for optimized output.
+fn is_simple_command(command: &str) -> bool {
+    !command.contains(SHELL_META)
+}
+
 pub struct ExecOpts {
     pub shell: String,
     pub max_output_bytes: usize,
@@ -26,9 +37,14 @@ fn build_command(
     extra_env: &[(String, String)],
     opts: &ExecOpts,
 ) -> Command {
-    let mut cmd = if opts.rtk {
+    let mut cmd = if opts.rtk && is_simple_command(command) {
+        // Simple command: run through RTK directly for optimized output.
+        // RTK needs to see the actual command (e.g., `rtk docker ps`), not
+        // `rtk sh -c "docker ps"` which makes RTK see `sh` and pass through.
         let mut c = Command::new("rtk");
-        c.arg(&opts.shell).arg("-c").arg(command);
+        for arg in shell_words::split(command).unwrap_or_else(|_| vec![command.to_string()]) {
+            c.arg(arg);
+        }
         c
     } else {
         let mut c = Command::new(&opts.shell);
