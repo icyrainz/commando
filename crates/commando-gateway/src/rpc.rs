@@ -204,14 +204,22 @@ impl output_receiver::Server for OutputReceiverImpl {
             .map_err(|e| capnp::Error::failed(format!("failed to get data: {e}")))?;
         let stream = reader.get_stream();
 
-        let mut map = self.session_map.borrow_mut();
-        if let Some(session) = map.get_by_id_mut(&self.session_id) {
-            match stream {
-                0 => session.stdout_buffer.extend_from_slice(data),
-                1 => session.stderr_buffer.extend_from_slice(data),
-                _ => {} // ignore unknown streams
+        // Clone notify before dropping the borrow to avoid holding RefCell across notify_one()
+        let notify = {
+            let mut map = self.session_map.borrow_mut();
+            if let Some(session) = map.get_by_id_mut(&self.session_id) {
+                match stream {
+                    0 => session.stdout_buffer.extend_from_slice(data),
+                    1 => session.stderr_buffer.extend_from_slice(data),
+                    _ => {} // ignore unknown streams
+                }
+                Some(session.notify.clone())
+            } else {
+                None
             }
-            session.notify.notify_one();
+        };
+        if let Some(notify) = notify {
+            notify.notify_one();
         }
 
         Ok(())
@@ -282,34 +290,41 @@ pub fn start_remote_exec_stream(
         .await;
 
         // Mark session completed regardless of success/failure.
-        let mut map = session_map.borrow_mut();
-        if let Some(session) = map.get_by_id_mut(&session_id) {
-            match result {
-                Ok((exit_code, duration_ms, timed_out)) => {
-                    session.completed = true;
-                    session.exec_result = Some(StreamExecResult {
-                        exit_code,
-                        duration_ms,
-                        timed_out,
-                    });
-                    session.notify.notify_one();
+        // Clone notify before dropping the borrow to avoid holding RefCell across notify_one()
+        let notify = {
+            let mut map = session_map.borrow_mut();
+            if let Some(session) = map.get_by_id_mut(&session_id) {
+                match result {
+                    Ok((exit_code, duration_ms, timed_out)) => {
+                        session.completed = true;
+                        session.exec_result = Some(StreamExecResult {
+                            exit_code,
+                            duration_ms,
+                            timed_out,
+                        });
+                    }
+                    Err(e) => {
+                        error!(
+                            target = %target_name,
+                            request_id = %request_id,
+                            error = %e,
+                            "exec_stream RPC failed"
+                        );
+                        session.completed = true;
+                        session.exec_result = Some(StreamExecResult {
+                            exit_code: -1,
+                            duration_ms: 0,
+                            timed_out: false,
+                        });
+                    }
                 }
-                Err(e) => {
-                    error!(
-                        target = %target_name,
-                        request_id = %request_id,
-                        error = %e,
-                        "exec_stream RPC failed"
-                    );
-                    session.completed = true;
-                    session.exec_result = Some(StreamExecResult {
-                        exit_code: -1,
-                        duration_ms: 0,
-                        timed_out: false,
-                    });
-                    session.notify.notify_one();
-                }
+                Some(session.notify.clone())
+            } else {
+                None
             }
+        };
+        if let Some(notify) = notify {
+            notify.notify_one();
         }
     })
 }
