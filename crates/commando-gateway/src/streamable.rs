@@ -58,7 +58,10 @@ pub fn build_app(
                 interval.tick().await;
                 let expired = cleanup_map.borrow_mut().cleanup_expired(idle_timeout);
                 if !expired.is_empty() {
-                    info!(count = expired.len(), "cleaned up expired streaming sessions");
+                    info!(
+                        count = expired.len(),
+                        "cleaned up expired streaming sessions"
+                    );
                 }
             }
         });

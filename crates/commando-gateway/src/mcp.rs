@@ -33,7 +33,10 @@ pub async fn run_stdio_loop(
             interval.tick().await;
             let expired = cleanup_map.borrow_mut().cleanup_expired(idle_timeout);
             if !expired.is_empty() {
-                tracing::info!(count = expired.len(), "cleaned up expired streaming sessions");
+                tracing::info!(
+                    count = expired.len(),
+                    "cleaned up expired streaming sessions"
+                );
             }
         }
     });

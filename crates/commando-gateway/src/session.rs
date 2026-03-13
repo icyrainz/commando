@@ -91,7 +91,8 @@ impl SessionMap {
         let token = generate_token();
         let session_id = generate_token();
         self.sessions.insert(session_id.clone(), Session::new());
-        self.token_to_session.insert(token.clone(), session_id.clone());
+        self.token_to_session
+            .insert(token.clone(), session_id.clone());
         (token, session_id)
     }
 
@@ -188,11 +189,12 @@ mod tests {
             .extend_from_slice(b"hello world");
         let drained = map.get_by_token_mut(&token).unwrap().drain_stdout();
         assert_eq!(drained, b"hello world");
-        assert!(map
-            .get_by_token_mut(&token)
-            .unwrap()
-            .stdout_buffer
-            .is_empty());
+        assert!(
+            map.get_by_token_mut(&token)
+                .unwrap()
+                .stdout_buffer
+                .is_empty()
+        );
     }
 
     #[test]

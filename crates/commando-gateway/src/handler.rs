@@ -207,9 +207,7 @@ pub async fn dispatch_request(
     let response = match method {
         "initialize" => process_initialize(request),
         "tools/list" => process_tools_list(request),
-        "tools/call" => {
-            handle_tools_call(request, config, registry, limiter, session_map).await
-        }
+        "tools/call" => handle_tools_call(request, config, registry, limiter, session_map).await,
         _ => make_error_response(id.clone(), -32601, &format!("Method not found: {method}")),
     };
 
@@ -365,7 +363,10 @@ fn format_page_response(id: &Value, page: &Value) -> Value {
     // Final page: include metadata footer with exit code and duration
     if let Some(exit_code) = page["exit_code"].as_i64() {
         let duration_ms = page["duration_ms"].as_u64().unwrap_or(0);
-        let metadata = format!("\n---\nexit_code: {} | duration: {}ms", exit_code, duration_ms);
+        let metadata = format!(
+            "\n---\nexit_code: {} | duration: {}ms",
+            exit_code, duration_ms
+        );
         text.push_str(&metadata);
     }
 
@@ -439,7 +440,10 @@ async fn build_page(
     let has_remaining = session.total_buffered() > 0;
     let completed = session.completed;
     let exec_result_data = if completed {
-        session.exec_result.as_ref().map(|r| (r.exit_code, r.duration_ms, r.timed_out))
+        session
+            .exec_result
+            .as_ref()
+            .map(|r| (r.exit_code, r.duration_ms, r.timed_out))
     } else {
         None
     };
@@ -1061,9 +1065,15 @@ mod tests {
             "method": "notifications/initialized"
         });
         assert!(
-            dispatch_request(&notification, &config, &registry, &limiter, &test_session_map())
-                .await
-                .is_none()
+            dispatch_request(
+                &notification,
+                &config,
+                &registry,
+                &limiter,
+                &test_session_map()
+            )
+            .await
+            .is_none()
         );
 
         // Notification: null id
