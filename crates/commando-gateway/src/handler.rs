@@ -507,6 +507,7 @@ mod tests {
             },
             targets: vec![],
             cache_dir: "/tmp/commando-test".to_string(),
+            streaming: Default::default(),
         })
     }
 
@@ -525,6 +526,7 @@ mod tests {
             },
             targets: vec![],
             cache_dir: "/tmp/commando-test".to_string(),
+            streaming: Default::default(),
         })
     }
 
@@ -804,6 +806,7 @@ mod tests {
             },
             targets: vec![],
             cache_dir: "/tmp/commando-test".to_string(),
+            streaming: Default::default(),
         });
 
         let request = json!({
@@ -853,6 +856,7 @@ mod tests {
             },
             targets: vec![],
             cache_dir: "/tmp/commando-test".to_string(),
+            streaming: Default::default(),
         });
 
         let request = json!({

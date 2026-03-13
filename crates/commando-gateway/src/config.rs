@@ -12,6 +12,28 @@ pub struct GatewayConfig {
     pub targets: Vec<ManualTarget>,
     #[serde(default = "default_cache_dir")]
     pub cache_dir: String,
+    #[serde(default)]
+    pub streaming: StreamingConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamingConfig {
+    #[serde(default = "default_page_timeout")]
+    pub page_timeout_secs: u64,
+    #[serde(default = "default_page_max_bytes")]
+    pub page_max_bytes: usize,
+    #[serde(default = "default_session_idle_timeout")]
+    pub session_idle_timeout_secs: u64,
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            page_timeout_secs: default_page_timeout(),
+            page_max_bytes: default_page_max_bytes(),
+            session_idle_timeout_secs: default_session_idle_timeout(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +149,15 @@ pub fn default_shell() -> String {
 }
 pub fn default_cache_dir() -> String {
     "/var/lib/commando".to_string()
+}
+fn default_page_timeout() -> u64 {
+    5
+}
+fn default_page_max_bytes() -> usize {
+    32_768 // 32KB
+}
+fn default_session_idle_timeout() -> u64 {
+    60
 }
 
 impl GatewayConfig {

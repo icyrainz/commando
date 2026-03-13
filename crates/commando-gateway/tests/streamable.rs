@@ -30,6 +30,7 @@ fn test_config() -> Arc<GatewayConfig> {
         },
         targets: vec![],
         cache_dir: "/tmp/commando-test".to_string(),
+        streaming: Default::default(),
     })
 }
 
