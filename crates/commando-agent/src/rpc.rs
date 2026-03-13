@@ -250,7 +250,7 @@ impl command_agent::Server for CommandAgentImpl {
         let opts = ExecOpts {
             shell: self.config.shell.clone(),
             max_output_bytes: self.config.max_output_bytes,
-            rtk: self.config.rtk,
+            wrapper: self.config.wrapper_binary().map(String::from),
         };
 
         let exec_result = process::execute(&command, &work_dir, timeout_secs, &extra_env, &opts)
@@ -355,7 +355,7 @@ impl command_agent::Server for CommandAgentImpl {
         let opts = ExecOpts {
             shell: self.config.shell.clone(),
             max_output_bytes: self.config.max_output_bytes,
-            rtk: self.config.rtk,
+            wrapper: self.config.wrapper_binary().map(String::from),
         };
 
         // Collect JoinHandles for all spawned receive calls so we can await

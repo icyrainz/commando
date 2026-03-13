@@ -13,9 +13,14 @@ pub struct AgentConfig {
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
     /// When true, wrap commands with `rtk` for token-optimized output.
-    /// Requires `rtk` binary on PATH. Falls back to raw execution if missing.
+    /// Requires `rtk` binary on PATH. Shorthand for `wrapper = "rtk"`.
     #[serde(default)]
     pub rtk: bool,
+
+    /// Command wrapper binary for output optimization (e.g., "rtk").
+    /// Takes precedence over the `rtk` field if set.
+    #[serde(default)]
+    pub wrapper: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -36,6 +41,18 @@ impl AgentConfig {
         let content = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&content)?;
         Ok(config)
+    }
+
+    /// Returns the wrapper binary name, if any.
+    /// `wrapper` field takes precedence; `rtk = true` is shorthand for `wrapper = "rtk"`.
+    pub fn wrapper_binary(&self) -> Option<&str> {
+        if let Some(ref w) = self.wrapper {
+            Some(w)
+        } else if self.rtk {
+            Some("rtk")
+        } else {
+            None
+        }
     }
 }
 
@@ -62,6 +79,7 @@ rtk = true
         assert_eq!(config.max_output_bytes, 131_072);
         assert_eq!(config.max_concurrent, 8);
         assert!(config.rtk);
+        assert_eq!(config.wrapper_binary(), Some("rtk"));
     }
 
     #[test]
@@ -76,5 +94,29 @@ psk = "secret"
         assert_eq!(config.max_output_bytes, 131_072);
         assert_eq!(config.max_concurrent, 8);
         assert!(!config.rtk);
+        assert_eq!(config.wrapper_binary(), None);
+    }
+
+    #[test]
+    fn parse_custom_wrapper() {
+        let toml_str = r#"
+bind = "0.0.0.0"
+psk = "secret"
+wrapper = "my-optimizer"
+"#;
+        let config: AgentConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.wrapper_binary(), Some("my-optimizer"));
+    }
+
+    #[test]
+    fn wrapper_overrides_rtk() {
+        let toml_str = r#"
+bind = "0.0.0.0"
+psk = "secret"
+rtk = true
+wrapper = "custom-bin"
+"#;
+        let config: AgentConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.wrapper_binary(), Some("custom-bin"));
     }
 }
