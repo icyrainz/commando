@@ -9,7 +9,7 @@ use futures::AsyncReadExt;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use commando_common::auth;
-use commando_common::commando_capnp::{authenticator, command_agent};
+use commando_common::commando_capnp::{authenticator, command_agent, output_receiver};
 
 use crate::config::AgentConfig;
 use crate::process::{self, ExecOpts};
@@ -272,6 +272,140 @@ impl command_agent::Server for CommandAgentImpl {
         r.set_duration_ms(exec_result.duration_ms);
         r.set_timed_out(exec_result.timed_out);
         r.set_truncated(exec_result.truncated);
+        r.set_request_id(&request_id);
+
+        Ok(())
+    }
+
+    async fn exec_stream(
+        self: Rc<Self>,
+        params: command_agent::ExecStreamParams,
+        mut results: command_agent::ExecStreamResults,
+    ) -> Result<(), capnp::Error> {
+        let _permit = self
+            .concurrency_guard
+            .try_acquire()
+            .ok_or_else(|| capnp::Error::failed("too many concurrent exec requests".to_string()))?;
+
+        let params_reader = params
+            .get()
+            .map_err(|e| capnp::Error::failed(format!("failed to get params: {e}")))?;
+
+        let request = params_reader
+            .get_request()
+            .map_err(|e| capnp::Error::failed(format!("failed to get request: {e}")))?;
+
+        let command = request
+            .get_command()
+            .map_err(|e| capnp::Error::failed(format!("failed to get command: {e}")))?
+            .to_str()
+            .map_err(|e| capnp::Error::failed(format!("invalid UTF-8 in command: {e}")))?
+            .to_owned();
+
+        let work_dir = request
+            .get_work_dir()
+            .map_err(|e| capnp::Error::failed(format!("failed to get work_dir: {e}")))?
+            .to_str()
+            .map_err(|e| capnp::Error::failed(format!("invalid UTF-8 in work_dir: {e}")))?
+            .to_owned();
+
+        let timeout_secs = request.get_timeout_secs();
+
+        let request_id = request
+            .get_request_id()
+            .map_err(|e| capnp::Error::failed(format!("failed to get request_id: {e}")))?
+            .to_str()
+            .map_err(|e| capnp::Error::failed(format!("invalid UTF-8 in request_id: {e}")))?
+            .to_owned();
+
+        let extra_env_list = request
+            .get_extra_env()
+            .map_err(|e| capnp::Error::failed(format!("failed to get extra_env: {e}")))?;
+
+        let mut extra_env: Vec<(String, String)> = Vec::new();
+        for env_var in extra_env_list.iter() {
+            let key = env_var
+                .get_key()
+                .map_err(|e| capnp::Error::failed(format!("failed to get env key: {e}")))?
+                .to_str()
+                .map_err(|e| capnp::Error::failed(format!("invalid UTF-8 in env key: {e}")))?
+                .to_owned();
+            let value = env_var
+                .get_value()
+                .map_err(|e| capnp::Error::failed(format!("failed to get env value: {e}")))?
+                .to_str()
+                .map_err(|e| capnp::Error::failed(format!("invalid UTF-8 in env value: {e}")))?
+                .to_owned();
+            extra_env.push((key, value));
+        }
+
+        let receiver: output_receiver::Client = params_reader
+            .get_receiver()
+            .map_err(|e| capnp::Error::failed(format!("failed to get receiver: {e}")))?;
+
+        tracing::info!(
+            request_id = %request_id,
+            command = %command,
+            work_dir = %work_dir,
+            timeout_secs = timeout_secs,
+            "exec_stream request"
+        );
+
+        let opts = ExecOpts {
+            shell: self.config.shell.clone(),
+            max_output_bytes: self.config.max_output_bytes,
+        };
+
+        // Collect JoinHandles for all spawned receive calls so we can await
+        // them after execute_stream returns (draining in-flight RPC sends).
+        let handles: Rc<RefCell<Vec<tokio::task::JoinHandle<()>>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let handles_clone = handles.clone();
+
+        let exec_result = process::execute_stream(
+            &command,
+            &work_dir,
+            timeout_secs,
+            &extra_env,
+            &opts,
+            move |data: &[u8], stream: u8| {
+                let mut req = receiver.receive_request();
+                {
+                    let mut p = req.get();
+                    p.set_data(data);
+                    p.set_stream(stream);
+                }
+                let send_promise = req.send().promise;
+                let handle = tokio::task::spawn_local(async move {
+                    let _ = send_promise.await;
+                });
+                handles_clone.borrow_mut().push(handle);
+            },
+        )
+        .await
+        .map_err(|e| capnp::Error::failed(format!("exec_stream error: {e}")))?;
+
+        // Drain all pending receive calls before returning the result.
+        let pending: Vec<_> = handles.borrow_mut().drain(..).collect();
+        for handle in pending {
+            let _ = handle.await;
+        }
+
+        tracing::info!(
+            request_id = %request_id,
+            exit_code = exec_result.exit_code,
+            duration_ms = exec_result.duration_ms,
+            timed_out = exec_result.timed_out,
+            "exec_stream completed"
+        );
+
+        let mut r = results.get().init_result();
+        r.set_stdout(&[]);
+        r.set_stderr(&[]);
+        r.set_exit_code(exec_result.exit_code);
+        r.set_duration_ms(exec_result.duration_ms);
+        r.set_timed_out(exec_result.timed_out);
+        r.set_truncated(false);
         r.set_request_id(&request_id);
 
         Ok(())
