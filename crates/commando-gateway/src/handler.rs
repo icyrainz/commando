@@ -432,39 +432,75 @@ async fn build_page(
     }
 
     // Phase 2: Drain buffers up to page_max_bytes.
-    let mut map = session_map.borrow_mut();
-    let session = map
-        .get_by_token_mut(token)
-        .ok_or_else(|| "invalid or expired page token".to_string())?;
-    session.touch();
+    let (stdout_bytes, stderr_bytes, has_remaining) = {
+        let mut map = session_map.borrow_mut();
+        let session = map
+            .get_by_token_mut(token)
+            .ok_or_else(|| "invalid or expired page token".to_string())?;
+        session.touch();
 
-    let stdout_bytes = session.drain_stdout_up_to(page_max);
-    let remaining_budget = page_max.saturating_sub(stdout_bytes.len());
-    let stderr_bytes = session.drain_stderr_up_to(remaining_budget);
+        let stdout_bytes = session.drain_stdout_up_to(page_max);
+        let remaining_budget = page_max.saturating_sub(stdout_bytes.len());
+        let stderr_bytes = session.drain_stderr_up_to(remaining_budget);
+        let has_remaining = session.total_buffered() > 0;
 
-    let has_remaining = session.total_buffered() > 0;
-    let completed = session.completed;
-    // Only treat as final page when command is done AND all buffered data has been drained.
-    // Otherwise a command completing with >page_max_bytes output would lose the tail.
-    let exec_result_data = if completed && !has_remaining {
-        session
-            .exec_result
-            .as_ref()
-            .map(|r| (r.exit_code, r.duration_ms, r.timed_out))
-    } else {
-        None
+        if has_remaining {
+            session.notify.notify_one();
+        }
+
+        (stdout_bytes, stderr_bytes, has_remaining)
+    };
+    // Mutable borrow dropped — safe to await below.
+
+    // Check if command already completed.
+    let mut exec_result_data = {
+        let map = session_map.borrow();
+        let session = map
+            .get_by_token(token)
+            .ok_or_else(|| "session lost during drain".to_string())?;
+        if session.completed && !has_remaining {
+            session
+                .exec_result
+                .as_ref()
+                .map(|r| (r.exit_code, r.duration_ms, r.timed_out))
+        } else {
+            None
+        }
     };
 
-    // If there's remaining buffered data, re-notify so next poll returns immediately
-    if has_remaining {
-        session.notify.notify_one();
+    // Coalesce: for fast commands, output chunks arrive via the OutputReceiver
+    // callback before the exec_stream RPC response sets `completed = true`.
+    // Brief wait lets us return data + exit_code in a single page instead of
+    // forcing an unnecessary round-trip for just the exit code.
+    // Loop because there may be a stale notification from the data arrival
+    // that we need to drain before the completion notification arrives.
+    if exec_result_data.is_none() && !has_remaining {
+        let coalesce_deadline = Instant::now() + Duration::from_millis(50);
+        loop {
+            let notify = {
+                let map = session_map.borrow();
+                match map.get_by_token(token) {
+                    Some(s) if s.completed && s.total_buffered() == 0 => {
+                        exec_result_data = s
+                            .exec_result
+                            .as_ref()
+                            .map(|r| (r.exit_code, r.duration_ms, r.timed_out));
+                        break;
+                    }
+                    Some(s) => s.notify.clone(),
+                    None => break,
+                }
+            };
+            let remaining = coalesce_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let _ = tokio::time::timeout(remaining, notify.notified()).await;
+        }
     }
 
     let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
-
-    // Need to drop the mutable borrow before potentially removing the session
-    drop(map);
 
     if let Some((exit_code, duration_ms, timed_out)) = exec_result_data {
         // Final page: remove session from map
@@ -1479,5 +1515,68 @@ mod tests {
         let text3 = resp3["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text3.contains("exit_code: 0"));
         assert!(!text3.contains("[streaming]")); // no more pages
+    }
+
+    /// Simulates real-world fast command timing: output arrives via callback
+    /// before the RPC completion signal. Without coalesce, this would return
+    /// an unnecessary intermediate page followed by a final page with just
+    /// the exit code.
+    #[test]
+    fn build_page_coalesces_fast_command_completion() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let sm = test_session_map();
+            let (token, _) = sm.borrow_mut().create_session();
+            let session_id = sm
+                .borrow()
+                .session_id_for_token(&token)
+                .unwrap()
+                .to_string();
+
+            // Data arrives but command NOT yet completed — simulates the
+            // OutputReceiver callback firing before the RPC response.
+            {
+                let mut map = sm.borrow_mut();
+                let session = map.get_by_token_mut(&token).unwrap();
+                session.stdout_buffer.extend_from_slice(b"fast output");
+                session.notify.notify_one();
+            }
+
+            // Spawn task that marks completion after 10ms — simulates the
+            // exec_stream RPC response arriving slightly after the data.
+            let sm2 = sm.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let notify = {
+                    let mut map = sm2.borrow_mut();
+                    let session = map.get_by_id_mut(&session_id).unwrap();
+                    session.completed = true;
+                    session.exec_result = Some(crate::session::StreamExecResult {
+                        exit_code: 0,
+                        duration_ms: 5,
+                        timed_out: false,
+                    });
+                    session.notify.clone()
+                };
+                notify.notify_one();
+            });
+
+            let config = streaming_config(32768);
+            let page = build_page(&sm, &token, &config).await.unwrap();
+
+            // Should be a FINAL page — coalesced data + exit code in one response.
+            assert_eq!(page["stdout"], "fast output");
+            assert_eq!(page["exit_code"], 0);
+            assert!(
+                page["next_page"].is_null(),
+                "fast command should not require a second page"
+            );
+            // Session should be cleaned up
+            assert!(sm.borrow().get_by_token(&token).is_none());
+        });
     }
 }
