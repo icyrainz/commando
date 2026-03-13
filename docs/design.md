@@ -517,7 +517,8 @@ For non-LXC machines (e.g., desktops, bare-metal servers), deploy manually via `
 
 - **TLS transport:** Wrap agent connections in TLS via `tokio-rustls` for encrypted-on-the-wire security — eliminates plaintext PSK and command visibility concerns
 - **Connection pooling:** Persistent connections with multiplexing for lower latency on high-frequency operations
-- **Streaming output:** Cap'n Proto streaming for long-running commands — important for UX on commands that take minutes
+- **Streaming output:** ~~Cap'n Proto streaming for long-running commands~~ **Implemented** — see `docs/superpowers/specs/2026-03-12-streaming-exec-design.md`. Paginated output via `execStream` RPC + `commando_output` MCP tool.
+- **LLM-optimized truncation guidance:** When output is truncated, include guidance in the response to help the LLM ask better follow-up questions (e.g., "Output truncated. Try: `tail -n 50 <file>` or add `| grep <pattern>` to narrow results")
 - **Per-caller authorization:** Role-based permissions when multiple clients connect (beyond single Claude Code instance)
 - **File transfer:** Read/write files on targets without shell commands
 - **Web UI:** Dashboard showing all agents, status, recent commands
