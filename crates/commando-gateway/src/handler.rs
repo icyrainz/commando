@@ -403,21 +403,23 @@ async fn build_page(
     let page_max = config.page_max_bytes;
     let deadline = Instant::now() + page_timeout;
 
-    // Phase 1: Wait until data is available, completed, or timeout expires.
+    // Phase 1: Wait until enough data is available, command completes, or timeout.
+    // We keep waiting as long as: no data yet, OR data is under page_max and
+    // the command hasn't completed (avoids unnecessary pagination for small output).
     loop {
-        let (has_data, completed, notify) = {
+        let (buffered, completed, notify) = {
             let map = session_map.borrow();
             let session = map
                 .get_by_token(token)
                 .ok_or_else(|| "invalid or expired page token".to_string())?;
             (
-                session.total_buffered() > 0,
+                session.total_buffered(),
                 session.completed,
                 session.notify.clone(),
             )
         };
 
-        if has_data || completed {
+        if completed || buffered >= page_max {
             break;
         }
 
@@ -428,7 +430,7 @@ async fn build_page(
 
         // Wait for notification or timeout
         let _ = tokio::time::timeout(remaining, notify.notified()).await;
-        // Re-loop to check if data is now available
+        // Re-loop to check state again
     }
 
     // Phase 2: Drain buffers up to page_max_bytes.
