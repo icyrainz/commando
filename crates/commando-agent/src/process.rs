@@ -19,16 +19,12 @@ pub struct ExecResult {
     pub truncated: bool,
 }
 
-pub async fn execute(
+fn build_command(
     command: &str,
     work_dir: &str,
-    timeout_secs: u32,
     extra_env: &[(String, String)],
     opts: &ExecOpts,
-) -> anyhow::Result<ExecResult> {
-    let start = Instant::now();
-    let timeout_secs = if timeout_secs == 0 { 60 } else { timeout_secs };
-
+) -> Command {
     let mut cmd = Command::new(&opts.shell);
     cmd.arg("-c").arg(command);
 
@@ -68,6 +64,20 @@ pub async fn execute(
         });
     }
 
+    cmd
+}
+
+pub async fn execute(
+    command: &str,
+    work_dir: &str,
+    timeout_secs: u32,
+    extra_env: &[(String, String)],
+    opts: &ExecOpts,
+) -> anyhow::Result<ExecResult> {
+    let start = Instant::now();
+    let timeout_secs = if timeout_secs == 0 { 60 } else { timeout_secs };
+
+    let mut cmd = build_command(command, work_dir, extra_env, opts);
     let mut child = cmd.spawn()?;
     let pid = child.id().expect("child has pid");
 
@@ -155,6 +165,93 @@ pub async fn execute(
                 duration_ms,
                 timed_out: true,
                 truncated,
+            })
+        }
+    }
+}
+
+pub async fn execute_stream<F>(
+    command: &str,
+    work_dir: &str,
+    timeout_secs: u32,
+    extra_env: &[(String, String)],
+    opts: &ExecOpts,
+    on_chunk: F,
+) -> anyhow::Result<ExecResult>
+where
+    F: Fn(&[u8], u8) + 'static,
+{
+    let start = Instant::now();
+    let timeout_secs = if timeout_secs == 0 { 60 } else { timeout_secs };
+
+    let mut cmd = build_command(command, work_dir, extra_env, opts);
+    let mut child = cmd.spawn()?;
+    let pid = child.id().expect("child has pid");
+
+    let mut stdout_handle = child.stdout.take().unwrap();
+    let mut stderr_handle = child.stderr.take().unwrap();
+
+    // Wrap callback in Arc so it can be shared across the two parallel read tasks.
+    let on_chunk = Arc::new(on_chunk);
+    let on_chunk_stderr = on_chunk.clone();
+
+    let read_and_wait = async move {
+        tokio::join!(
+            async {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stdout_handle.read(&mut chunk).await {
+                        Ok(0) => break,
+                        Ok(n) => on_chunk(&chunk[..n], 0),
+                        Err(_) => break,
+                    }
+                }
+            },
+            async {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stderr_handle.read(&mut chunk).await {
+                        Ok(0) => break,
+                        Ok(n) => on_chunk_stderr(&chunk[..n], 1),
+                        Err(_) => break,
+                    }
+                }
+            },
+        );
+        let status = child.wait().await?;
+        Ok::<_, anyhow::Error>(status)
+    };
+
+    let result = timeout(Duration::from_secs(timeout_secs.into()), read_and_wait).await;
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(Ok(status)) => {
+            let exit_code = status.code().unwrap_or(-1);
+            Ok(ExecResult {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_code,
+                duration_ms,
+                timed_out: false,
+                truncated: false,
+            })
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_elapsed) => {
+            // Timeout — SIGTERM first, then wait 5 s grace period, then SIGKILL.
+            // child was moved into read_and_wait (now dropped) so we use libc directly.
+            kill_process_group(pid);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            kill_process_group_force(pid);
+
+            Ok(ExecResult {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_code: 137, // SIGKILL convention
+                duration_ms,
+                timed_out: true,
+                truncated: false,
             })
         }
     }
@@ -304,5 +401,88 @@ mod tests {
         .unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "1");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exec_stream_echo() {
+        let received = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let received_clone = received.clone();
+
+        let result = execute_stream(
+            "echo hello",
+            "",
+            60,
+            &[],
+            &default_opts(),
+            move |data, stream| {
+                if stream == 0 {
+                    received_clone.lock().unwrap().extend_from_slice(data);
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert!(!result.timed_out);
+        assert!(!result.truncated);
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.is_empty());
+        let output = received.lock().unwrap().clone();
+        assert_eq!(String::from_utf8_lossy(&output).as_ref(), "hello\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exec_stream_stderr() {
+        let received = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let received_clone = received.clone();
+
+        let result = execute_stream(
+            "echo err >&2",
+            "",
+            60,
+            &[],
+            &default_opts(),
+            move |data, stream| {
+                if stream == 1 {
+                    received_clone.lock().unwrap().extend_from_slice(data);
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert!(!result.timed_out);
+        let output = received.lock().unwrap().clone();
+        assert_eq!(String::from_utf8_lossy(&output).as_ref(), "err\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exec_stream_timeout() {
+        let received = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let received_clone = received.clone();
+
+        // Print something before sleeping so we can verify partial output arrives
+        let result = execute_stream(
+            "echo partial; sleep 30",
+            "",
+            1,
+            &[],
+            &default_opts(),
+            move |data, stream| {
+                if stream == 0 {
+                    received_clone.lock().unwrap().extend_from_slice(data);
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(result.timed_out);
+        assert_eq!(result.exit_code, 137);
+        // Partial output should have been delivered via callback before timeout
+        let output = received.lock().unwrap().clone();
+        assert_eq!(String::from_utf8_lossy(&output).trim(), "partial");
     }
 }

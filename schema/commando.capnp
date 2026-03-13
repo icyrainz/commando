@@ -8,6 +8,14 @@ interface Authenticator {
 interface CommandAgent {
   exec @0 (request :ExecRequest) -> (result :ExecResult);
   ping @1 () -> (pong :PingResult);
+  execStream @2 (request :ExecRequest, receiver :OutputReceiver)
+    -> (result :ExecResult);
+}
+
+interface OutputReceiver {
+  receive @0 (data :Data, stream :UInt8) -> ();
+  # stream: 0 = stdout, 1 = stderr
+  # Agent calls this as output arrives from the child process.
 }
 
 struct ExecRequest {

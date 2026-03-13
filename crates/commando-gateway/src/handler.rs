@@ -1,12 +1,17 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
+use tokio::time::Instant;
 use tracing::info;
 
-use crate::config::GatewayConfig;
+use crate::config::{GatewayConfig, StreamingConfig};
 use crate::registry::Registry;
 use crate::rpc;
+use crate::session::SessionMap;
 
 /// Per-target concurrency semaphore (simple counter-based).
 pub struct ConcurrencyLimiter {
@@ -65,7 +70,7 @@ pub fn process_tools_list(request: &Value) -> Value {
             "tools": [
                 {
                     "name": "commando_exec",
-                    "description": "Execute a shell command on a target machine. Returns stdout, stderr, exit code, and timing.",
+                    "description": "Execute a shell command on a target machine. If the response includes a next_page field, the command is still running — call commando_output with the page token to get more output.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -119,6 +124,20 @@ pub fn process_tools_list(request: &Value) -> Value {
                             }
                         },
                         "required": ["target"]
+                    }
+                },
+                {
+                    "name": "commando_output",
+                    "description": "Get the next page of output from a streaming command. Use when commando_exec returns a next_page token.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["page"],
+                        "properties": {
+                            "page": {
+                                "type": "string",
+                                "description": "Page token from previous commando_exec or commando_output response"
+                            }
+                        }
                     }
                 }
             ]
@@ -175,6 +194,7 @@ pub async fn dispatch_request(
     config: &Arc<GatewayConfig>,
     registry: &Arc<Mutex<Registry>>,
     limiter: &Arc<ConcurrencyLimiter>,
+    session_map: &Rc<RefCell<SessionMap>>,
 ) -> Option<Value> {
     let method = request["method"].as_str().unwrap_or("");
     let id = &request["id"];
@@ -187,7 +207,7 @@ pub async fn dispatch_request(
     let response = match method {
         "initialize" => process_initialize(request),
         "tools/list" => process_tools_list(request),
-        "tools/call" => handle_tools_call(request, config, registry, limiter).await,
+        "tools/call" => handle_tools_call(request, config, registry, limiter, session_map).await,
         _ => make_error_response(id.clone(), -32601, &format!("Method not found: {method}")),
     };
 
@@ -199,15 +219,17 @@ async fn handle_tools_call(
     config: &Arc<GatewayConfig>,
     registry: &Arc<Mutex<Registry>>,
     limiter: &Arc<ConcurrencyLimiter>,
+    session_map: &Rc<RefCell<SessionMap>>,
 ) -> Value {
     let id = &request["id"];
     let tool_name = request["params"]["name"].as_str().unwrap_or("");
     let args = &request["params"]["arguments"];
 
     match tool_name {
-        "commando_exec" => handle_exec(id, args, config, registry, limiter).await,
+        "commando_exec" => handle_exec(id, args, config, registry, limiter, session_map).await,
         "commando_list" => handle_list(id, args, config, registry),
         "commando_ping" => handle_ping(id, args, config, registry).await,
+        "commando_output" => handle_output(id, args, session_map, &config.streaming).await,
         _ => make_tool_error(id, &format!("Unknown tool: {tool_name}")),
     }
 }
@@ -218,6 +240,7 @@ async fn handle_exec(
     config: &Arc<GatewayConfig>,
     registry: &Arc<Mutex<Registry>>,
     limiter: &Arc<ConcurrencyLimiter>,
+    session_map: &Rc<RefCell<SessionMap>>,
 ) -> Value {
     let target_name = match args["target"].as_str() {
         Some(t) => t,
@@ -279,7 +302,11 @@ async fn handle_exec(
         "executing command"
     );
 
-    let result = rpc::remote_exec(
+    // Create a streaming session
+    let (token, session_id) = session_map.borrow_mut().create_session();
+
+    // Start the streaming RPC (the spawned task releases the concurrency slot via RAII guard)
+    let join_handle = rpc::start_remote_exec_stream(
         &host,
         port,
         &psk,
@@ -289,47 +316,196 @@ async fn handle_exec(
         &extra_env,
         &request_id,
         config.agent.connect_timeout_secs,
-    )
-    .await;
+        session_map.clone(),
+        session_id.clone(),
+        limiter.clone(),
+        target_name.to_string(),
+    );
 
-    limiter.release(target_name);
-
-    match result {
-        Ok(r) => {
-            let stdout = String::from_utf8_lossy(&r.stdout);
-            let stderr = String::from_utf8_lossy(&r.stderr);
-
-            let mut text = String::new();
-            if !stdout.is_empty() {
-                text.push_str(&stdout);
-            }
-            if !stderr.is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str("[stderr]\n");
-                text.push_str(&stderr);
-            }
-            if r.timed_out {
-                text.push_str("\n[timed out]");
-            }
-            if r.truncated {
-                text.push_str("\n[output truncated]");
-            }
-
-            let metadata = format!(
-                "\n---\nexit_code: {} | duration: {}ms | request_id: {}",
-                r.exit_code, r.duration_ms, r.request_id
-            );
-            text.push_str(&metadata);
-
-            if r.exit_code != 0 || r.timed_out {
-                make_tool_error(id, &text)
-            } else {
-                make_tool_result(id, &text)
-            }
+    // Store the JoinHandle so cleanup can abort it if needed
+    {
+        let mut map = session_map.borrow_mut();
+        if let Some(session) = map.get_by_id_mut(&session_id) {
+            session.rpc_task = Some(join_handle);
+        } else {
+            // Session was unexpectedly removed; abort the spawned task and release slot
+            join_handle.abort();
+            return make_tool_error(id, "session lost before execution started");
         }
+    }
+
+    // Build and return the first page
+    match build_page(session_map, &token, &config.streaming).await {
+        Ok(page) => format_page_response(id, &page),
         Err(e) => make_tool_error(id, &format!("exec failed: {e}")),
+    }
+}
+
+/// Convert a page response JSON into MCP tool result text.
+fn format_page_response(id: &Value, page: &Value) -> Value {
+    let mut text = String::new();
+
+    if let Some(stdout) = page["stdout"].as_str()
+        && !stdout.is_empty()
+    {
+        text.push_str(stdout);
+    }
+
+    if let Some(stderr) = page["stderr"].as_str()
+        && !stderr.is_empty()
+    {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("[stderr]\n");
+        text.push_str(stderr);
+    }
+
+    if page["timed_out"].as_bool().unwrap_or(false) {
+        text.push_str("\n[timed out]");
+    }
+
+    // Final page: include metadata footer with exit code and duration
+    if let Some(exit_code) = page["exit_code"].as_i64() {
+        let duration_ms = page["duration_ms"].as_u64().unwrap_or(0);
+        let metadata = format!(
+            "\n---\nexit_code: {} | duration: {}ms",
+            exit_code, duration_ms
+        );
+        text.push_str(&metadata);
+    }
+
+    // Streaming: include next_page token if still running
+    if let Some(next_page) = page["next_page"].as_str() {
+        text.push_str(&format!("\n[streaming] next_page={next_page}"));
+    }
+
+    let is_error = page["exit_code"].as_i64().is_some_and(|c| c != 0)
+        || page["timed_out"].as_bool().unwrap_or(false);
+
+    if is_error {
+        make_tool_error(id, &text)
+    } else {
+        make_tool_result(id, &text)
+    }
+}
+
+/// Build a page of streaming output from a session.
+///
+/// Phase 1: Wait for data to become available (or completion/timeout).
+/// Phase 2: Drain buffers up to page_max_bytes and build the response.
+async fn build_page(
+    session_map: &Rc<RefCell<SessionMap>>,
+    token: &str,
+    config: &StreamingConfig,
+) -> Result<Value, String> {
+    let page_timeout = Duration::from_secs(config.page_timeout_secs);
+    let page_max = config.page_max_bytes;
+    let deadline = Instant::now() + page_timeout;
+
+    // Phase 1: Wait until data is available, completed, or timeout expires.
+    loop {
+        let (has_data, completed, notify) = {
+            let map = session_map.borrow();
+            let session = map
+                .get_by_token(token)
+                .ok_or_else(|| "invalid or expired page token".to_string())?;
+            (
+                session.total_buffered() > 0,
+                session.completed,
+                session.notify.clone(),
+            )
+        };
+
+        if has_data || completed {
+            break;
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        // Wait for notification or timeout
+        let _ = tokio::time::timeout(remaining, notify.notified()).await;
+        // Re-loop to check if data is now available
+    }
+
+    // Phase 2: Drain buffers up to page_max_bytes.
+    let mut map = session_map.borrow_mut();
+    let session = map
+        .get_by_token_mut(token)
+        .ok_or_else(|| "invalid or expired page token".to_string())?;
+    session.touch();
+
+    let stdout_bytes = session.drain_stdout_up_to(page_max);
+    let remaining_budget = page_max.saturating_sub(stdout_bytes.len());
+    let stderr_bytes = session.drain_stderr_up_to(remaining_budget);
+
+    let has_remaining = session.total_buffered() > 0;
+    let completed = session.completed;
+    // Only treat as final page when command is done AND all buffered data has been drained.
+    // Otherwise a command completing with >page_max_bytes output would lose the tail.
+    let exec_result_data = if completed && !has_remaining {
+        session
+            .exec_result
+            .as_ref()
+            .map(|r| (r.exit_code, r.duration_ms, r.timed_out))
+    } else {
+        None
+    };
+
+    // If there's remaining buffered data, re-notify so next poll returns immediately
+    if has_remaining {
+        session.notify.notify_one();
+    }
+
+    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+
+    // Need to drop the mutable borrow before potentially removing the session
+    drop(map);
+
+    if let Some((exit_code, duration_ms, timed_out)) = exec_result_data {
+        // Final page: remove session from map
+        session_map.borrow_mut().remove_by_token(token);
+
+        Ok(json!({
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": exit_code,
+            "duration_ms": duration_ms,
+            "timed_out": timed_out,
+        }))
+    } else {
+        // Still running: rotate token
+        let new_token = session_map
+            .borrow_mut()
+            .rotate_token(token)
+            .ok_or_else(|| "session disappeared during token rotation".to_string())?;
+
+        Ok(json!({
+            "stdout": stdout,
+            "stderr": stderr,
+            "next_page": new_token,
+        }))
+    }
+}
+
+async fn handle_output(
+    id: &Value,
+    args: &Value,
+    session_map: &Rc<RefCell<SessionMap>>,
+    config: &StreamingConfig,
+) -> Value {
+    let token = match args["page"].as_str() {
+        Some(t) => t,
+        None => return make_tool_error(id, "missing required parameter: page"),
+    };
+
+    match build_page(session_map, token, config).await {
+        Ok(page) => format_page_response(id, &page),
+        Err(e) => make_tool_error(id, &e),
     }
 }
 
@@ -415,6 +591,10 @@ async fn handle_ping(
 mod tests {
     use super::*;
 
+    fn test_session_map() -> Rc<RefCell<SessionMap>> {
+        Rc::new(RefCell::new(SessionMap::new()))
+    }
+
     #[test]
     fn handle_initialize() {
         let request = json!({
@@ -442,12 +622,13 @@ mod tests {
         });
         let response = process_tools_list(&request);
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"commando_exec"));
         assert!(names.contains(&"commando_list"));
         assert!(names.contains(&"commando_ping"));
+        assert!(names.contains(&"commando_output"));
     }
 
     #[test]
@@ -507,6 +688,7 @@ mod tests {
             },
             targets: vec![],
             cache_dir: "/tmp/commando-test".to_string(),
+            streaming: Default::default(),
         })
     }
 
@@ -525,6 +707,7 @@ mod tests {
             },
             targets: vec![],
             cache_dir: "/tmp/commando-test".to_string(),
+            streaming: Default::default(),
         })
     }
 
@@ -554,7 +737,7 @@ mod tests {
                 "arguments": { "command": "echo hi" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter)
+        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
             .await
             .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
@@ -581,7 +764,7 @@ mod tests {
                 "arguments": { "target": "nonexistent", "command": "echo hi" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter)
+        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
             .await
             .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
@@ -609,7 +792,7 @@ mod tests {
                 "arguments": { "target": "my-box", "command": "echo hi" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter)
+        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
             .await
             .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
@@ -639,7 +822,7 @@ mod tests {
                 "arguments": { "target": "my-box", "command": "echo hi" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter)
+        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
             .await
             .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
@@ -666,7 +849,7 @@ mod tests {
                 "arguments": {}
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter)
+        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
             .await
             .unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -689,7 +872,7 @@ mod tests {
                 "arguments": { "filter": "nonexistent" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter)
+        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
             .await
             .unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -711,7 +894,7 @@ mod tests {
                 "arguments": { "target": "nonexistent" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter)
+        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
             .await
             .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
@@ -738,7 +921,7 @@ mod tests {
                 "arguments": { "target": "my-box" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter)
+        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
             .await
             .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
@@ -765,7 +948,7 @@ mod tests {
                 "arguments": {}
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter)
+        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
             .await
             .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
@@ -804,6 +987,7 @@ mod tests {
             },
             targets: vec![],
             cache_dir: "/tmp/commando-test".to_string(),
+            streaming: Default::default(),
         });
 
         let request = json!({
@@ -815,7 +999,7 @@ mod tests {
                 "arguments": { "target": "node-1/stopped-app", "command": "echo hi" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter)
+        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
             .await
             .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
@@ -853,6 +1037,7 @@ mod tests {
             },
             targets: vec![],
             cache_dir: "/tmp/commando-test".to_string(),
+            streaming: Default::default(),
         });
 
         let request = json!({
@@ -864,7 +1049,7 @@ mod tests {
                 "arguments": { "target": "node-1/stopped-app" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter)
+        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
             .await
             .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
@@ -887,9 +1072,15 @@ mod tests {
             "method": "notifications/initialized"
         });
         assert!(
-            dispatch_request(&notification, &config, &registry, &limiter)
-                .await
-                .is_none()
+            dispatch_request(
+                &notification,
+                &config,
+                &registry,
+                &limiter,
+                &test_session_map()
+            )
+            .await
+            .is_none()
         );
 
         // Notification: null id
@@ -899,7 +1090,7 @@ mod tests {
             "method": "notifications/initialized"
         });
         assert!(
-            dispatch_request(&null_id, &config, &registry, &limiter)
+            dispatch_request(&null_id, &config, &registry, &limiter, &test_session_map())
                 .await
                 .is_none()
         );
@@ -912,9 +1103,381 @@ mod tests {
             "params": {}
         });
         assert!(
-            dispatch_request(&request, &config, &registry, &limiter)
+            dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
                 .await
                 .is_some()
         );
+    }
+
+    // ---- Streaming / pagination tests ----
+
+    fn streaming_config(page_max_bytes: usize) -> StreamingConfig {
+        StreamingConfig {
+            page_timeout_secs: 1, // short timeout for tests
+            page_max_bytes,
+            session_idle_timeout_secs: 60,
+        }
+    }
+
+    /// Helper: populate a session with data and optionally mark completed.
+    fn populate_session(
+        session_map: &Rc<RefCell<SessionMap>>,
+        token: &str,
+        stdout: &[u8],
+        stderr: &[u8],
+        completed: bool,
+        exit_code: i32,
+    ) {
+        let mut map = session_map.borrow_mut();
+        let session = map.get_by_token_mut(token).unwrap();
+        session.stdout_buffer.extend_from_slice(stdout);
+        session.stderr_buffer.extend_from_slice(stderr);
+        if completed {
+            session.completed = true;
+            session.exec_result = Some(crate::session::StreamExecResult {
+                exit_code,
+                duration_ms: 42,
+                timed_out: false,
+            });
+        }
+        session.notify.notify_one();
+    }
+
+    // -- format_page_response tests --
+
+    #[test]
+    fn format_page_stdout_only() {
+        let id = json!(1);
+        let page =
+            json!({ "stdout": "hello world", "stderr": "", "exit_code": 0, "duration_ms": 10 });
+        let resp = format_page_response(&id, &page);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("hello world"));
+        assert!(text.contains("exit_code: 0"));
+        assert!(text.contains("duration: 10ms"));
+        assert!(!resp["result"]["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[test]
+    fn format_page_stderr_included() {
+        let id = json!(1);
+        let page =
+            json!({ "stdout": "out", "stderr": "err msg", "exit_code": 0, "duration_ms": 5 });
+        let resp = format_page_response(&id, &page);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("out"));
+        assert!(text.contains("[stderr]\nerr msg"));
+    }
+
+    #[test]
+    fn format_page_nonzero_exit_is_error() {
+        let id = json!(1);
+        let page = json!({ "stdout": "", "stderr": "fail", "exit_code": 1, "duration_ms": 0 });
+        let resp = format_page_response(&id, &page);
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[test]
+    fn format_page_timed_out() {
+        let id = json!(1);
+        let page = json!({ "stdout": "partial", "stderr": "", "exit_code": -1, "duration_ms": 5000, "timed_out": true });
+        let resp = format_page_response(&id, &page);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("[timed out]"));
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[test]
+    fn format_page_streaming_next_page() {
+        let id = json!(1);
+        let page = json!({ "stdout": "chunk1", "stderr": "", "next_page": "abc123" });
+        let resp = format_page_response(&id, &page);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("[streaming] next_page=abc123"));
+        // No exit_code means not an error
+        assert!(!resp["result"]["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[test]
+    fn format_page_empty_output() {
+        let id = json!(1);
+        let page = json!({ "stdout": "", "stderr": "", "next_page": "tok123" });
+        let resp = format_page_response(&id, &page);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        // Should still have the streaming token
+        assert!(text.contains("[streaming] next_page=tok123"));
+    }
+
+    // -- build_page tests --
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_completed_session_returns_final() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        populate_session(&sm, &token, b"output data", b"", true, 0);
+
+        let config = streaming_config(32768);
+        let page = build_page(&sm, &token, &config).await.unwrap();
+
+        assert_eq!(page["stdout"], "output data");
+        assert_eq!(page["exit_code"], 0);
+        assert_eq!(page["duration_ms"], 42);
+        assert!(page["next_page"].is_null()); // final page has no next_page
+        // Session should be removed after final page
+        assert!(sm.borrow().get_by_token(&token).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_running_session_rotates_token() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        populate_session(&sm, &token, b"partial output", b"", false, 0);
+
+        let config = streaming_config(32768);
+        let page = build_page(&sm, &token, &config).await.unwrap();
+
+        assert_eq!(page["stdout"], "partial output");
+        assert!(page["exit_code"].is_null()); // not final
+        let next_page = page["next_page"].as_str().unwrap();
+        assert!(!next_page.is_empty());
+        // Old token should be invalid
+        assert!(sm.borrow().get_by_token(&token).is_none());
+        // New token should work
+        assert!(sm.borrow().get_by_token(next_page).is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_respects_page_max_bytes() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        // 100 bytes of stdout, page limit of 50
+        let big_data = vec![b'A'; 100];
+        populate_session(&sm, &token, &big_data, b"", false, 0);
+
+        let config = streaming_config(50);
+        let page = build_page(&sm, &token, &config).await.unwrap();
+
+        // Should only get 50 bytes
+        assert_eq!(page["stdout"].as_str().unwrap().len(), 50);
+        // Should have a next_page (still has data)
+        assert!(page["next_page"].as_str().is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_large_output_completed_not_final_until_drained() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        // 100 bytes of stdout, page limit of 50, command completed
+        let big_data = vec![b'X'; 100];
+        populate_session(&sm, &token, &big_data, b"", true, 0);
+
+        let config = streaming_config(50);
+
+        // First page: should get 50 bytes but NOT be final (50 bytes remain)
+        let page1 = build_page(&sm, &token, &config).await.unwrap();
+        assert_eq!(page1["stdout"].as_str().unwrap().len(), 50);
+        assert!(page1["exit_code"].is_null(), "should not be final page yet");
+        let token2 = page1["next_page"].as_str().unwrap();
+
+        // Second page: drain remaining 50 bytes, now it's final
+        let page2 = build_page(&sm, token2, &config).await.unwrap();
+        assert_eq!(page2["stdout"].as_str().unwrap().len(), 50);
+        assert_eq!(page2["exit_code"], 0);
+        assert!(page2["next_page"].is_null());
+        // Session cleaned up
+        assert!(sm.borrow().get_by_token(token2).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_stdout_and_stderr_share_budget() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        // 40 bytes stdout + 40 bytes stderr, page max 50
+        populate_session(&sm, &token, &vec![b'O'; 40], &vec![b'E'; 40], true, 0);
+
+        let config = streaming_config(50);
+        let page = build_page(&sm, &token, &config).await.unwrap();
+
+        // stdout gets first 40, stderr gets remaining budget (50-40=10)
+        assert_eq!(page["stdout"].as_str().unwrap().len(), 40);
+        assert_eq!(page["stderr"].as_str().unwrap().len(), 10);
+        // Still has remaining stderr data, so NOT final even though completed
+        assert!(page["exit_code"].is_null());
+        assert!(page["next_page"].as_str().is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_invalid_token_returns_error() {
+        let sm = test_session_map();
+        let config = streaming_config(32768);
+        let result = build_page(&sm, "bogus-token", &config).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid or expired"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_empty_completed_session() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        // No output, but completed
+        populate_session(&sm, &token, b"", b"", true, 0);
+
+        let config = streaming_config(32768);
+        let page = build_page(&sm, &token, &config).await.unwrap();
+
+        assert_eq!(page["stdout"], "");
+        assert_eq!(page["stderr"], "");
+        assert_eq!(page["exit_code"], 0);
+        assert!(page["next_page"].is_null());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_timeout_with_no_data() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        // Don't populate any data — session exists but empty and not completed.
+
+        let config = streaming_config(32768);
+        let page = build_page(&sm, &token, &config).await.unwrap();
+
+        // After timeout, should return an empty intermediate page
+        assert_eq!(page["stdout"], "");
+        assert_eq!(page["stderr"], "");
+        assert!(page["next_page"].as_str().is_some());
+    }
+
+    // -- handle_output tests --
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_output_missing_page_param() {
+        let sm = test_session_map();
+        let config = streaming_config(32768);
+        let id = json!(1);
+        let args = json!({});
+        let resp = handle_output(&id, &args, &sm, &config).await;
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+        assert!(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("missing required parameter: page")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_output_invalid_token() {
+        let sm = test_session_map();
+        let config = streaming_config(32768);
+        let id = json!(1);
+        let args = json!({ "page": "nonexistent-token" });
+        let resp = handle_output(&id, &args, &sm, &config).await;
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+        assert!(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("invalid or expired")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_output_returns_data_and_next_page() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        populate_session(&sm, &token, b"streamed output", b"", false, 0);
+
+        let config = streaming_config(32768);
+        let id = json!(1);
+        let args = json!({ "page": token });
+        let resp = handle_output(&id, &args, &sm, &config).await;
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("streamed output"));
+        assert!(text.contains("[streaming] next_page="));
+        assert!(!resp["result"]["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_output_final_page() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        populate_session(&sm, &token, b"final output", b"", true, 0);
+
+        let config = streaming_config(32768);
+        let id = json!(1);
+        let args = json!({ "page": token });
+        let resp = handle_output(&id, &args, &sm, &config).await;
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("final output"));
+        assert!(text.contains("exit_code: 0"));
+        assert!(!text.contains("[streaming]"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_page_polling_flow() {
+        let sm = test_session_map();
+        let (token, _sid) = sm.borrow_mut().create_session();
+        let config = streaming_config(20); // tiny pages
+
+        // Simulate: 50 bytes of stdout arrives, command still running
+        populate_session(
+            &sm,
+            &token,
+            b"AAAAAAAAAABBBBBBBBBBCCCCCCCCCC",
+            b"",
+            false,
+            0,
+        );
+
+        let id = json!(1);
+
+        // Page 1: first 20 bytes
+        let args1 = json!({ "page": token });
+        let resp1 = handle_output(&id, &args1, &sm, &config).await;
+        let text1 = resp1["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text1.contains("AAAAAAAAAABBBBBBBBBB")); // first 20
+        // Extract next_page token
+        let next1 = text1
+            .lines()
+            .find(|l| l.contains("next_page="))
+            .unwrap()
+            .split("next_page=")
+            .nth(1)
+            .unwrap();
+
+        // Page 2: next 10 bytes (remaining) — command still running
+        let args2 = json!({ "page": next1 });
+        let resp2 = handle_output(&id, &args2, &sm, &config).await;
+        let text2 = resp2["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text2.contains("CCCCCCCCCC")); // remaining 10
+        let next2 = text2
+            .lines()
+            .find(|l| l.contains("next_page="))
+            .unwrap()
+            .split("next_page=")
+            .nth(1)
+            .unwrap()
+            .to_string();
+
+        // Now mark the command as completed
+        {
+            let mut map = sm.borrow_mut();
+            let session = map.get_by_token_mut(&next2).unwrap();
+            session.completed = true;
+            session.exec_result = Some(crate::session::StreamExecResult {
+                exit_code: 0,
+                duration_ms: 100,
+                timed_out: false,
+            });
+            session.notify.notify_one();
+        }
+
+        // Page 3: final page with exit code
+        let args3 = json!({ "page": next2 });
+        let resp3 = handle_output(&id, &args3, &sm, &config).await;
+        let text3 = resp3["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text3.contains("exit_code: 0"));
+        assert!(!text3.contains("[streaming]")); // no more pages
     }
 }
