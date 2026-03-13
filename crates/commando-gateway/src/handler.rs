@@ -323,11 +323,16 @@ async fn handle_exec(
     );
 
     // Store the JoinHandle so cleanup can abort it if needed
-    session_map
-        .borrow_mut()
-        .get_by_id_mut(&session_id)
-        .unwrap()
-        .rpc_task = Some(join_handle);
+    {
+        let mut map = session_map.borrow_mut();
+        if let Some(session) = map.get_by_id_mut(&session_id) {
+            session.rpc_task = Some(join_handle);
+        } else {
+            // Session was unexpectedly removed; abort the spawned task and release slot
+            join_handle.abort();
+            return make_tool_error(id, "session lost before execution started");
+        }
+    }
 
     // Build and return the first page
     match build_page(session_map, &token, &config.streaming).await {
@@ -439,7 +444,9 @@ async fn build_page(
 
     let has_remaining = session.total_buffered() > 0;
     let completed = session.completed;
-    let exec_result_data = if completed {
+    // Only treat as final page when command is done AND all buffered data has been drained.
+    // Otherwise a command completing with >page_max_bytes output would lose the tail.
+    let exec_result_data = if completed && !has_remaining {
         session
             .exec_result
             .as_ref()
