@@ -8,6 +8,7 @@ use tokio::time::{Duration, timeout};
 pub struct ExecOpts {
     pub shell: String,
     pub max_output_bytes: usize,
+    pub rtk: bool,
 }
 
 pub struct ExecResult {
@@ -25,8 +26,15 @@ fn build_command(
     extra_env: &[(String, String)],
     opts: &ExecOpts,
 ) -> Command {
-    let mut cmd = Command::new(&opts.shell);
-    cmd.arg("-c").arg(command);
+    let mut cmd = if opts.rtk {
+        let mut c = Command::new("rtk");
+        c.arg(&opts.shell).arg("-c").arg(command);
+        c
+    } else {
+        let mut c = Command::new(&opts.shell);
+        c.arg("-c").arg(command);
+        c
+    };
 
     // Clean environment — do NOT inherit agent's env
     cmd.env_clear();
@@ -299,6 +307,7 @@ mod tests {
         ExecOpts {
             shell: "sh".to_string(),
             max_output_bytes: 131_072,
+            rtk: false,
         }
     }
 
@@ -379,6 +388,7 @@ mod tests {
         let opts = ExecOpts {
             shell: "sh".to_string(),
             max_output_bytes: 100,
+            rtk: false,
         };
         // Generate more than 100 bytes of output
         let result = execute("yes | head -n 200", "", 60, &[], &opts)

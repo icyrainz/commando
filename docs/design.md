@@ -263,6 +263,7 @@ shell = "sh"        # or "bash", "fish", etc.
 psk = "per-agent-unique-key"  # unique to this agent, gateway must know it
 max_output_bytes = 131_072    # 128KB, tail-truncate stdout/stderr beyond this
 max_concurrent = 8            # max simultaneous exec calls, rejects beyond this
+# rtk = true                  # wrap commands with rtk for token-optimized output (requires rtk binary on PATH)
 ```
 
 **Config reload:** The agent reads `agent.toml` once at startup. Changes to PSK, shell, bind address, or limits require a restart (`systemctl restart commando-agent`). There is no hot-reload mechanism — this is intentional to keep the agent simple. PSK rotation is a restart.

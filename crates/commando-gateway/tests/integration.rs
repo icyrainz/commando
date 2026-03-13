@@ -22,6 +22,7 @@ fn test_agent_config() -> AgentConfig {
         psk: TEST_PSK.to_string(),
         max_output_bytes: 131_072,
         max_concurrent: 8,
+        rtk: false,
     }
 }
 

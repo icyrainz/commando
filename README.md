@@ -230,6 +230,29 @@ It preserves existing config and only replaces the binary + service file.
 cd ~/docker-app && docker compose pull && docker compose up -d
 ```
 
+## RTK Integration (Token Optimization)
+
+Agents optionally support [RTK](https://github.com/rtk-ai/rtk) — a CLI proxy that reduces token usage by 60-90% on common dev commands (`git`, `docker`, `ls`, etc.). When enabled, commands are wrapped with `rtk` before execution. Unrecognized commands pass through unchanged.
+
+### Setup
+
+1. Install RTK on the target machine:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh
+   ```
+
+2. Enable in the agent config (`/etc/commando/agent.toml`):
+   ```toml
+   rtk = true
+   ```
+
+3. Restart the agent:
+   ```bash
+   systemctl restart commando-agent
+   ```
+
+RTK is safe to enable globally — it passes through commands it doesn't optimize unchanged.
+
 ## Security
 
 - **Bearer token auth** — MCP endpoint requires `Authorization: Bearer <key>` (constant-time comparison). `/health` stays open.

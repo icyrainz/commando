@@ -7,3 +7,4 @@ shell = "sh"               # or "bash", "fish"
 psk = "REPLACE_WITH_OUTPUT_OF_openssl_rand_-hex_32"
 max_output_bytes = 131072  # 128KB, tail-truncate beyond this
 max_concurrent = 8         # Max simultaneous exec calls
+# rtk = true               # Wrap commands with rtk for token-optimized output (requires rtk binary)

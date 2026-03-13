@@ -12,6 +12,10 @@ pub struct AgentConfig {
     pub max_output_bytes: usize,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
+    /// When true, wrap commands with `rtk` for token-optimized output.
+    /// Requires `rtk` binary on PATH. Falls back to raw execution if missing.
+    #[serde(default)]
+    pub rtk: bool,
 }
 
 fn default_port() -> u16 {
@@ -48,6 +52,7 @@ shell = "bash"
 psk = "abcdef1234567890"
 max_output_bytes = 131072
 max_concurrent = 8
+rtk = true
 "#;
         let config: AgentConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.bind, "10.0.0.5");
@@ -56,6 +61,7 @@ max_concurrent = 8
         assert_eq!(config.psk, "abcdef1234567890");
         assert_eq!(config.max_output_bytes, 131_072);
         assert_eq!(config.max_concurrent, 8);
+        assert!(config.rtk);
     }
 
     #[test]
@@ -69,5 +75,6 @@ psk = "secret"
         assert_eq!(config.shell, "sh");
         assert_eq!(config.max_output_bytes, 131_072);
         assert_eq!(config.max_concurrent, 8);
+        assert!(!config.rtk);
     }
 }
