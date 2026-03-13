@@ -1,4 +1,7 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use axum::Router;
@@ -14,6 +17,7 @@ use tracing::info;
 use crate::config::GatewayConfig;
 use crate::handler;
 use crate::registry::Registry;
+use crate::session::SessionMap;
 
 /// Work item sent from axum handlers (outside LocalSet) to the RPC worker (inside LocalSet).
 struct WorkItem {
@@ -41,13 +45,32 @@ pub fn build_app(
     // RPC worker: runs inside LocalSet, processes JSON-RPC requests.
     // axum::serve dispatches handlers via tokio::spawn (outside LocalSet),
     // so handlers send work here via the channel to bridge the !Send gap.
+    let idle_timeout_secs = config.streaming.session_idle_timeout_secs;
     tokio::task::spawn_local(async move {
+        let session_map = Rc::new(RefCell::new(SessionMap::new()));
+
+        // Spawn idle cleanup timer
+        let cleanup_map = session_map.clone();
+        let idle_timeout = Duration::from_secs(idle_timeout_secs);
+        tokio::task::spawn_local(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let expired = cleanup_map.borrow_mut().cleanup_expired(idle_timeout);
+                if !expired.is_empty() {
+                    info!(count = expired.len(), "cleaned up expired streaming sessions");
+                }
+            }
+        });
+
         while let Some(item) = work_rx.recv().await {
             let cfg = config.clone();
             let reg = registry.clone();
             let lim = limiter.clone();
+            let smap = session_map.clone();
             tokio::task::spawn_local(async move {
-                let result = handler::dispatch_request(&item.request, &cfg, &reg, &lim).await;
+                let result =
+                    handler::dispatch_request(&item.request, &cfg, &reg, &lim, &smap).await;
                 let _ = item.response_tx.send(result);
             });
         }
