@@ -268,7 +268,7 @@ checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
 
 [[package]]
 name = "commando-agent"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "capnp",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "commando-cli"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "clap",
  "reqwest",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "commando-common"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "capnp",
  "capnp-rpc",
@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "commando-gateway"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "axum",
