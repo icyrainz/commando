@@ -22,7 +22,7 @@ ssh root@pve-node "pct exec 100 -- bash -c 'cd /app && docker compose ps --forma
 
 Each layer (local shell → SSH → container exec → bash -c) interprets quotes. Pipes, heredocs, and special characters break constantly.
 
-Commando transports commands through MCP (JSON-RPC) and Cap'n Proto (binary serialization) — neither interprets the string as shell. The command arrives at the target machine untouched. Only one `sh -c` ever runs it.
+Commando transports commands through HTTP (REST API or MCP) and Cap'n Proto (binary serialization) — neither interprets the string as shell. The command arrives at the target machine untouched. Only one `sh -c` ever runs it.
 
 ## AI Agent Efficiency
 
@@ -54,14 +54,17 @@ For an AI agent executing dozens of commands per task, this is the difference be
 
 ```
 AI Coding Agent (Claude Code, etc.)
-    │
-    │ HTTP (MCP JSON-RPC)
-    ▼
+    │                      │
+    │ MCP (discovery)      │ Bash (execution)
+    │ commando_list        │ commando exec <target> "cmd"
+    │ commando_ping        │
+    ▼                      ▼
 ┌──────────────────────────────┐
 │  Commando Gateway            │
 │  (one persistent service)    │
 │                              │
-│  HTTP Server ── Registry     │
+│  /mcp  ── MCP tools          │
+│  /api  ── REST API  Registry │
 │       │        - auto-disc   │
 │       ▼        - manual TOML │
 │  Cap'n Proto                 │
