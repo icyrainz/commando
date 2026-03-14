@@ -31,7 +31,8 @@ const SHELL_BUILTINS: &[&str] = &[
 /// `wrapper_bin` is the wrapper binary name (e.g., "rtk").
 /// `shell` is the configured shell (e.g., "sh", "bash", "fish") for complex commands.
 pub fn build_command(command: &str, shell: &str, wrapper_bin: &str) -> Command {
-    if is_simple_command(command) {
+    let first_word = command.split_whitespace().next().unwrap_or("");
+    if is_simple_command(command) && !SHELL_BUILTINS.contains(&first_word) {
         let mut c = Command::new(wrapper_bin);
         for arg in shell_words::split(command).unwrap_or_else(|_| vec![command.to_string()]) {
             c.arg(arg);
@@ -308,6 +309,37 @@ mod tests {
         assert_eq!(
             wrap_chain_rtk(r#"docker ps && echo "done""#),
             Some(r#"rtk docker ps && rtk echo "done""#.to_string())
+        );
+    }
+
+    #[test]
+    fn builtin_commands_not_wrapped() {
+        // Shell builtins that look like simple commands must go through the shell,
+        // not be wrapped with the wrapper binary.
+        let cmd = build_command("exit 42", "sh", "rtk");
+        let prog = format!("{:?}", cmd.as_std());
+        assert!(
+            prog.contains("\"sh\""),
+            "exit should use shell, got: {prog}"
+        );
+
+        let cmd = build_command("cd /app", "sh", "rtk");
+        let prog = format!("{:?}", cmd.as_std());
+        assert!(prog.contains("\"sh\""), "cd should use shell, got: {prog}");
+
+        let cmd = build_command("export FOO=bar", "sh", "rtk");
+        let prog = format!("{:?}", cmd.as_std());
+        assert!(
+            prog.contains("\"sh\""),
+            "export should use shell, got: {prog}"
+        );
+
+        // Non-builtin simple commands should still be wrapped
+        let cmd = build_command("hostname", "sh", "rtk");
+        let prog = format!("{:?}", cmd.as_std());
+        assert!(
+            prog.contains("\"rtk\""),
+            "hostname should use rtk, got: {prog}"
         );
     }
 }
