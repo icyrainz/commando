@@ -62,7 +62,9 @@ async fn run(cli: Cli) -> i32 {
     };
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
-        .read_timeout(std::time::Duration::from_secs(30))
+        // No read_timeout — the gateway's page_timeout_secs (default 5s) controls
+        // how long each page poll blocks. A client-side read_timeout would race
+        // against the gateway timeout and kill long-running commands.
         .build()
         .expect("failed to build HTTP client");
     match cli.command {

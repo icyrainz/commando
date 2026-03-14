@@ -549,5 +549,5 @@ Last updated: 2026-03-14. Feedback sources: homelab user review, DevOps/SRE revi
 - **Agent auto-update:** Gateway pushes new agent binaries to targets
 - **Graceful agent shutdown:** On SIGTERM, SIGTERM all active child process groups (5s grace + SIGKILL) before exiting
 - **Version negotiation:** `agentVersion` compatibility checks in gateway to detect incompatible agents
-- **Rename `expose_exec_tool`:** Consider `mcp_exec_mode` or similar for clarity
+- ~~**Rename `expose_exec_tool`:**~~ **Done** — renamed to `execution_mode` ("cli" or "mcp")
 - **Binary checksum verification:** Install scripts should verify checksums or signatures of downloaded binaries

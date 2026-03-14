@@ -92,11 +92,19 @@ pub struct ServerConfig {
     /// Can also be set via COMMANDO_API_KEY env var (takes precedence).
     /// Required for streamable-http transport.
     pub api_key: Option<String>,
-    /// When true, expose commando_exec and commando_output as MCP tools.
-    /// When false (default), only commando_list and commando_ping are exposed,
-    /// and the tool description tells Claude to use the `commando` CLI via Bash.
-    #[serde(default)]
-    pub expose_exec_tool: bool,
+    /// How Claude Code executes commands: "cli" (default) or "mcp".
+    /// - "cli": only commando_list and commando_ping exposed as MCP tools.
+    ///   Tool description tells Claude to use `commando exec` via Bash.
+    /// - "mcp": also exposes commando_exec and commando_output as MCP tools.
+    ///   No CLI install needed, but output may be truncated by Claude Code.
+    #[serde(default = "default_execution_mode")]
+    pub execution_mode: String,
+}
+
+impl ServerConfig {
+    pub fn is_mcp_exec_mode(&self) -> bool {
+        self.execution_mode == "mcp"
+    }
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -106,7 +114,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("bind", &self.bind)
             .field("port", &self.port)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
-            .field("expose_exec_tool", &self.expose_exec_tool)
+            .field("execution_mode", &self.execution_mode)
             .finish()
     }
 }
@@ -118,9 +126,13 @@ impl Default for ServerConfig {
             bind: default_bind(),
             port: default_server_port(),
             api_key: None,
-            expose_exec_tool: false,
+            execution_mode: default_execution_mode(),
         }
     }
+}
+
+fn default_execution_mode() -> String {
+    "cli".to_string()
 }
 
 fn default_transport() -> String {

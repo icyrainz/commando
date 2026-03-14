@@ -245,14 +245,14 @@ tags = ["database"]
 
 ## MCP-Only Mode (Optional)
 
-If you prefer not to install the CLI and want Claude Code to execute commands entirely through MCP tools, add to `gateway.toml`:
+If you prefer not to install the CLI and want Claude Code to execute commands entirely through MCP tools, set the execution mode in `gateway.toml`:
 
 ```toml
 [server]
-expose_exec_tool = true
+execution_mode = "mcp"
 ```
 
-This exposes `commando_exec` and `commando_output` as MCP tools. The trade-off: Claude Code's MCP output rendering may truncate long command output. The CLI avoids this by using native Bash rendering.
+This exposes `commando_exec` and `commando_output` as MCP tools (default is `"cli"` which hides them). The trade-off: Claude Code's MCP output rendering may truncate long command output. The CLI avoids this by using native Bash rendering.
 
 ## Proxmox Auto-Discovery
 

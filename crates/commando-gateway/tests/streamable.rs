@@ -19,7 +19,7 @@ fn test_config() -> Arc<GatewayConfig> {
             bind: "127.0.0.1".to_string(),
             port: 0,
             api_key: Some(TEST_API_KEY.to_string()),
-            expose_exec_tool: false,
+            execution_mode: "cli".to_string(),
         },
         proxmox: None,
         agent: AgentConnectionConfig {

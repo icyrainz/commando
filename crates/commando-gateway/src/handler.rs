@@ -204,7 +204,7 @@ pub async fn dispatch_request(
 
     let response = match method {
         "initialize" => process_initialize(request),
-        "tools/list" => process_tools_list(request, config.server.expose_exec_tool),
+        "tools/list" => process_tools_list(request, config.server.is_mcp_exec_mode()),
         "tools/call" => handle_tools_call(request, config, registry, limiter, session_map).await,
         _ => make_error_response(id.clone(), -32601, &format!("Method not found: {method}")),
     };
