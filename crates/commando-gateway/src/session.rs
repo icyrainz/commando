@@ -16,11 +16,20 @@ pub struct StreamExecResult {
     pub timed_out: bool,
 }
 
+/// RPC-internal timing breakdown, stored in the session for profiling.
+#[derive(Clone, Default)]
+pub struct RpcProfile {
+    pub tcp_connect_ms: f64,
+    pub auth_ms: f64,
+    pub exec_rpc_ms: f64,
+}
+
 pub struct Session {
     pub stdout_buffer: Vec<u8>,
     pub stderr_buffer: Vec<u8>,
     pub completed: bool,
     pub exec_result: Option<StreamExecResult>,
+    pub rpc_profile: Option<RpcProfile>,
     pub last_polled: Instant,
     pub notify: Rc<Notify>,
     pub rpc_task: Option<tokio::task::JoinHandle<()>>,
@@ -33,6 +42,7 @@ impl Session {
             stderr_buffer: Vec::new(),
             completed: false,
             exec_result: None,
+            rpc_profile: None,
             last_polled: Instant::now(),
             notify: Rc::new(Notify::new()),
             rpc_task: None,

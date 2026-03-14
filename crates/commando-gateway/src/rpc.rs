@@ -295,13 +295,14 @@ pub fn start_remote_exec_stream(
             let mut map = session_map.borrow_mut();
             if let Some(session) = map.get_by_id_mut(&session_id) {
                 match result {
-                    Ok((exit_code, duration_ms, timed_out)) => {
+                    Ok((exit_code, duration_ms, timed_out, rpc_profile)) => {
                         session.completed = true;
                         session.exec_result = Some(StreamExecResult {
                             exit_code,
                             duration_ms,
                             timed_out,
                         });
+                        session.rpc_profile = Some(rpc_profile);
                     }
                     Err(e) => {
                         error!(
@@ -330,7 +331,7 @@ pub fn start_remote_exec_stream(
 }
 
 /// Inner helper: connect, authenticate, send exec_stream request, await result.
-/// Returns `(exit_code, duration_ms, timed_out)` on success.
+/// Returns `(exit_code, duration_ms, timed_out, rpc_profile)` on success.
 #[allow(clippy::too_many_arguments)]
 async fn exec_stream_inner(
     host: &str,
@@ -344,7 +345,10 @@ async fn exec_stream_inner(
     connect_timeout_secs: u64,
     session_map: Rc<RefCell<SessionMap>>,
     session_id: String,
-) -> Result<(i32, u64, bool)> {
+) -> Result<(i32, u64, bool, crate::session::RpcProfile)> {
+    use tokio::time::Instant;
+
+    let t0 = Instant::now();
     let addr = format!("{host}:{port}");
 
     // Connect with timeout
@@ -357,6 +361,8 @@ async fn exec_stream_inner(
     .context("TCP connect failed")?;
 
     stream.set_nodelay(true)?;
+    let t_connected = Instant::now();
+
     let stream = stream.compat();
     let (reader, writer) = stream.split();
 
@@ -376,6 +382,7 @@ async fn exec_stream_inner(
 
     // Authenticate
     let agent_client = authenticate(&auth_client, psk.as_bytes()).await?;
+    let t_authed = Instant::now();
 
     // Build exec_stream request
     let receiver_impl = OutputReceiverImpl {
@@ -413,6 +420,14 @@ async fn exec_stream_inner(
     let exit_code = result.get_exit_code();
     let duration_ms = result.get_duration_ms();
     let timed_out = result.get_timed_out();
+    let t_exec_done = Instant::now();
+
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let rpc_profile = crate::session::RpcProfile {
+        tcp_connect_ms: ms(t_connected.duration_since(t0)),
+        auth_ms: ms(t_authed.duration_since(t_connected)),
+        exec_rpc_ms: ms(t_exec_done.duration_since(t_authed)),
+    };
 
     // Clean up RPC connection — fire-and-forget to avoid blocking on TCP teardown.
     // The RPC system is already running via spawn_local; the disconnector just
@@ -423,7 +438,7 @@ async fn exec_stream_inner(
         let _ = disconnector.await;
     });
 
-    Ok((exit_code, duration_ms, timed_out))
+    Ok((exit_code, duration_ms, timed_out, rpc_profile))
 }
 
 /// Perform HMAC challenge-response authentication, returns CommandAgent capability.

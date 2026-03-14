@@ -219,9 +219,15 @@ pub async fn dispatch_request(
                 profiler.stage("audit");
                 audit_exec(audit, target, command, &result, "rest");
                 profiler.stage("serialize");
-                let profile_data = profiler.finish();
+                let mut profile_data = profiler.finish();
                 match result {
                     Ok(mut page) => {
+                        // Merge RPC-internal profile into gateway profile
+                        if let Some(ref mut gw) = profile_data
+                            && let Some(rpc) = page._profile.take()
+                        {
+                            gw.stages.extend(rpc.stages);
+                        }
                         page._profile = profile_data;
                         serde_json::to_value(&page).unwrap()
                     }
@@ -636,8 +642,11 @@ pub async fn build_page(
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
 
     if let Some((exit_code, duration_ms, timed_out)) = exec_result_data {
-        // Final page: remove session from map
-        session_map.borrow_mut().remove_by_token(token);
+        // Final page: remove session from map, extract rpc_profile if present
+        let rpc_profile = session_map
+            .borrow_mut()
+            .remove_by_token(token)
+            .and_then(|s| s.rpc_profile);
 
         Ok(ExecPage {
             stdout,
@@ -646,7 +655,16 @@ pub async fn build_page(
             duration_ms: Some(duration_ms),
             timed_out: if timed_out { Some(true) } else { None },
             next_page: None,
-            _profile: None,
+            _profile: rpc_profile.map(|rp| {
+                let mut stages = BTreeMap::new();
+                stages.insert("rpc_tcp_connect".to_string(), rp.tcp_connect_ms);
+                stages.insert("rpc_auth".to_string(), rp.auth_ms);
+                stages.insert("rpc_exec".to_string(), rp.exec_rpc_ms);
+                ProfileData {
+                    stages,
+                    total_ms: 0.0, // will be replaced by Profiler::finish()
+                }
+            }),
         })
     } else {
         // Still running: rotate token
