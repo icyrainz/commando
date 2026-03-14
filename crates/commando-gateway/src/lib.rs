@@ -6,3 +6,4 @@ pub mod registry;
 pub mod rpc;
 pub mod session;
 pub mod streamable;
+pub mod types;
