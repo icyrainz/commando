@@ -612,10 +612,23 @@ pub fn handle_list_core(filter: Option<&str>, registry: &Arc<Mutex<Registry>>) -
     let reg = registry.lock().unwrap();
     reg.list(filter)
         .iter()
-        .map(|t| TargetInfo {
-            name: t.name.clone(),
-            status: t.status.clone(),
-            host: t.host.clone(),
+        .map(|t| {
+            // For manual targets, status is always "unknown" since there's no
+            // Proxmox discovery. Use reachability from ping cycle instead.
+            let status = if t.status == "unknown" {
+                match t.reachable {
+                    crate::registry::Reachability::Reachable => "reachable".to_string(),
+                    crate::registry::Reachability::Unreachable => "unreachable".to_string(),
+                    crate::registry::Reachability::Unknown => "unknown".to_string(),
+                }
+            } else {
+                t.status.clone()
+            };
+            TargetInfo {
+                name: t.name.clone(),
+                status,
+                host: t.host.clone(),
+            }
         })
         .collect()
 }
