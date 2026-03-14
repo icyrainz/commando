@@ -103,6 +103,23 @@ else
     echo "  COMMANDO_URL=$COMMANDO_URL"
     echo "  COMMANDO_API_KEY=(set)"
     echo ""
+
+    # Configure Claude Code MCP if 'claude' is available
+    if command -v claude >/dev/null 2>&1; then
+        echo "Configuring Claude Code MCP server..."
+        claude mcp add commando \
+            --transport http \
+            --url "${COMMANDO_URL}/mcp" \
+            --header "Authorization: Bearer ${COMMANDO_API_KEY}" 2>/dev/null \
+            && echo "Claude Code MCP configured." \
+            || echo "Warning: failed to configure Claude Code MCP. Add manually with:"
+        echo "  claude mcp add commando --transport http --url \"\$COMMANDO_URL/mcp\" --header \"Authorization: Bearer \$COMMANDO_API_KEY\""
+    else
+        echo "To connect Claude Code, run:"
+        echo "  claude mcp add commando --transport http --url \"\$COMMANDO_URL/mcp\" --header \"Authorization: Bearer \$COMMANDO_API_KEY\""
+    fi
+
+    echo ""
     echo "Verify: commando list"
 fi
 

@@ -51,7 +51,7 @@ Or pin a version: `COMMANDO_VERSION=v0.5.0 bash` instead of `bash`.
 Set env vars (shared with MCP config):
 
 ```bash
-export COMMANDO_URL="http://akio-commando:9877"
+export COMMANDO_URL="http://your-gateway:9877"
 export COMMANDO_API_KEY="your-key"
 ```
 
@@ -82,7 +82,7 @@ cargo +nightly test
 
 ## Deployment Operations
 
-There are 4 deploy scripts in `deploy/`. Pick the right one for the task:
+There are 5 deploy scripts in `deploy/`. Pick the right one for the task:
 
 ### Install agent on a new machine (any Linux host)
 
