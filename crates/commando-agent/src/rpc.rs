@@ -283,6 +283,10 @@ impl command_agent::Server for CommandAgentImpl {
         params: command_agent::ExecStreamParams,
         mut results: command_agent::ExecStreamResults,
     ) -> Result<(), capnp::Error> {
+        // Always collect timestamps — cost is ~20ns per Instant::now().
+        // JSON serialization (~1μs) only happens at the end.
+        let t0 = Instant::now();
+
         let _permit = self
             .concurrency_guard
             .try_acquire()
@@ -344,6 +348,8 @@ impl command_agent::Server for CommandAgentImpl {
             .get_receiver()
             .map_err(|e| capnp::Error::failed(format!("failed to get receiver: {e}")))?;
 
+        let t_parsed = Instant::now();
+
         tracing::info!(
             request_id = %request_id,
             command = %command,
@@ -387,11 +393,16 @@ impl command_agent::Server for CommandAgentImpl {
         .await
         .map_err(|e| capnp::Error::failed(format!("exec_stream error: {e}")))?;
 
+        let t_exec_done = Instant::now();
+
         // Drain all pending receive calls before returning the result.
         let pending: Vec<_> = handles.borrow_mut().drain(..).collect();
+        let drain_count = pending.len();
         for handle in pending {
             let _ = handle.await;
         }
+
+        let t_drain_done = Instant::now();
 
         tracing::info!(
             request_id = %request_id,
@@ -401,6 +412,16 @@ impl command_agent::Server for CommandAgentImpl {
             "exec_stream completed"
         );
 
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        let profile_json = serde_json::json!({
+            "parse_params_ms": ms(t_parsed.duration_since(t0)),
+            "execute_ms": ms(t_exec_done.duration_since(t_parsed)),
+            "drain_callbacks_ms": ms(t_drain_done.duration_since(t_exec_done)),
+            "drain_count": drain_count,
+            "total_ms": ms(t_drain_done.duration_since(t0)),
+        })
+        .to_string();
+
         let mut r = results.get().init_result();
         r.set_stdout(&[]);
         r.set_stderr(&[]);
@@ -409,6 +430,7 @@ impl command_agent::Server for CommandAgentImpl {
         r.set_timed_out(exec_result.timed_out);
         r.set_truncated(false);
         r.set_request_id(&request_id);
+        r.set_profiler_json(&profile_json);
 
         Ok(())
     }

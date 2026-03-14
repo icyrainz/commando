@@ -39,6 +39,8 @@ struct ExecResult {
   timedOut @4 :Bool;
   truncated @5 :Bool;
   requestId @6 :Text;
+  profilerJson @7 :Text;
+  # Optional JSON-encoded timing breakdown (always populated by the agent).
 }
 
 struct PingResult {

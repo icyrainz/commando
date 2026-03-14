@@ -660,6 +660,20 @@ pub async fn build_page(
                 stages.insert("rpc_tcp_connect".to_string(), rp.tcp_connect_ms);
                 stages.insert("rpc_auth".to_string(), rp.auth_ms);
                 stages.insert("rpc_exec".to_string(), rp.exec_rpc_ms);
+                // Merge agent-side profile if present
+                if !rp.agent_profile_json.is_empty()
+                    && let Ok(agent) =
+                        serde_json::from_str::<serde_json::Value>(&rp.agent_profile_json)
+                    && let Some(obj) = agent.as_object()
+                {
+                    for (k, v) in obj {
+                        if let Some(f) = v.as_f64() {
+                            stages.insert(format!("agent_{k}"), f);
+                        } else if let Some(n) = v.as_u64() {
+                            stages.insert(format!("agent_{k}"), n as f64);
+                        }
+                    }
+                }
                 ProfileData {
                     stages,
                     total_ms: 0.0, // will be replaced by Profiler::finish()

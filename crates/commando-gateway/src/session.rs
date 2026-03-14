@@ -22,6 +22,8 @@ pub struct RpcProfile {
     pub tcp_connect_ms: f64,
     pub auth_ms: f64,
     pub exec_rpc_ms: f64,
+    /// JSON-encoded agent-side profile (empty if agent doesn't support it).
+    pub agent_profile_json: String,
 }
 
 pub struct Session {

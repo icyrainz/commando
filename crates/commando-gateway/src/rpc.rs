@@ -420,6 +420,12 @@ async fn exec_stream_inner(
     let exit_code = result.get_exit_code();
     let duration_ms = result.get_duration_ms();
     let timed_out = result.get_timed_out();
+    let agent_profile_json = result
+        .get_profiler_json()
+        .ok()
+        .and_then(|s| s.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let t_exec_done = Instant::now();
 
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
@@ -427,6 +433,7 @@ async fn exec_stream_inner(
         tcp_connect_ms: ms(t_connected.duration_since(t0)),
         auth_ms: ms(t_authed.duration_since(t_connected)),
         exec_rpc_ms: ms(t_exec_done.duration_since(t_authed)),
+        agent_profile_json,
     };
 
     // Clean up RPC connection — fire-and-forget to avoid blocking on TCP teardown.
