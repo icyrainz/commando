@@ -12,6 +12,7 @@ use crate::config::{GatewayConfig, StreamingConfig};
 use crate::registry::Registry;
 use crate::rpc;
 use crate::session::SessionMap;
+use crate::types::*;
 
 /// Per-target concurrency semaphore (simple counter-based).
 pub struct ConcurrencyLimiter {
@@ -69,39 +70,8 @@ pub fn process_tools_list(request: &Value) -> Value {
         "result": {
             "tools": [
                 {
-                    "name": "commando_exec",
-                    "description": "Execute a shell command on a target machine. If the response includes a next_page field, the command is still running — call commando_output with the page token to get more output.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "target": {
-                                "type": "string",
-                                "description": "Fully qualified target name (e.g., 'node-1/my-app', 'my-desktop')"
-                            },
-                            "command": {
-                                "type": "string",
-                                "description": "Shell command to execute"
-                            },
-                            "work_dir": {
-                                "type": "string",
-                                "description": "Working directory (default: home dir)"
-                            },
-                            "timeout": {
-                                "type": "number",
-                                "description": "Timeout in seconds (default: 60)"
-                            },
-                            "env": {
-                                "type": "object",
-                                "description": "Additional environment variables",
-                                "additionalProperties": { "type": "string" }
-                            }
-                        },
-                        "required": ["target", "command"]
-                    }
-                },
-                {
                     "name": "commando_list",
-                    "description": "List all registered targets with their status, shell, tags, and reachability.",
+                    "description": "List all available commando targets with their status and IP. To execute commands on a target, use the Bash tool: commando exec <target> '<command>'",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -124,20 +94,6 @@ pub fn process_tools_list(request: &Value) -> Value {
                             }
                         },
                         "required": ["target"]
-                    }
-                },
-                {
-                    "name": "commando_output",
-                    "description": "Get the next page of output from a streaming command. Use when commando_exec returns a next_page token.",
-                    "inputSchema": {
-                        "type": "object",
-                        "required": ["page"],
-                        "properties": {
-                            "page": {
-                                "type": "string",
-                                "description": "Page token from previous commando_exec or commando_output response"
-                            }
-                        }
                     }
                 }
             ]
@@ -196,6 +152,55 @@ pub async fn dispatch_request(
     limiter: &Arc<ConcurrencyLimiter>,
     session_map: &Rc<RefCell<SessionMap>>,
 ) -> Option<Value> {
+    // Handle REST API requests (sent via __rest marker)
+    if let Some(rest_type) = request["__rest"].as_str() {
+        let result = match rest_type {
+            "exec" => {
+                let target = request["target"].as_str().unwrap_or("");
+                let command = request["command"].as_str().unwrap_or("");
+                let work_dir = request["work_dir"].as_str().unwrap_or("");
+                let timeout = request["timeout"].as_u64().map(|t| t as u32);
+                // extra_env intentionally empty — --env flag omitted from CLI v1
+                match handle_exec_core(
+                    target,
+                    command,
+                    work_dir,
+                    timeout,
+                    vec![],
+                    config,
+                    registry,
+                    limiter,
+                    session_map,
+                )
+                .await
+                {
+                    Ok(page) => serde_json::to_value(&page).unwrap(),
+                    Err(e) => json!({"error": e.message, "_gateway": e.is_gateway_error}),
+                }
+            }
+            "output" => {
+                let token = request["page"].as_str().unwrap_or("");
+                match handle_output_core(token, session_map, &config.streaming).await {
+                    Ok(page) => serde_json::to_value(&page).unwrap(),
+                    Err(e) => json!({"error": e.message}),
+                }
+            }
+            "list" => {
+                let targets = handle_list_core(None, registry);
+                serde_json::to_value(&targets).unwrap()
+            }
+            "ping" => {
+                let target = request["target"].as_str().unwrap_or("");
+                match handle_ping_core(target, config, registry).await {
+                    Ok(info) => serde_json::to_value(&info).unwrap(),
+                    Err(e) => json!({"error": e.message, "_gateway": e.is_gateway_error}),
+                }
+            }
+            _ => json!({"error": format!("unknown REST type: {rest_type}")}),
+        };
+        return Some(result);
+    }
+
     let method = request["method"].as_str().unwrap_or("");
     let id = &request["id"];
 
@@ -234,64 +239,53 @@ async fn handle_tools_call(
     }
 }
 
-async fn handle_exec(
-    id: &Value,
-    args: &Value,
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_exec_core(
+    target_name: &str,
+    command: &str,
+    work_dir: &str,
+    timeout_secs: Option<u32>,
+    extra_env: Vec<(String, String)>,
     config: &Arc<GatewayConfig>,
     registry: &Arc<Mutex<Registry>>,
     limiter: &Arc<ConcurrencyLimiter>,
     session_map: &Rc<RefCell<SessionMap>>,
-) -> Value {
-    let target_name = match args["target"].as_str() {
-        Some(t) => t,
-        None => return make_tool_error(id, "missing required parameter: target"),
-    };
-    let command = match args["command"].as_str() {
-        Some(c) => c,
-        None => return make_tool_error(id, "missing required parameter: command"),
-    };
-    let work_dir = args["work_dir"].as_str().unwrap_or("");
-    let timeout_secs = args["timeout"]
-        .as_u64()
-        .unwrap_or(config.agent.default_timeout_secs as u64) as u32;
+) -> Result<ExecPage, HandlerError> {
+    let timeout = timeout_secs.unwrap_or(config.agent.default_timeout_secs);
 
     let (host, port, status) = {
         let reg = registry.lock().unwrap();
         match reg.get(target_name) {
             Some(t) => (t.host.clone(), t.port, t.status.clone()),
-            None => return make_tool_error(id, &format!("unknown target: {target_name}")),
+            None => {
+                return Err(HandlerError::bad_request(format!(
+                    "unknown target: {target_name}"
+                )));
+            }
         }
     };
 
     if host.is_empty() {
-        return make_tool_error(
-            id,
-            &format!("target '{}' is {} (no IP available)", target_name, status),
-        );
+        return Err(HandlerError::bad_request(format!(
+            "target '{}' is {} (no IP available)",
+            target_name, status
+        )));
     }
 
     let psk = match config.agent.psk.get(target_name) {
         Some(p) => p.clone(),
         None => {
-            return make_tool_error(id, &format!("no PSK configured for target: {target_name}"));
+            return Err(HandlerError::bad_request(format!(
+                "no PSK configured for target: {target_name}"
+            )));
         }
     };
 
     if !limiter.try_acquire(target_name) {
-        return make_tool_error(
-            id,
-            &format!("concurrency limit reached for target: {target_name}"),
-        );
+        return Err(HandlerError::bad_request(format!(
+            "concurrency limit reached for target: {target_name}"
+        )));
     }
-
-    let extra_env: Vec<(String, String)> = args["env"]
-        .as_object()
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
 
     let request_id = uuid::Uuid::new_v4().to_string();
 
@@ -312,7 +306,7 @@ async fn handle_exec(
         &psk,
         command,
         work_dir,
-        timeout_secs,
+        timeout,
         &extra_env,
         &request_id,
         config.agent.connect_timeout_secs,
@@ -330,59 +324,90 @@ async fn handle_exec(
         } else {
             // Session was unexpectedly removed; abort the spawned task and release slot
             join_handle.abort();
-            return make_tool_error(id, "session lost before execution started");
+            return Err(HandlerError::bad_request(
+                "session lost before execution started",
+            ));
         }
     }
 
     // Build and return the first page
-    match build_page(session_map, &token, &config.streaming).await {
+    build_page(session_map, &token, &config.streaming)
+        .await
+        .map_err(HandlerError::bad_request)
+}
+
+async fn handle_exec(
+    id: &Value,
+    args: &Value,
+    config: &Arc<GatewayConfig>,
+    registry: &Arc<Mutex<Registry>>,
+    limiter: &Arc<ConcurrencyLimiter>,
+    session_map: &Rc<RefCell<SessionMap>>,
+) -> Value {
+    let target_name = match args["target"].as_str() {
+        Some(t) => t,
+        None => return make_tool_error(id, "missing required parameter: target"),
+    };
+    let command = match args["command"].as_str() {
+        Some(c) => c,
+        None => return make_tool_error(id, "missing required parameter: command"),
+    };
+    let work_dir = args["work_dir"].as_str().unwrap_or("");
+    let timeout_secs = args["timeout"].as_u64().map(|t| t as u32);
+    let extra_env: Vec<(String, String)> = args["env"]
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    match handle_exec_core(
+        target_name,
+        command,
+        work_dir,
+        timeout_secs,
+        extra_env,
+        config,
+        registry,
+        limiter,
+        session_map,
+    )
+    .await
+    {
         Ok(page) => format_page_response(id, &page),
-        Err(e) => make_tool_error(id, &format!("exec failed: {e}")),
+        Err(e) => make_tool_error(id, &e.message),
     }
 }
 
-/// Convert a page response JSON into MCP tool result text.
-fn format_page_response(id: &Value, page: &Value) -> Value {
+/// Convert a page response into MCP tool result text.
+fn format_page_response(id: &Value, page: &ExecPage) -> Value {
     let mut text = String::new();
-
-    if let Some(stdout) = page["stdout"].as_str()
-        && !stdout.is_empty()
-    {
-        text.push_str(stdout);
+    if !page.stdout.is_empty() {
+        text.push_str(&page.stdout);
     }
-
-    if let Some(stderr) = page["stderr"].as_str()
-        && !stderr.is_empty()
-    {
+    if !page.stderr.is_empty() {
         if !text.is_empty() {
             text.push('\n');
         }
         text.push_str("[stderr]\n");
-        text.push_str(stderr);
+        text.push_str(&page.stderr);
     }
-
-    if page["timed_out"].as_bool().unwrap_or(false) {
+    if page.timed_out.unwrap_or(false) {
         text.push_str("\n[timed out]");
     }
-
-    // Final page: include metadata footer with exit code and duration
-    if let Some(exit_code) = page["exit_code"].as_i64() {
-        let duration_ms = page["duration_ms"].as_u64().unwrap_or(0);
-        let metadata = format!(
+    if let Some(exit_code) = page.exit_code {
+        let duration_ms = page.duration_ms.unwrap_or(0);
+        text.push_str(&format!(
             "\n---\nexit_code: {} | duration: {}ms",
             exit_code, duration_ms
-        );
-        text.push_str(&metadata);
+        ));
     }
-
-    // Streaming: include next_page token if still running
-    if let Some(next_page) = page["next_page"].as_str() {
+    if let Some(next_page) = &page.next_page {
         text.push_str(&format!("\n[streaming] next_page={next_page}"));
     }
-
-    let is_error = page["exit_code"].as_i64().is_some_and(|c| c != 0)
-        || page["timed_out"].as_bool().unwrap_or(false);
-
+    let is_error = page.exit_code.is_some_and(|c| c != 0) || page.timed_out.unwrap_or(false);
     if is_error {
         make_tool_error(id, &text)
     } else {
@@ -394,11 +419,11 @@ fn format_page_response(id: &Value, page: &Value) -> Value {
 ///
 /// Phase 1: Wait for data to become available (or completion/timeout).
 /// Phase 2: Drain buffers up to page_max_bytes and build the response.
-async fn build_page(
+pub async fn build_page(
     session_map: &Rc<RefCell<SessionMap>>,
     token: &str,
     config: &StreamingConfig,
-) -> Result<Value, String> {
+) -> Result<ExecPage, String> {
     let page_timeout = Duration::from_secs(config.page_timeout_secs);
     let page_max = config.page_max_bytes;
     let deadline = Instant::now() + page_timeout;
@@ -508,13 +533,14 @@ async fn build_page(
         // Final page: remove session from map
         session_map.borrow_mut().remove_by_token(token);
 
-        Ok(json!({
-            "stdout": stdout,
-            "stderr": stderr,
-            "exit_code": exit_code,
-            "duration_ms": duration_ms,
-            "timed_out": timed_out,
-        }))
+        Ok(ExecPage {
+            stdout,
+            stderr,
+            exit_code: Some(exit_code),
+            duration_ms: Some(duration_ms),
+            timed_out: if timed_out { Some(true) } else { None },
+            next_page: None,
+        })
     } else {
         // Still running: rotate token
         let new_token = session_map
@@ -522,12 +548,25 @@ async fn build_page(
             .rotate_token(token)
             .ok_or_else(|| "session disappeared during token rotation".to_string())?;
 
-        Ok(json!({
-            "stdout": stdout,
-            "stderr": stderr,
-            "next_page": new_token,
-        }))
+        Ok(ExecPage {
+            stdout,
+            stderr,
+            exit_code: None,
+            duration_ms: None,
+            timed_out: None,
+            next_page: Some(new_token),
+        })
     }
+}
+
+pub async fn handle_output_core(
+    token: &str,
+    session_map: &Rc<RefCell<SessionMap>>,
+    config: &StreamingConfig,
+) -> Result<ExecPage, HandlerError> {
+    build_page(session_map, token, config)
+        .await
+        .map_err(HandlerError::bad_request)
 }
 
 async fn handle_output(
@@ -541,10 +580,44 @@ async fn handle_output(
         None => return make_tool_error(id, "missing required parameter: page"),
     };
 
-    match build_page(session_map, token, config).await {
+    match handle_output_core(token, session_map, config).await {
         Ok(page) => format_page_response(id, &page),
-        Err(e) => make_tool_error(id, &e),
+        Err(e) => make_tool_error(id, &e.message),
     }
+}
+
+pub fn handle_list_core_full(
+    filter: Option<&str>,
+    config: &GatewayConfig,
+    registry: &Arc<Mutex<Registry>>,
+) -> Vec<TargetInfoFull> {
+    let reg = registry.lock().unwrap();
+    reg.list(filter)
+        .iter()
+        .map(|t| TargetInfoFull {
+            name: t.name.clone(),
+            host: t.host.clone(),
+            port: t.port,
+            shell: t.shell.clone(),
+            tags: t.tags.clone(),
+            source: format!("{:?}", t.source),
+            status: t.status.clone(),
+            reachable: format!("{:?}", t.reachable),
+            has_psk: config.agent.psk.contains_key(&t.name),
+        })
+        .collect()
+}
+
+pub fn handle_list_core(filter: Option<&str>, registry: &Arc<Mutex<Registry>>) -> Vec<TargetInfo> {
+    let reg = registry.lock().unwrap();
+    reg.list(filter)
+        .iter()
+        .map(|t| TargetInfo {
+            name: t.name.clone(),
+            status: t.status.clone(),
+            host: t.host.clone(),
+        })
+        .collect()
 }
 
 fn handle_list(
@@ -554,30 +627,58 @@ fn handle_list(
     registry: &Arc<Mutex<Registry>>,
 ) -> Value {
     let filter = args["filter"].as_str();
-    let reg = registry.lock().unwrap();
-
-    let targets: Vec<Value> = reg
-        .list(filter)
-        .iter()
-        .map(|t| {
-            json!({
-                "name": t.name,
-                "host": t.host,
-                "port": t.port,
-                "shell": t.shell,
-                "tags": t.tags,
-                "source": format!("{:?}", t.source),
-                "status": t.status,
-                "reachable": format!("{:?}", t.reachable),
-                "has_psk": config.agent.psk.contains_key(&t.name),
-            })
-        })
-        .collect();
-
+    let targets = handle_list_core_full(filter, config, registry);
     make_tool_result(
         id,
         &serde_json::to_string_pretty(&targets).unwrap_or_default(),
     )
+}
+
+pub async fn handle_ping_core(
+    target_name: &str,
+    config: &Arc<GatewayConfig>,
+    registry: &Arc<Mutex<Registry>>,
+) -> Result<PingInfo, HandlerError> {
+    let (host, port, status) = {
+        let reg = registry.lock().unwrap();
+        match reg.get(target_name) {
+            Some(t) => (t.host.clone(), t.port, t.status.clone()),
+            None => {
+                return Err(HandlerError::bad_request(format!(
+                    "unknown target: {target_name}"
+                )));
+            }
+        }
+    };
+
+    if host.is_empty() {
+        return Err(HandlerError::bad_request(format!(
+            "target '{}' is {} (no IP available)",
+            target_name, status
+        )));
+    }
+
+    let psk = match config.agent.psk.get(target_name) {
+        Some(p) => p.clone(),
+        None => {
+            return Err(HandlerError::bad_request(format!(
+                "no PSK configured for target: {target_name}"
+            )));
+        }
+    };
+
+    let start = std::time::Instant::now();
+    match rpc::remote_ping(&host, port, &psk, config.agent.connect_timeout_secs).await {
+        Ok(r) => Ok(PingInfo {
+            target: target_name.to_string(),
+            hostname: r.hostname,
+            uptime_secs: r.uptime_secs,
+            shell: r.shell,
+            latency_ms: start.elapsed().as_millis() as u64,
+            version: r.version,
+        }),
+        Err(e) => Err(HandlerError::gateway(format!("ping failed: {e}"))),
+    }
 }
 
 async fn handle_ping(
@@ -591,37 +692,15 @@ async fn handle_ping(
         None => return make_tool_error(id, "missing required parameter: target"),
     };
 
-    let (host, port, status) = {
-        let reg = registry.lock().unwrap();
-        match reg.get(target_name) {
-            Some(t) => (t.host.clone(), t.port, t.status.clone()),
-            None => return make_tool_error(id, &format!("unknown target: {target_name}")),
-        }
-    };
-
-    if host.is_empty() {
-        return make_tool_error(
-            id,
-            &format!("target '{}' is {} (no IP available)", target_name, status),
-        );
-    }
-
-    let psk = match config.agent.psk.get(target_name) {
-        Some(p) => p.clone(),
-        None => {
-            return make_tool_error(id, &format!("no PSK configured for target: {target_name}"));
-        }
-    };
-
-    match rpc::remote_ping(&host, port, &psk, config.agent.connect_timeout_secs).await {
-        Ok(r) => {
+    match handle_ping_core(target_name, config, registry).await {
+        Ok(info) => {
             let text = format!(
                 "hostname: {}\nuptime: {}s\nshell: {}\nversion: {}",
-                r.hostname, r.uptime_secs, r.shell, r.version
+                info.hostname, info.uptime_secs, info.shell, info.version
             );
             make_tool_result(id, &text)
         }
-        Err(e) => make_tool_error(id, &format!("ping failed: {e}")),
+        Err(e) => make_tool_error(id, &e.message),
     }
 }
 
@@ -660,13 +739,11 @@ mod tests {
         });
         let response = process_tools_list(&request);
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 2);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"commando_exec"));
         assert!(names.contains(&"commando_list"));
         assert!(names.contains(&"commando_ping"));
-        assert!(names.contains(&"commando_output"));
     }
 
     #[test]
@@ -1186,8 +1263,14 @@ mod tests {
     #[test]
     fn format_page_stdout_only() {
         let id = json!(1);
-        let page =
-            json!({ "stdout": "hello world", "stderr": "", "exit_code": 0, "duration_ms": 10 });
+        let page = ExecPage {
+            stdout: "hello world".to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration_ms: Some(10),
+            timed_out: None,
+            next_page: None,
+        };
         let resp = format_page_response(&id, &page);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("hello world"));
@@ -1199,8 +1282,14 @@ mod tests {
     #[test]
     fn format_page_stderr_included() {
         let id = json!(1);
-        let page =
-            json!({ "stdout": "out", "stderr": "err msg", "exit_code": 0, "duration_ms": 5 });
+        let page = ExecPage {
+            stdout: "out".to_string(),
+            stderr: "err msg".to_string(),
+            exit_code: Some(0),
+            duration_ms: Some(5),
+            timed_out: None,
+            next_page: None,
+        };
         let resp = format_page_response(&id, &page);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("out"));
@@ -1210,7 +1299,14 @@ mod tests {
     #[test]
     fn format_page_nonzero_exit_is_error() {
         let id = json!(1);
-        let page = json!({ "stdout": "", "stderr": "fail", "exit_code": 1, "duration_ms": 0 });
+        let page = ExecPage {
+            stdout: String::new(),
+            stderr: "fail".to_string(),
+            exit_code: Some(1),
+            duration_ms: Some(0),
+            timed_out: None,
+            next_page: None,
+        };
         let resp = format_page_response(&id, &page);
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
     }
@@ -1218,7 +1314,14 @@ mod tests {
     #[test]
     fn format_page_timed_out() {
         let id = json!(1);
-        let page = json!({ "stdout": "partial", "stderr": "", "exit_code": -1, "duration_ms": 5000, "timed_out": true });
+        let page = ExecPage {
+            stdout: "partial".to_string(),
+            stderr: String::new(),
+            exit_code: Some(-1),
+            duration_ms: Some(5000),
+            timed_out: Some(true),
+            next_page: None,
+        };
         let resp = format_page_response(&id, &page);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("[timed out]"));
@@ -1228,7 +1331,14 @@ mod tests {
     #[test]
     fn format_page_streaming_next_page() {
         let id = json!(1);
-        let page = json!({ "stdout": "chunk1", "stderr": "", "next_page": "abc123" });
+        let page = ExecPage {
+            stdout: "chunk1".to_string(),
+            stderr: String::new(),
+            exit_code: None,
+            duration_ms: None,
+            timed_out: None,
+            next_page: Some("abc123".to_string()),
+        };
         let resp = format_page_response(&id, &page);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("[streaming] next_page=abc123"));
@@ -1239,7 +1349,14 @@ mod tests {
     #[test]
     fn format_page_empty_output() {
         let id = json!(1);
-        let page = json!({ "stdout": "", "stderr": "", "next_page": "tok123" });
+        let page = ExecPage {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: None,
+            duration_ms: None,
+            timed_out: None,
+            next_page: Some("tok123".to_string()),
+        };
         let resp = format_page_response(&id, &page);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         // Should still have the streaming token
@@ -1257,10 +1374,10 @@ mod tests {
         let config = streaming_config(32768);
         let page = build_page(&sm, &token, &config).await.unwrap();
 
-        assert_eq!(page["stdout"], "output data");
-        assert_eq!(page["exit_code"], 0);
-        assert_eq!(page["duration_ms"], 42);
-        assert!(page["next_page"].is_null()); // final page has no next_page
+        assert_eq!(page.stdout, "output data");
+        assert_eq!(page.exit_code.unwrap(), 0);
+        assert_eq!(page.duration_ms.unwrap(), 42);
+        assert!(page.next_page.is_none()); // final page has no next_page
         // Session should be removed after final page
         assert!(sm.borrow().get_by_token(&token).is_none());
     }
@@ -1274,9 +1391,9 @@ mod tests {
         let config = streaming_config(32768);
         let page = build_page(&sm, &token, &config).await.unwrap();
 
-        assert_eq!(page["stdout"], "partial output");
-        assert!(page["exit_code"].is_null()); // not final
-        let next_page = page["next_page"].as_str().unwrap();
+        assert_eq!(page.stdout, "partial output");
+        assert!(page.exit_code.is_none()); // not final
+        let next_page = page.next_page.as_ref().unwrap();
         assert!(!next_page.is_empty());
         // Old token should be invalid
         assert!(sm.borrow().get_by_token(&token).is_none());
@@ -1296,9 +1413,9 @@ mod tests {
         let page = build_page(&sm, &token, &config).await.unwrap();
 
         // Should only get 50 bytes
-        assert_eq!(page["stdout"].as_str().unwrap().len(), 50);
+        assert_eq!(page.stdout.len(), 50);
         // Should have a next_page (still has data)
-        assert!(page["next_page"].as_str().is_some());
+        assert!(page.next_page.is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1313,15 +1430,15 @@ mod tests {
 
         // First page: should get 50 bytes but NOT be final (50 bytes remain)
         let page1 = build_page(&sm, &token, &config).await.unwrap();
-        assert_eq!(page1["stdout"].as_str().unwrap().len(), 50);
-        assert!(page1["exit_code"].is_null(), "should not be final page yet");
-        let token2 = page1["next_page"].as_str().unwrap();
+        assert_eq!(page1.stdout.len(), 50);
+        assert!(page1.exit_code.is_none(), "should not be final page yet");
+        let token2 = page1.next_page.as_ref().unwrap();
 
         // Second page: drain remaining 50 bytes, now it's final
         let page2 = build_page(&sm, token2, &config).await.unwrap();
-        assert_eq!(page2["stdout"].as_str().unwrap().len(), 50);
-        assert_eq!(page2["exit_code"], 0);
-        assert!(page2["next_page"].is_null());
+        assert_eq!(page2.stdout.len(), 50);
+        assert_eq!(page2.exit_code.unwrap(), 0);
+        assert!(page2.next_page.is_none());
         // Session cleaned up
         assert!(sm.borrow().get_by_token(token2).is_none());
     }
@@ -1337,11 +1454,11 @@ mod tests {
         let page = build_page(&sm, &token, &config).await.unwrap();
 
         // stdout gets first 40, stderr gets remaining budget (50-40=10)
-        assert_eq!(page["stdout"].as_str().unwrap().len(), 40);
-        assert_eq!(page["stderr"].as_str().unwrap().len(), 10);
+        assert_eq!(page.stdout.len(), 40);
+        assert_eq!(page.stderr.len(), 10);
         // Still has remaining stderr data, so NOT final even though completed
-        assert!(page["exit_code"].is_null());
-        assert!(page["next_page"].as_str().is_some());
+        assert!(page.exit_code.is_none());
+        assert!(page.next_page.is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1363,10 +1480,10 @@ mod tests {
         let config = streaming_config(32768);
         let page = build_page(&sm, &token, &config).await.unwrap();
 
-        assert_eq!(page["stdout"], "");
-        assert_eq!(page["stderr"], "");
-        assert_eq!(page["exit_code"], 0);
-        assert!(page["next_page"].is_null());
+        assert_eq!(page.stdout, "");
+        assert_eq!(page.stderr, "");
+        assert_eq!(page.exit_code.unwrap(), 0);
+        assert!(page.next_page.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1379,9 +1496,9 @@ mod tests {
         let page = build_page(&sm, &token, &config).await.unwrap();
 
         // After timeout, should return an empty intermediate page
-        assert_eq!(page["stdout"], "");
-        assert_eq!(page["stderr"], "");
-        assert!(page["next_page"].as_str().is_some());
+        assert_eq!(page.stdout, "");
+        assert_eq!(page.stderr, "");
+        assert!(page.next_page.is_some());
     }
 
     // -- handle_output tests --
@@ -1571,10 +1688,10 @@ mod tests {
             let page = build_page(&sm, &token, &config).await.unwrap();
 
             // Should be a FINAL page — coalesced data + exit code in one response.
-            assert_eq!(page["stdout"], "fast output");
-            assert_eq!(page["exit_code"], 0);
+            assert_eq!(page.stdout, "fast output");
+            assert_eq!(page.exit_code.unwrap(), 0);
             assert!(
-                page["next_page"].is_null(),
+                page.next_page.is_none(),
                 "fast command should not require a second page"
             );
             // Session should be cleaned up

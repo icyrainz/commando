@@ -31,6 +31,23 @@ cargo +nightly test
 - `crates/commando-gateway/` — Gateway binary (MCP stdio server, routes to agents)
 - `schema/commando.capnp` — Cap'n Proto interface definition (single source of truth)
 
+## CLI
+
+The `commando` CLI is a thin HTTP client that talks to the gateway's REST API.
+Claude Code should use this via Bash for command execution instead of the MCP
+`commando_exec` tool directly.
+
+```bash
+# Set env vars (shared with MCP config)
+export COMMANDO_URL="http://akio-commando:9877"
+export COMMANDO_API_KEY="your-key"
+
+# Execute commands
+commando exec <target> '<command>'
+commando list
+commando ping <target>
+```
+
 ## Before Pushing
 
 Always run these before pushing to remote:
