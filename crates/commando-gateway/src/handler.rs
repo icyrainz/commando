@@ -70,39 +70,8 @@ pub fn process_tools_list(request: &Value) -> Value {
         "result": {
             "tools": [
                 {
-                    "name": "commando_exec",
-                    "description": "Execute a shell command on a target machine. If the response includes a next_page field, the command is still running — call commando_output with the page token to get more output.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "target": {
-                                "type": "string",
-                                "description": "Fully qualified target name (e.g., 'node-1/my-app', 'my-desktop')"
-                            },
-                            "command": {
-                                "type": "string",
-                                "description": "Shell command to execute"
-                            },
-                            "work_dir": {
-                                "type": "string",
-                                "description": "Working directory (default: home dir)"
-                            },
-                            "timeout": {
-                                "type": "number",
-                                "description": "Timeout in seconds (default: 60)"
-                            },
-                            "env": {
-                                "type": "object",
-                                "description": "Additional environment variables",
-                                "additionalProperties": { "type": "string" }
-                            }
-                        },
-                        "required": ["target", "command"]
-                    }
-                },
-                {
                     "name": "commando_list",
-                    "description": "List all registered targets with their status, shell, tags, and reachability.",
+                    "description": "List all available commando targets with their status and IP. To execute commands on a target, use the Bash tool: commando exec <target> '<command>'",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -125,20 +94,6 @@ pub fn process_tools_list(request: &Value) -> Value {
                             }
                         },
                         "required": ["target"]
-                    }
-                },
-                {
-                    "name": "commando_output",
-                    "description": "Get the next page of output from a streaming command. Use when commando_exec returns a next_page token.",
-                    "inputSchema": {
-                        "type": "object",
-                        "required": ["page"],
-                        "properties": {
-                            "page": {
-                                "type": "string",
-                                "description": "Page token from previous commando_exec or commando_output response"
-                            }
-                        }
                     }
                 }
             ]
@@ -784,13 +739,11 @@ mod tests {
         });
         let response = process_tools_list(&request);
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 2);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"commando_exec"));
         assert!(names.contains(&"commando_list"));
         assert!(names.contains(&"commando_ping"));
-        assert!(names.contains(&"commando_output"));
     }
 
     #[test]
