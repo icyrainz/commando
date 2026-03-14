@@ -12,7 +12,7 @@ use crate::config::{GatewayConfig, StreamingConfig};
 use crate::registry::Registry;
 use crate::rpc;
 use crate::session::SessionMap;
-use crate::types::ExecPage;
+use crate::types::*;
 
 /// Per-target concurrency semaphore (simple counter-based).
 pub struct ConcurrencyLimiter {
@@ -235,64 +235,53 @@ async fn handle_tools_call(
     }
 }
 
-async fn handle_exec(
-    id: &Value,
-    args: &Value,
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_exec_core(
+    target_name: &str,
+    command: &str,
+    work_dir: &str,
+    timeout_secs: Option<u32>,
+    extra_env: Vec<(String, String)>,
     config: &Arc<GatewayConfig>,
     registry: &Arc<Mutex<Registry>>,
     limiter: &Arc<ConcurrencyLimiter>,
     session_map: &Rc<RefCell<SessionMap>>,
-) -> Value {
-    let target_name = match args["target"].as_str() {
-        Some(t) => t,
-        None => return make_tool_error(id, "missing required parameter: target"),
-    };
-    let command = match args["command"].as_str() {
-        Some(c) => c,
-        None => return make_tool_error(id, "missing required parameter: command"),
-    };
-    let work_dir = args["work_dir"].as_str().unwrap_or("");
-    let timeout_secs = args["timeout"]
-        .as_u64()
-        .unwrap_or(config.agent.default_timeout_secs as u64) as u32;
+) -> Result<ExecPage, HandlerError> {
+    let timeout = timeout_secs.unwrap_or(config.agent.default_timeout_secs);
 
     let (host, port, status) = {
         let reg = registry.lock().unwrap();
         match reg.get(target_name) {
             Some(t) => (t.host.clone(), t.port, t.status.clone()),
-            None => return make_tool_error(id, &format!("unknown target: {target_name}")),
+            None => {
+                return Err(HandlerError::bad_request(format!(
+                    "unknown target: {target_name}"
+                )));
+            }
         }
     };
 
     if host.is_empty() {
-        return make_tool_error(
-            id,
-            &format!("target '{}' is {} (no IP available)", target_name, status),
-        );
+        return Err(HandlerError::bad_request(format!(
+            "target '{}' is {} (no IP available)",
+            target_name, status
+        )));
     }
 
     let psk = match config.agent.psk.get(target_name) {
         Some(p) => p.clone(),
         None => {
-            return make_tool_error(id, &format!("no PSK configured for target: {target_name}"));
+            return Err(HandlerError::bad_request(format!(
+                "no PSK configured for target: {target_name}"
+            )));
         }
     };
 
     if !limiter.try_acquire(target_name) {
-        return make_tool_error(
-            id,
-            &format!("concurrency limit reached for target: {target_name}"),
-        );
+        return Err(HandlerError::bad_request(format!(
+            "concurrency limit reached for target: {target_name}"
+        )));
     }
-
-    let extra_env: Vec<(String, String)> = args["env"]
-        .as_object()
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
 
     let request_id = uuid::Uuid::new_v4().to_string();
 
@@ -313,7 +302,7 @@ async fn handle_exec(
         &psk,
         command,
         work_dir,
-        timeout_secs,
+        timeout,
         &extra_env,
         &request_id,
         config.agent.connect_timeout_secs,
@@ -331,14 +320,60 @@ async fn handle_exec(
         } else {
             // Session was unexpectedly removed; abort the spawned task and release slot
             join_handle.abort();
-            return make_tool_error(id, "session lost before execution started");
+            return Err(HandlerError::bad_request(
+                "session lost before execution started",
+            ));
         }
     }
 
     // Build and return the first page
-    match build_page(session_map, &token, &config.streaming).await {
+    build_page(session_map, &token, &config.streaming)
+        .await
+        .map_err(HandlerError::bad_request)
+}
+
+async fn handle_exec(
+    id: &Value,
+    args: &Value,
+    config: &Arc<GatewayConfig>,
+    registry: &Arc<Mutex<Registry>>,
+    limiter: &Arc<ConcurrencyLimiter>,
+    session_map: &Rc<RefCell<SessionMap>>,
+) -> Value {
+    let target_name = match args["target"].as_str() {
+        Some(t) => t,
+        None => return make_tool_error(id, "missing required parameter: target"),
+    };
+    let command = match args["command"].as_str() {
+        Some(c) => c,
+        None => return make_tool_error(id, "missing required parameter: command"),
+    };
+    let work_dir = args["work_dir"].as_str().unwrap_or("");
+    let timeout_secs = args["timeout"].as_u64().map(|t| t as u32);
+    let extra_env: Vec<(String, String)> = args["env"]
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    match handle_exec_core(
+        target_name,
+        command,
+        work_dir,
+        timeout_secs,
+        extra_env,
+        config,
+        registry,
+        limiter,
+        session_map,
+    )
+    .await
+    {
         Ok(page) => format_page_response(id, &page),
-        Err(e) => make_tool_error(id, &format!("exec failed: {e}")),
+        Err(e) => make_tool_error(id, &e.message),
     }
 }
 
@@ -368,8 +403,7 @@ fn format_page_response(id: &Value, page: &ExecPage) -> Value {
     if let Some(next_page) = &page.next_page {
         text.push_str(&format!("\n[streaming] next_page={next_page}"));
     }
-    let is_error =
-        page.exit_code.is_some_and(|c| c != 0) || page.timed_out.unwrap_or(false);
+    let is_error = page.exit_code.is_some_and(|c| c != 0) || page.timed_out.unwrap_or(false);
     if is_error {
         make_tool_error(id, &text)
     } else {
@@ -381,7 +415,7 @@ fn format_page_response(id: &Value, page: &ExecPage) -> Value {
 ///
 /// Phase 1: Wait for data to become available (or completion/timeout).
 /// Phase 2: Drain buffers up to page_max_bytes and build the response.
-async fn build_page(
+pub async fn build_page(
     session_map: &Rc<RefCell<SessionMap>>,
     token: &str,
     config: &StreamingConfig,
@@ -521,6 +555,16 @@ async fn build_page(
     }
 }
 
+pub async fn handle_output_core(
+    token: &str,
+    session_map: &Rc<RefCell<SessionMap>>,
+    config: &StreamingConfig,
+) -> Result<ExecPage, HandlerError> {
+    build_page(session_map, token, config)
+        .await
+        .map_err(HandlerError::bad_request)
+}
+
 async fn handle_output(
     id: &Value,
     args: &Value,
@@ -532,10 +576,44 @@ async fn handle_output(
         None => return make_tool_error(id, "missing required parameter: page"),
     };
 
-    match build_page(session_map, token, config).await {
+    match handle_output_core(token, session_map, config).await {
         Ok(page) => format_page_response(id, &page),
-        Err(e) => make_tool_error(id, &e),
+        Err(e) => make_tool_error(id, &e.message),
     }
+}
+
+pub fn handle_list_core_full(
+    filter: Option<&str>,
+    config: &GatewayConfig,
+    registry: &Arc<Mutex<Registry>>,
+) -> Vec<TargetInfoFull> {
+    let reg = registry.lock().unwrap();
+    reg.list(filter)
+        .iter()
+        .map(|t| TargetInfoFull {
+            name: t.name.clone(),
+            host: t.host.clone(),
+            port: t.port,
+            shell: t.shell.clone(),
+            tags: t.tags.clone(),
+            source: format!("{:?}", t.source),
+            status: t.status.clone(),
+            reachable: format!("{:?}", t.reachable),
+            has_psk: config.agent.psk.contains_key(&t.name),
+        })
+        .collect()
+}
+
+pub fn handle_list_core(filter: Option<&str>, registry: &Arc<Mutex<Registry>>) -> Vec<TargetInfo> {
+    let reg = registry.lock().unwrap();
+    reg.list(filter)
+        .iter()
+        .map(|t| TargetInfo {
+            name: t.name.clone(),
+            status: t.status.clone(),
+            host: t.host.clone(),
+        })
+        .collect()
 }
 
 fn handle_list(
@@ -545,30 +623,58 @@ fn handle_list(
     registry: &Arc<Mutex<Registry>>,
 ) -> Value {
     let filter = args["filter"].as_str();
-    let reg = registry.lock().unwrap();
-
-    let targets: Vec<Value> = reg
-        .list(filter)
-        .iter()
-        .map(|t| {
-            json!({
-                "name": t.name,
-                "host": t.host,
-                "port": t.port,
-                "shell": t.shell,
-                "tags": t.tags,
-                "source": format!("{:?}", t.source),
-                "status": t.status,
-                "reachable": format!("{:?}", t.reachable),
-                "has_psk": config.agent.psk.contains_key(&t.name),
-            })
-        })
-        .collect();
-
+    let targets = handle_list_core_full(filter, config, registry);
     make_tool_result(
         id,
         &serde_json::to_string_pretty(&targets).unwrap_or_default(),
     )
+}
+
+pub async fn handle_ping_core(
+    target_name: &str,
+    config: &Arc<GatewayConfig>,
+    registry: &Arc<Mutex<Registry>>,
+) -> Result<PingInfo, HandlerError> {
+    let (host, port, status) = {
+        let reg = registry.lock().unwrap();
+        match reg.get(target_name) {
+            Some(t) => (t.host.clone(), t.port, t.status.clone()),
+            None => {
+                return Err(HandlerError::bad_request(format!(
+                    "unknown target: {target_name}"
+                )));
+            }
+        }
+    };
+
+    if host.is_empty() {
+        return Err(HandlerError::bad_request(format!(
+            "target '{}' is {} (no IP available)",
+            target_name, status
+        )));
+    }
+
+    let psk = match config.agent.psk.get(target_name) {
+        Some(p) => p.clone(),
+        None => {
+            return Err(HandlerError::bad_request(format!(
+                "no PSK configured for target: {target_name}"
+            )));
+        }
+    };
+
+    let start = std::time::Instant::now();
+    match rpc::remote_ping(&host, port, &psk, config.agent.connect_timeout_secs).await {
+        Ok(r) => Ok(PingInfo {
+            target: target_name.to_string(),
+            hostname: r.hostname,
+            uptime_secs: r.uptime_secs,
+            shell: r.shell,
+            latency_ms: start.elapsed().as_millis() as u64,
+            version: r.version,
+        }),
+        Err(e) => Err(HandlerError::gateway(format!("ping failed: {e}"))),
+    }
 }
 
 async fn handle_ping(
@@ -582,37 +688,15 @@ async fn handle_ping(
         None => return make_tool_error(id, "missing required parameter: target"),
     };
 
-    let (host, port, status) = {
-        let reg = registry.lock().unwrap();
-        match reg.get(target_name) {
-            Some(t) => (t.host.clone(), t.port, t.status.clone()),
-            None => return make_tool_error(id, &format!("unknown target: {target_name}")),
-        }
-    };
-
-    if host.is_empty() {
-        return make_tool_error(
-            id,
-            &format!("target '{}' is {} (no IP available)", target_name, status),
-        );
-    }
-
-    let psk = match config.agent.psk.get(target_name) {
-        Some(p) => p.clone(),
-        None => {
-            return make_tool_error(id, &format!("no PSK configured for target: {target_name}"));
-        }
-    };
-
-    match rpc::remote_ping(&host, port, &psk, config.agent.connect_timeout_secs).await {
-        Ok(r) => {
+    match handle_ping_core(target_name, config, registry).await {
+        Ok(info) => {
             let text = format!(
                 "hostname: {}\nuptime: {}s\nshell: {}\nversion: {}",
-                r.hostname, r.uptime_secs, r.shell, r.version
+                info.hostname, info.uptime_secs, info.shell, info.version
             );
             make_tool_result(id, &text)
         }
-        Err(e) => make_tool_error(id, &format!("ping failed: {e}")),
+        Err(e) => make_tool_error(id, &e.message),
     }
 }
 
