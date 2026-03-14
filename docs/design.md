@@ -516,16 +516,38 @@ For non-LXC machines (e.g., desktops, bare-metal servers), deploy manually via `
 
 ## Future Enhancements (Not in Scope)
 
-- **TLS transport:** Wrap agent connections in TLS via `tokio-rustls` for encrypted-on-the-wire security — eliminates plaintext PSK and command visibility concerns
+Last updated: 2026-03-14. Feedback sources: homelab user review, DevOps/SRE review, AI tooling developer review.
+
+### Implemented
+
+- ~~**Streaming output:**~~ Paginated output via `execStream` RPC + `commando_output` MCP tool. See `docs/superpowers/specs/2026-03-12-streaming-exec-design.md`.
+- ~~**CLI + REST API:**~~ `commando exec/list/ping` CLI with REST endpoints on gateway. See `docs/superpowers/specs/2026-03-14-commando-cli-design.md`.
+
+### High Priority
+
+- **Audit log:** Record all commands executed through Commando — who, what target, when, stdout/stderr, exit code. Written to structured log or append-only store. Table stakes for any tool that gives an LLM root access. *(Requested by: DevOps, homelab reviewers)*
+- **File transfer:** `commando_read_file` and `commando_write_file` MCP tools + CLI commands for reading/writing files on targets without shell commands. Handles binary encoding, partial reads. Completes Commando as a remote management toolkit. *(Requested by: AI tooling reviewer)*
+- **Batch exec (`commando_exec_batch`):** Fan-out a command to multiple targets in parallel (by name or tag), returning results per target. Single tool call instead of N sequential ones — saves LLM context tokens. CLI: `commando exec --tag web "apt update"`. *(Requested by: homelab, AI tooling reviewers)*
+- **LLM-optimized truncation guidance:** When output is truncated, append actionable hints (e.g., "pipe through `tail`/`head`/`grep` to narrow output") so the LLM knows how to explore the rest instead of blindly retrying. *(Requested by: AI tooling reviewer)*
+- **CLI `--json` flag:** Structured JSON output from `commando exec/list/ping` for machine parsing. Lets the LLM opt into structured parsing when it needs to reason about output. *(Requested by: AI tooling reviewer)*
+
+### Medium Priority
+
+- **TLS transport:** Wrap agent connections in TLS via `tokio-rustls` for encrypted-on-the-wire security. Eliminates plaintext command visibility concerns and enables deployment outside trusted LANs. *(Requested by: DevOps, AI tooling reviewers)*
+- **Non-root execution mode:** Configurable `user` field per target in `gateway.toml`. Agent runs as root but `su`s to the specified user before executing commands. Root should require explicit config. *(Requested by: homelab, DevOps reviewers)*
+- **Per-caller authorization:** Replace single API key with per-user credentials (JWT, mTLS, or OIDC). Add target-level ACLs. Required for team use. *(Requested by: DevOps reviewer)*
+- **Target-scoped environment presets:** Per-target `env` in `gateway.toml` (e.g., `KUBECONFIG`, `DOCKER_HOST`) injected into every command. Saves tokens by eliminating repetitive `--env` flags. *(Requested by: AI tooling reviewer)*
+- **CLI read_timeout bug:** The CLI's 30s `read_timeout` can timeout on commands that take >30s before producing any output. Should be configurable or set to `command_timeout + margin`. *(Found by: AI tooling reviewer)*
+
+### Low Priority / Nice to Have
+
 - **Connection pooling:** Persistent connections with multiplexing for lower latency on high-frequency operations
-- **Streaming output:** ~~Cap'n Proto streaming for long-running commands~~ **Implemented** — see `docs/superpowers/specs/2026-03-12-streaming-exec-design.md`. Paginated output via `execStream` RPC + `commando_output` MCP tool.
-- **LLM-optimized truncation guidance:** When output is truncated, include guidance in the response to help the LLM ask better follow-up questions (e.g., "Output truncated. Try: `tail -n 50 <file>` or add `| grep <pattern>` to narrow results")
-- **Per-caller authorization:** Role-based permissions when multiple clients connect (beyond single Claude Code instance)
-- **File transfer:** Read/write files on targets without shell commands
+- **MCP resources:** Expose target list as an MCP resource (not just a tool) for clients that support resource subscriptions
+- **Webhook/callback on completion:** Gateway POSTs to a callback URL when a long-running command completes — enables fire-and-forget patterns
+- **`commando init` subcommand:** One command that configures Claude Code MCP by editing `~/.claude.json` with `${COMMANDO_URL}` env var references
 - **Web UI:** Dashboard showing all agents, status, recent commands
-- **Audit log:** Record all commands executed through Commando
 - **Agent auto-update:** Gateway pushes new agent binaries to targets
-- **Batch exec (`commando_exec_batch`):** Fan-out a command to multiple targets in parallel, returning results per target — useful for fleet-wide operations like `apt update`
-- **Graceful agent shutdown:** On SIGTERM, the agent should SIGTERM all active child process groups (5s grace + SIGKILL) before exiting, preventing orphaned processes during agent restarts
-- **Version negotiation:** `agentVersion` is already returned by `Authenticator.authenticate()` — add compatibility checks in the gateway to detect incompatible agents and surface clear errors during schema evolution
-- **LLM-optimized truncation guidance:** When output is truncated, append actionable hints (e.g., "pipe through `tail`/`head`/`grep` to narrow output") so the LLM knows how to explore the rest instead of blindly retrying. Needs proper spec — the gateway presentation layer should guide the LLM without assuming why the command was run
+- **Graceful agent shutdown:** On SIGTERM, SIGTERM all active child process groups (5s grace + SIGKILL) before exiting
+- **Version negotiation:** `agentVersion` compatibility checks in gateway to detect incompatible agents
+- **Rename `expose_exec_tool`:** Consider `mcp_exec_mode` or similar for clarity
+- **Binary checksum verification:** Install scripts should verify checksums or signatures of downloaded binaries
