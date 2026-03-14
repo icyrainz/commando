@@ -115,3 +115,56 @@ async fn send_work(
         .map_err(|_| "worker dropped response".to_string())?
         .ok_or_else(|| "no response from worker".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::types::ExecPage;
+
+    #[test]
+    fn exec_page_completed_serialization() {
+        let page = ExecPage {
+            stdout: "hello".to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration_ms: Some(150),
+            timed_out: None,
+            next_page: None,
+        };
+        let json = serde_json::to_value(&page).unwrap();
+        assert_eq!(json["stdout"], "hello");
+        assert_eq!(json["exit_code"], 0);
+        assert_eq!(json["duration_ms"], 150);
+        assert!(json.get("timed_out").is_none());
+        assert!(json.get("next_page").is_none());
+    }
+
+    #[test]
+    fn exec_page_streaming_serialization() {
+        let page = ExecPage {
+            stdout: "partial".to_string(),
+            stderr: String::new(),
+            exit_code: None,
+            duration_ms: None,
+            timed_out: None,
+            next_page: Some("abc123".to_string()),
+        };
+        let json = serde_json::to_value(&page).unwrap();
+        assert_eq!(json["next_page"], "abc123");
+        assert!(json.get("exit_code").is_none());
+    }
+
+    #[test]
+    fn exec_page_timeout_serialization() {
+        let page = ExecPage {
+            stdout: "partial".to_string(),
+            stderr: String::new(),
+            exit_code: Some(124),
+            duration_ms: Some(60000),
+            timed_out: Some(true),
+            next_page: None,
+        };
+        let json = serde_json::to_value(&page).unwrap();
+        assert_eq!(json["exit_code"], 124);
+        assert_eq!(json["timed_out"], true);
+    }
+}
