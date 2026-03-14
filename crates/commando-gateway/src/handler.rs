@@ -197,6 +197,55 @@ pub async fn dispatch_request(
     limiter: &Arc<ConcurrencyLimiter>,
     session_map: &Rc<RefCell<SessionMap>>,
 ) -> Option<Value> {
+    // Handle REST API requests (sent via __rest marker)
+    if let Some(rest_type) = request["__rest"].as_str() {
+        let result = match rest_type {
+            "exec" => {
+                let target = request["target"].as_str().unwrap_or("");
+                let command = request["command"].as_str().unwrap_or("");
+                let work_dir = request["work_dir"].as_str().unwrap_or("");
+                let timeout = request["timeout"].as_u64().map(|t| t as u32);
+                // extra_env intentionally empty — --env flag omitted from CLI v1
+                match handle_exec_core(
+                    target,
+                    command,
+                    work_dir,
+                    timeout,
+                    vec![],
+                    config,
+                    registry,
+                    limiter,
+                    session_map,
+                )
+                .await
+                {
+                    Ok(page) => serde_json::to_value(&page).unwrap(),
+                    Err(e) => json!({"error": e.message, "_gateway": e.is_gateway_error}),
+                }
+            }
+            "output" => {
+                let token = request["page"].as_str().unwrap_or("");
+                match handle_output_core(token, session_map, &config.streaming).await {
+                    Ok(page) => serde_json::to_value(&page).unwrap(),
+                    Err(e) => json!({"error": e.message}),
+                }
+            }
+            "list" => {
+                let targets = handle_list_core(None, registry);
+                serde_json::to_value(&targets).unwrap()
+            }
+            "ping" => {
+                let target = request["target"].as_str().unwrap_or("");
+                match handle_ping_core(target, config, registry).await {
+                    Ok(info) => serde_json::to_value(&info).unwrap(),
+                    Err(e) => json!({"error": e.message, "_gateway": e.is_gateway_error}),
+                }
+            }
+            _ => json!({"error": format!("unknown REST type: {rest_type}")}),
+        };
+        return Some(result);
+    }
+
     let method = request["method"].as_str().unwrap_or("");
     let id = &request["id"];
 

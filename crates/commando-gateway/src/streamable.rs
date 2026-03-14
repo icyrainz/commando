@@ -20,16 +20,16 @@ use crate::registry::Registry;
 use crate::session::SessionMap;
 
 /// Work item sent from axum handlers (outside LocalSet) to the RPC worker (inside LocalSet).
-struct WorkItem {
-    request: Value,
-    response_tx: tokio::sync::oneshot::Sender<Option<Value>>,
+pub struct WorkItem {
+    pub request: Value,
+    pub response_tx: tokio::sync::oneshot::Sender<Option<Value>>,
 }
 
-type WorkSender = tokio::sync::mpsc::Sender<WorkItem>;
+pub type WorkSender = tokio::sync::mpsc::Sender<WorkItem>;
 
 #[derive(Clone)]
-struct AppState {
-    work_tx: WorkSender,
+pub struct AppState {
+    pub work_tx: WorkSender,
 }
 
 /// Build the Axum router and spawn the RPC worker that bridges axum handlers
@@ -80,11 +80,17 @@ pub fn build_app(
     });
     let state = AppState { work_tx };
 
-    let mcp_routes = Router::new()
+    let authed_routes = Router::new()
         .route(
             "/mcp",
             post(handle_post).get(handle_get).delete(handle_delete),
         )
+        .route(
+            "/api/exec",
+            post(crate::rest::handle_exec_post).get(crate::rest::handle_exec_get),
+        )
+        .route("/api/targets", get(crate::rest::handle_targets))
+        .route("/api/ping/{target}", get(crate::rest::handle_ping))
         .layer(middleware::from_fn_with_state(
             api_key,
             bearer_auth_middleware,
@@ -92,7 +98,7 @@ pub fn build_app(
         .with_state(state);
 
     Router::new()
-        .merge(mcp_routes)
+        .merge(authed_routes)
         .route("/health", get(handle_health))
 }
 
