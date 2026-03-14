@@ -6,7 +6,7 @@ Run commands on any Linux machine through MCP tool calls. No SSH escaping, no ne
 commando_exec(target="web-server", command="docker compose ps --format json")
 ```
 
-Your AI coding agent gets `commando_exec`, `commando_list`, and `commando_ping` as MCP tools — it can manage your entire fleet without you writing a single SSH command.
+Your AI coding agent gets `commando_list` and `commando_ping` as MCP tools for target discovery, and the `commando` CLI for command execution with full output streaming.
 
 ## Why
 
@@ -74,8 +74,9 @@ Agent  Agent  Agent  Agent  Agent
 (any Linux machine — LXC, VM, bare metal, cloud)
 ```
 
-- **Gateway** — MCP server (Docker container or binary). Receives tool calls, routes to agents.
+- **Gateway** — MCP server + REST API (Docker container or binary). Receives tool calls and CLI requests, routes to agents.
 - **Agent** — ~3MB static binary on each target. Executes commands, returns stdout/stderr/exit code.
+- **CLI** — Thin HTTP client (`commando exec`). Claude Code calls it via Bash for native output rendering and streaming.
 - Commands travel through binary serialization, never through a shell, until the target machine runs `sh -c`.
 
 ## Quick Start
@@ -150,44 +151,48 @@ Copy those snippets into your `gateway.toml`, restart the gateway (`docker compo
 
 To pin a version: `curl -sL ... | COMMANDO_VERSION=v0.3.2 bash`
 
-### 3. Connect Your AI Agent
+### 3. Install the CLI
 
-Add the MCP server to Claude Code (`~/.claude.json`), using the API key from step 1:
+On the machine where you run Claude Code (macOS or Linux):
 
-```json
-{
-  "mcpServers": {
-    "commando": {
-      "type": "http",
-      "url": "http://gateway-host:9877/mcp",
-      "headers": {
-        "Authorization": "Bearer YOUR_API_KEY"
-      }
-    }
-  }
-}
-```
-
-Or via CLI:
 ```bash
-claude mcp add commando --transport http --url http://gateway-host:9877/mcp \
-  --header "Authorization: Bearer YOUR_API_KEY"
+curl -sSL https://raw.githubusercontent.com/icyrainz/commando/main/deploy/install-cli.sh | bash
 ```
 
-Your agent now has three tools:
+Set environment variables (add to your shell config):
 
-| Tool | Purpose |
-|------|---------|
-| `commando_exec(target, command, ...)` | Run a command on any target |
-| `commando_list(filter?)` | List all targets with status and reachability |
-| `commando_ping(target)` | Health check — hostname, uptime, shell, version |
-
-### 4. Verify
-
+```bash
+export COMMANDO_URL="http://gateway-host:9877"
+export COMMANDO_API_KEY="YOUR_API_KEY"
 ```
-commando_list()                                          # see all targets
-commando_ping(target="web-server")                       # health check
-commando_exec(target="web-server", command="hostname")   # run a command
+
+Verify: `commando list` should show your targets.
+
+### 4. Connect Claude Code (MCP)
+
+Add the MCP server for target discovery:
+
+```bash
+claude mcp add commando --transport http --url "$COMMANDO_URL/mcp" \
+  --header "Authorization: Bearer $COMMANDO_API_KEY"
+```
+
+Claude Code now has:
+
+| Component | Purpose |
+|-----------|---------|
+| `commando_list` (MCP tool) | Discover available targets |
+| `commando_ping` (MCP tool) | Health check a target |
+| `commando exec` (CLI via Bash) | Execute commands with full output streaming |
+
+The MCP tools provide discovery. The CLI provides execution with native Bash rendering — no truncated output, no wasted LLM round-trips.
+
+### 5. Verify
+
+```bash
+commando list                                      # see all targets
+commando ping web-server                           # health check
+commando exec web-server "hostname"                # run a command
 ```
 
 ## Proxmox Auto-Discovery
@@ -218,6 +223,12 @@ For bulk deployment to all LXCs on a Proxmox node:
 CI builds on tagged releases and publishes:
 - **Gateway** → `ghcr.io/icyrainz/commando-gateway` (Docker image)
 - **Agent** → GitHub release assets (`commando-agent-x86_64-linux`, `commando-agent-aarch64-linux`)
+- **CLI** → GitHub release assets (`commando-cli-x86_64-linux`, `commando-cli-aarch64-linux`, `commando-cli-aarch64-macos`)
+
+**Update CLI:**
+```bash
+curl -sSL https://raw.githubusercontent.com/icyrainz/commando/main/deploy/install-cli.sh | bash
+```
 
 **Update agents** — re-run the install script on each target:
 ```bash
