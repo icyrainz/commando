@@ -43,11 +43,44 @@ The gateway is a persistent HTTP server. No SSH handshake per command.
 
 | Method | Latency | Notes |
 |--------|---------|-------|
-| **Commando (CLI or MCP)** | **~110ms** | HTTP → gateway → Cap'n Proto RPC |
+| **Commando (CLI or MCP)** | **~51ms** | HTTP → gateway → Cap'n Proto RPC |
 | **SSH direct** | **~390ms** | SSH handshake per invocation |
 | **SSH + pct exec** | **~1065ms** | SSH handshake + Proxmox pct exec |
 
-**3-10x faster** depending on target type. Measured on LAN with `hostname` (average of 10 runs, v0.5.5). CLI and MCP execution modes have identical performance.
+**7-20x faster** depending on target type. Measured on LAN with `hostname` (average of 5 runs, v0.5.9). CLI and MCP execution modes have identical performance.
+
+### Latency Breakdown
+
+Use `--profile` to see where time is spent end-to-end:
+
+```bash
+commando exec my-target 'hostname' --profile
+```
+
+```
+─── profile ──────────────────────────────────
+  client
+    http_roundtrip          51.51ms
+    total                   51.54ms
+  gateway
+    registry_lookup          0.00ms
+    setup                    0.01ms
+    spawn_rpc                0.03ms
+    rpc_tcp_connect          0.21ms
+    rpc_auth                 0.66ms
+    rpc_exec                35.31ms
+    build_page              36.32ms
+    audit                    0.00ms
+    serialize                0.04ms
+    agent_parse_params_ms    0.01ms
+    agent_execute_ms        34.93ms
+    agent_drain_callbacks_ms 0.00ms
+    _total                  36.32ms
+  pages: 1
+──────────────────────────────────────────────
+```
+
+The dominant cost is `agent_execute_ms` — the shell spawn (`sh -c`) on the target machine. Gateway routing, auth, and audit overhead are <1ms combined.
 
 For an AI agent executing dozens of commands per task, this is the difference between a responsive workflow and waiting.
 
