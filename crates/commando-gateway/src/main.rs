@@ -146,9 +146,17 @@ async fn run_gateway(config: Arc<config::GatewayConfig>) -> Result<()> {
         config.agent.max_concurrent_per_target,
     ));
 
-    // Spawn background discovery loop
-    if let Some(proxmox) = config.proxmox.as_ref().filter(|p| !p.nodes.is_empty()) {
-        let discovery_interval = proxmox.discovery_interval_secs;
+    // Run initial ping cycle for all targets (manual and discovered)
+    run_ping_cycle(&config, &registry).await;
+
+    // Spawn background discovery + ping loop
+    {
+        let has_proxmox = config.proxmox.as_ref().is_some_and(|p| !p.nodes.is_empty());
+        let discovery_interval = config
+            .proxmox
+            .as_ref()
+            .map(|p| p.discovery_interval_secs)
+            .unwrap_or(60);
         let config_clone = config.clone();
         let registry_clone = registry.clone();
         tokio::task::spawn_local(async move {
@@ -157,7 +165,10 @@ async fn run_gateway(config: Arc<config::GatewayConfig>) -> Result<()> {
             interval.tick().await; // Skip immediate first tick
             loop {
                 interval.tick().await;
-                run_discovery_cycle(&config_clone, &registry_clone).await;
+                if has_proxmox {
+                    run_discovery_cycle(&config_clone, &registry_clone).await;
+                }
+                run_ping_cycle(&config_clone, &registry_clone).await;
             }
         });
     }
@@ -207,14 +218,33 @@ async fn run_discovery_cycle(config: &config::GatewayConfig, registry: &Arc<Mute
 
     registry.lock().unwrap().update_discovered(all_discovered);
 
-    // Ping all targets with PSKs to check reachability
+    // Save cache to disk
+    let cache_dir = std::path::Path::new(&config.cache_dir);
+    if let Err(e) = std::fs::create_dir_all(cache_dir) {
+        warn!(error = %e, "failed to create cache directory");
+        return;
+    }
+    let cache_path = cache_dir.join("registry.json");
+    match registry.lock().unwrap().to_cache_json() {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&cache_path, json) {
+                warn!(error = %e, "failed to write registry cache");
+            }
+        }
+        Err(e) => warn!(error = %e, "failed to serialize registry cache"),
+    }
+}
+
+/// Ping all targets with PSKs to check reachability.
+/// Runs independently of Proxmox discovery — works for both manual and discovered targets.
+async fn run_ping_cycle(config: &config::GatewayConfig, registry: &Arc<Mutex<Registry>>) {
     let targets_to_ping: Vec<(String, String, u16, String)> = {
         let reg = registry.lock().unwrap();
         reg.targets
             .values()
             .filter_map(|t| {
                 if t.host.is_empty() {
-                    return None; // Skip stopped/unreachable targets with no IP
+                    return None;
                 }
                 config
                     .agent
@@ -224,6 +254,10 @@ async fn run_discovery_cycle(config: &config::GatewayConfig, registry: &Arc<Mute
             })
             .collect()
     };
+
+    if targets_to_ping.is_empty() {
+        return;
+    }
 
     let ping_futures: Vec<_> = targets_to_ping
         .iter()
@@ -243,12 +277,16 @@ async fn run_discovery_cycle(config: &config::GatewayConfig, registry: &Arc<Mute
         .collect();
 
     let ping_results = futures::future::join_all(ping_futures).await;
+    let mut reachable_count = 0;
     {
         let mut reg = registry.lock().unwrap();
-        for (name, reachable) in ping_results {
+        for (name, reachable) in &ping_results {
+            if *reachable {
+                reachable_count += 1;
+            }
             reg.set_reachable(
-                &name,
-                if reachable {
+                name,
+                if *reachable {
                     registry::Reachability::Reachable
                 } else {
                     registry::Reachability::Unreachable
@@ -256,20 +294,9 @@ async fn run_discovery_cycle(config: &config::GatewayConfig, registry: &Arc<Mute
             );
         }
     }
-
-    // Save cache to disk
-    let cache_dir = std::path::Path::new(&config.cache_dir);
-    if let Err(e) = std::fs::create_dir_all(cache_dir) {
-        warn!(error = %e, "failed to create cache directory");
-        return;
-    }
-    let cache_path = cache_dir.join("registry.json");
-    match registry.lock().unwrap().to_cache_json() {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&cache_path, json) {
-                warn!(error = %e, "failed to write registry cache");
-            }
-        }
-        Err(e) => warn!(error = %e, "failed to serialize registry cache"),
-    }
+    info!(
+        total = ping_results.len(),
+        reachable = reachable_count,
+        "ping cycle complete"
+    );
 }
