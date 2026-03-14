@@ -63,40 +63,96 @@ pub fn process_initialize(request: &Value) -> Value {
     })
 }
 
-pub fn process_tools_list(request: &Value) -> Value {
+pub fn process_tools_list(request: &Value, expose_exec: bool) -> Value {
+    let list_description = if expose_exec {
+        "List all registered targets with their status, shell, tags, and reachability."
+    } else {
+        "List all available commando targets with their status and IP. To execute commands on a target, use the Bash tool: commando exec <target> '<command>'"
+    };
+
+    let mut tools = vec![
+        json!({
+            "name": "commando_list",
+            "description": list_description,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "type": "string",
+                        "description": "Case-insensitive substring match against target name and tags"
+                    }
+                }
+            }
+        }),
+        json!({
+            "name": "commando_ping",
+            "description": "Health check a specific agent. Returns hostname, uptime, shell, and version.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Fully qualified target name"
+                    }
+                },
+                "required": ["target"]
+            }
+        }),
+    ];
+
+    if expose_exec {
+        tools.push(json!({
+            "name": "commando_exec",
+            "description": "Execute a shell command on a target machine. If the response includes a next_page field, the command is still running — call commando_output with the page token to get more output.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Fully qualified target name (e.g., 'node-1/my-app', 'my-desktop')"
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute"
+                    },
+                    "work_dir": {
+                        "type": "string",
+                        "description": "Working directory (default: home dir)"
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "description": "Timeout in seconds (default: 60)"
+                    },
+                    "env": {
+                        "type": "object",
+                        "description": "Additional environment variables",
+                        "additionalProperties": { "type": "string" }
+                    }
+                },
+                "required": ["target", "command"]
+            }
+        }));
+        tools.push(json!({
+            "name": "commando_output",
+            "description": "Get the next page of output from a streaming command. Use when commando_exec returns a next_page token.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["page"],
+                "properties": {
+                    "page": {
+                        "type": "string",
+                        "description": "Page token from previous commando_exec or commando_output response"
+                    }
+                }
+            }
+        }));
+    }
+
     json!({
         "jsonrpc": "2.0",
         "id": request["id"],
         "result": {
-            "tools": [
-                {
-                    "name": "commando_list",
-                    "description": "List all available commando targets with their status and IP. To execute commands on a target, use the Bash tool: commando exec <target> '<command>'",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "filter": {
-                                "type": "string",
-                                "description": "Case-insensitive substring match against target name and tags"
-                            }
-                        }
-                    }
-                },
-                {
-                    "name": "commando_ping",
-                    "description": "Health check a specific agent. Returns hostname, uptime, shell, and version.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "target": {
-                                "type": "string",
-                                "description": "Fully qualified target name"
-                            }
-                        },
-                        "required": ["target"]
-                    }
-                }
-            ]
+            "tools": tools
         }
     })
 }
@@ -211,7 +267,7 @@ pub async fn dispatch_request(
 
     let response = match method {
         "initialize" => process_initialize(request),
-        "tools/list" => process_tools_list(request),
+        "tools/list" => process_tools_list(request, config.server.expose_exec_tool),
         "tools/call" => handle_tools_call(request, config, registry, limiter, session_map).await,
         _ => make_error_response(id.clone(), -32601, &format!("Method not found: {method}")),
     };
@@ -744,25 +800,46 @@ mod tests {
     }
 
     #[test]
-    fn handle_tools_list() {
+    fn handle_tools_list_cli_mode() {
         let request = json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/list"
         });
-        let response = process_tools_list(&request);
+        let response = process_tools_list(&request, false);
         let tools = response["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"commando_list"));
         assert!(names.contains(&"commando_ping"));
+        // commando_list description should mention CLI
+        let list_desc = tools[0]["description"].as_str().unwrap();
+        assert!(list_desc.contains("commando exec"));
+    }
+
+    #[test]
+    fn handle_tools_list_exec_mode() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        });
+        let response = process_tools_list(&request, true);
+        let tools = response["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4);
+
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"commando_list"));
+        assert!(names.contains(&"commando_ping"));
+        assert!(names.contains(&"commando_exec"));
+        assert!(names.contains(&"commando_output"));
     }
 
     #[test]
     fn tool_schemas_have_required_fields() {
         let request = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
-        let response = process_tools_list(&request);
+        let response = process_tools_list(&request, true);
         let tools = response["result"]["tools"].as_array().unwrap();
 
         for tool in tools {

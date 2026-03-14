@@ -92,6 +92,11 @@ pub struct ServerConfig {
     /// Can also be set via COMMANDO_API_KEY env var (takes precedence).
     /// Required for streamable-http transport.
     pub api_key: Option<String>,
+    /// When true, expose commando_exec and commando_output as MCP tools.
+    /// When false (default), only commando_list and commando_ping are exposed,
+    /// and the tool description tells Claude to use the `commando` CLI via Bash.
+    #[serde(default)]
+    pub expose_exec_tool: bool,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -101,6 +106,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("bind", &self.bind)
             .field("port", &self.port)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("expose_exec_tool", &self.expose_exec_tool)
             .finish()
     }
 }
@@ -112,6 +118,7 @@ impl Default for ServerConfig {
             bind: default_bind(),
             port: default_server_port(),
             api_key: None,
+            expose_exec_tool: false,
         }
     }
 }
