@@ -79,6 +79,7 @@ pub async fn handle_ping(
     State(state): State<crate::streamable::AppState>,
     axum::extract::Path(target): axum::extract::Path<String>,
 ) -> Response {
+    let target = target.strip_prefix('/').unwrap_or(&target);
     let internal_req = json!({"__rest": "ping", "target": target});
     match send_work(&state, internal_req).await {
         Ok(resp) => {

@@ -90,7 +90,7 @@ pub fn build_app(
             post(crate::rest::handle_exec_post).get(crate::rest::handle_exec_get),
         )
         .route("/api/targets", get(crate::rest::handle_targets))
-        .route("/api/ping/{target}", get(crate::rest::handle_ping))
+        .route("/api/ping/{*target}", get(crate::rest::handle_ping))
         .layer(middleware::from_fn_with_state(
             api_key,
             bearer_auth_middleware,
