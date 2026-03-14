@@ -60,6 +60,28 @@ jobs:
             target/${{ matrix.target }}/release/commando-agent
             target/${{ matrix.target }}/release/commando
 
+  build-macos-cli:
+    needs: ci
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install capnproto
+        run: brew install capnp
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-arm64-release
+
+      - name: Build CLI
+        run: cargo build --release -p commando-cli
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-macos-arm64
+          path: target/release/commando
+
   gateway-image:
     needs: build
     runs-on: ubuntu-latest
@@ -108,7 +130,7 @@ jobs:
             ghcr.io/icyrainz/commando-gateway:latest
 
   github-release:
-    needs: build
+    needs: [build, build-macos-cli]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -123,7 +145,8 @@ jobs:
           mv artifacts/binaries-arm64/commando-gateway commando-gateway-aarch64-linux
           mv artifacts/binaries-arm64/commando-agent commando-agent-aarch64-linux
           mv artifacts/binaries-arm64/commando commando-cli-aarch64-linux
-          chmod +x commando-*-linux
+          mv artifacts/binaries-macos-arm64/commando commando-cli-aarch64-macos
+          chmod +x commando-*-linux commando-*-macos
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -136,3 +159,4 @@ jobs:
             commando-gateway-aarch64-linux
             commando-agent-aarch64-linux
             commando-cli-aarch64-linux
+            commando-cli-aarch64-macos
