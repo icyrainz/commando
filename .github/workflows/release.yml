@@ -58,6 +58,7 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/commando-gateway
             target/${{ matrix.target }}/release/commando-agent
+            target/${{ matrix.target }}/release/commando
 
   gateway-image:
     needs: build
@@ -73,8 +74,10 @@ jobs:
         run: |
           mkdir -p binaries-amd64 binaries-arm64
           cp artifacts/binaries-amd64/commando-gateway binaries-amd64/
+          cp artifacts/binaries-amd64/commando binaries-amd64/
           cp artifacts/binaries-arm64/commando-gateway binaries-arm64/
-          chmod +x binaries-amd64/commando-gateway binaries-arm64/commando-gateway
+          cp artifacts/binaries-arm64/commando binaries-arm64/
+          chmod +x binaries-amd64/* binaries-arm64/*
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -116,8 +119,10 @@ jobs:
         run: |
           mv artifacts/binaries-amd64/commando-gateway commando-gateway-x86_64-linux
           mv artifacts/binaries-amd64/commando-agent commando-agent-x86_64-linux
+          mv artifacts/binaries-amd64/commando commando-cli-x86_64-linux
           mv artifacts/binaries-arm64/commando-gateway commando-gateway-aarch64-linux
           mv artifacts/binaries-arm64/commando-agent commando-agent-aarch64-linux
+          mv artifacts/binaries-arm64/commando commando-cli-aarch64-linux
           chmod +x commando-*-linux
 
       - name: Create GitHub Release
@@ -127,5 +132,7 @@ jobs:
           files: |
             commando-gateway-x86_64-linux
             commando-agent-x86_64-linux
+            commando-cli-x86_64-linux
             commando-gateway-aarch64-linux
             commando-agent-aarch64-linux
+            commando-cli-aarch64-linux
