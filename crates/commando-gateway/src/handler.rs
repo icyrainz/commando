@@ -608,7 +608,7 @@ pub async fn build_page(
     // Loop because there may be a stale notification from the data arrival
     // that we need to drain before the completion notification arrives.
     if exec_result_data.is_none() && !has_remaining {
-        let coalesce_deadline = Instant::now() + Duration::from_millis(50);
+        let coalesce_deadline = Instant::now() + Duration::from_millis(10);
         loop {
             let notify = {
                 let map = session_map.borrow();

@@ -414,10 +414,14 @@ async fn exec_stream_inner(
     let duration_ms = result.get_duration_ms();
     let timed_out = result.get_timed_out();
 
-    // Clean up RPC connection
+    // Clean up RPC connection — fire-and-forget to avoid blocking on TCP teardown.
+    // The RPC system is already running via spawn_local; the disconnector just
+    // triggers a graceful shutdown that can take 20-30ms on LAN.
     drop(agent_client);
     drop(auth_client);
-    let _ = disconnector.await;
+    tokio::task::spawn_local(async move {
+        let _ = disconnector.await;
+    });
 
     Ok((exit_code, duration_ms, timed_out))
 }
