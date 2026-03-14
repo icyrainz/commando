@@ -28,7 +28,8 @@ cargo +nightly test
 
 - `crates/commando-common/` — Shared Cap'n Proto schema + HMAC auth helpers
 - `crates/commando-agent/` — Agent binary (Cap'n Proto RPC server, runs on each target)
-- `crates/commando-gateway/` — Gateway binary (MCP stdio server, routes to agents)
+- `crates/commando-gateway/` — Gateway binary (MCP server + REST API, routes to agents)
+- `crates/commando-cli/` — CLI binary (thin HTTP client for the gateway's REST API)
 - `schema/commando.capnp` — Cap'n Proto interface definition (single source of truth)
 
 ## CLI
@@ -37,12 +38,26 @@ The `commando` CLI is a thin HTTP client that talks to the gateway's REST API.
 Claude Code should use this via Bash for command execution instead of the MCP
 `commando_exec` tool directly.
 
+### Install
+
 ```bash
-# Set env vars (shared with MCP config)
+curl -sSL https://raw.githubusercontent.com/icyrainz/commando/main/deploy/install-cli.sh | bash
+```
+
+Or pin a version: `COMMANDO_VERSION=v0.5.0 bash` instead of `bash`.
+
+### Configure
+
+Set env vars (shared with MCP config):
+
+```bash
 export COMMANDO_URL="http://akio-commando:9877"
 export COMMANDO_API_KEY="your-key"
+```
 
-# Execute commands
+### Usage
+
+```bash
 commando exec <target> '<command>'
 commando list
 commando ping <target>
@@ -110,6 +125,7 @@ Pulls the Docker image from `ghcr.io/icyrainz/commando-gateway` and restarts the
 
 | Task | Script | Scope |
 |------|--------|-------|
+| Install CLI on your machine (macOS/Linux) | `install-cli.sh` | Single machine (where Claude Code runs) |
 | Add agent to a new standalone machine | `install-agent.sh` | Single machine (any Linux) |
 | First-time setup of all Proxmox LXC agents | `deploy-agents.sh` | All LXCs on specified Proxmox nodes |
 | Update agent version on all Proxmox LXCs | `update-agents.sh` | All LXCs on specified Proxmox nodes |
