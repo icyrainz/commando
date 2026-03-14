@@ -96,9 +96,7 @@ jobs:
         run: |
           mkdir -p binaries-amd64 binaries-arm64
           cp artifacts/binaries-amd64/commando-gateway binaries-amd64/
-          cp artifacts/binaries-amd64/commando binaries-amd64/
           cp artifacts/binaries-arm64/commando-gateway binaries-arm64/
-          cp artifacts/binaries-arm64/commando binaries-arm64/
           chmod +x binaries-amd64/* binaries-arm64/*
 
       - name: Set up QEMU

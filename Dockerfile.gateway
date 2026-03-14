@@ -1,5 +1,4 @@
 FROM scratch
 ARG TARGETARCH=amd64
 COPY --chmod=755 binaries-${TARGETARCH}/commando-gateway /commando-gateway
-COPY --chmod=755 binaries-${TARGETARCH}/commando /commando
 ENTRYPOINT ["/commando-gateway"]
