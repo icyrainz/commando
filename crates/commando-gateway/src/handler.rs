@@ -12,6 +12,7 @@ use crate::config::{GatewayConfig, StreamingConfig};
 use crate::registry::Registry;
 use crate::rpc;
 use crate::session::SessionMap;
+use crate::types::ExecPage;
 
 /// Per-target concurrency semaphore (simple counter-based).
 pub struct ConcurrencyLimiter {
@@ -341,48 +342,34 @@ async fn handle_exec(
     }
 }
 
-/// Convert a page response JSON into MCP tool result text.
-fn format_page_response(id: &Value, page: &Value) -> Value {
+/// Convert a page response into MCP tool result text.
+fn format_page_response(id: &Value, page: &ExecPage) -> Value {
     let mut text = String::new();
-
-    if let Some(stdout) = page["stdout"].as_str()
-        && !stdout.is_empty()
-    {
-        text.push_str(stdout);
+    if !page.stdout.is_empty() {
+        text.push_str(&page.stdout);
     }
-
-    if let Some(stderr) = page["stderr"].as_str()
-        && !stderr.is_empty()
-    {
+    if !page.stderr.is_empty() {
         if !text.is_empty() {
             text.push('\n');
         }
         text.push_str("[stderr]\n");
-        text.push_str(stderr);
+        text.push_str(&page.stderr);
     }
-
-    if page["timed_out"].as_bool().unwrap_or(false) {
+    if page.timed_out.unwrap_or(false) {
         text.push_str("\n[timed out]");
     }
-
-    // Final page: include metadata footer with exit code and duration
-    if let Some(exit_code) = page["exit_code"].as_i64() {
-        let duration_ms = page["duration_ms"].as_u64().unwrap_or(0);
-        let metadata = format!(
+    if let Some(exit_code) = page.exit_code {
+        let duration_ms = page.duration_ms.unwrap_or(0);
+        text.push_str(&format!(
             "\n---\nexit_code: {} | duration: {}ms",
             exit_code, duration_ms
-        );
-        text.push_str(&metadata);
+        ));
     }
-
-    // Streaming: include next_page token if still running
-    if let Some(next_page) = page["next_page"].as_str() {
+    if let Some(next_page) = &page.next_page {
         text.push_str(&format!("\n[streaming] next_page={next_page}"));
     }
-
-    let is_error = page["exit_code"].as_i64().is_some_and(|c| c != 0)
-        || page["timed_out"].as_bool().unwrap_or(false);
-
+    let is_error =
+        page.exit_code.is_some_and(|c| c != 0) || page.timed_out.unwrap_or(false);
     if is_error {
         make_tool_error(id, &text)
     } else {
@@ -398,7 +385,7 @@ async fn build_page(
     session_map: &Rc<RefCell<SessionMap>>,
     token: &str,
     config: &StreamingConfig,
-) -> Result<Value, String> {
+) -> Result<ExecPage, String> {
     let page_timeout = Duration::from_secs(config.page_timeout_secs);
     let page_max = config.page_max_bytes;
     let deadline = Instant::now() + page_timeout;
@@ -508,13 +495,14 @@ async fn build_page(
         // Final page: remove session from map
         session_map.borrow_mut().remove_by_token(token);
 
-        Ok(json!({
-            "stdout": stdout,
-            "stderr": stderr,
-            "exit_code": exit_code,
-            "duration_ms": duration_ms,
-            "timed_out": timed_out,
-        }))
+        Ok(ExecPage {
+            stdout,
+            stderr,
+            exit_code: Some(exit_code),
+            duration_ms: Some(duration_ms),
+            timed_out: if timed_out { Some(true) } else { None },
+            next_page: None,
+        })
     } else {
         // Still running: rotate token
         let new_token = session_map
@@ -522,11 +510,14 @@ async fn build_page(
             .rotate_token(token)
             .ok_or_else(|| "session disappeared during token rotation".to_string())?;
 
-        Ok(json!({
-            "stdout": stdout,
-            "stderr": stderr,
-            "next_page": new_token,
-        }))
+        Ok(ExecPage {
+            stdout,
+            stderr,
+            exit_code: None,
+            duration_ms: None,
+            timed_out: None,
+            next_page: Some(new_token),
+        })
     }
 }
 
@@ -1186,8 +1177,14 @@ mod tests {
     #[test]
     fn format_page_stdout_only() {
         let id = json!(1);
-        let page =
-            json!({ "stdout": "hello world", "stderr": "", "exit_code": 0, "duration_ms": 10 });
+        let page = ExecPage {
+            stdout: "hello world".to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration_ms: Some(10),
+            timed_out: None,
+            next_page: None,
+        };
         let resp = format_page_response(&id, &page);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("hello world"));
@@ -1199,8 +1196,14 @@ mod tests {
     #[test]
     fn format_page_stderr_included() {
         let id = json!(1);
-        let page =
-            json!({ "stdout": "out", "stderr": "err msg", "exit_code": 0, "duration_ms": 5 });
+        let page = ExecPage {
+            stdout: "out".to_string(),
+            stderr: "err msg".to_string(),
+            exit_code: Some(0),
+            duration_ms: Some(5),
+            timed_out: None,
+            next_page: None,
+        };
         let resp = format_page_response(&id, &page);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("out"));
@@ -1210,7 +1213,14 @@ mod tests {
     #[test]
     fn format_page_nonzero_exit_is_error() {
         let id = json!(1);
-        let page = json!({ "stdout": "", "stderr": "fail", "exit_code": 1, "duration_ms": 0 });
+        let page = ExecPage {
+            stdout: String::new(),
+            stderr: "fail".to_string(),
+            exit_code: Some(1),
+            duration_ms: Some(0),
+            timed_out: None,
+            next_page: None,
+        };
         let resp = format_page_response(&id, &page);
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
     }
@@ -1218,7 +1228,14 @@ mod tests {
     #[test]
     fn format_page_timed_out() {
         let id = json!(1);
-        let page = json!({ "stdout": "partial", "stderr": "", "exit_code": -1, "duration_ms": 5000, "timed_out": true });
+        let page = ExecPage {
+            stdout: "partial".to_string(),
+            stderr: String::new(),
+            exit_code: Some(-1),
+            duration_ms: Some(5000),
+            timed_out: Some(true),
+            next_page: None,
+        };
         let resp = format_page_response(&id, &page);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("[timed out]"));
@@ -1228,7 +1245,14 @@ mod tests {
     #[test]
     fn format_page_streaming_next_page() {
         let id = json!(1);
-        let page = json!({ "stdout": "chunk1", "stderr": "", "next_page": "abc123" });
+        let page = ExecPage {
+            stdout: "chunk1".to_string(),
+            stderr: String::new(),
+            exit_code: None,
+            duration_ms: None,
+            timed_out: None,
+            next_page: Some("abc123".to_string()),
+        };
         let resp = format_page_response(&id, &page);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("[streaming] next_page=abc123"));
@@ -1239,7 +1263,14 @@ mod tests {
     #[test]
     fn format_page_empty_output() {
         let id = json!(1);
-        let page = json!({ "stdout": "", "stderr": "", "next_page": "tok123" });
+        let page = ExecPage {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: None,
+            duration_ms: None,
+            timed_out: None,
+            next_page: Some("tok123".to_string()),
+        };
         let resp = format_page_response(&id, &page);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         // Should still have the streaming token
@@ -1257,10 +1288,10 @@ mod tests {
         let config = streaming_config(32768);
         let page = build_page(&sm, &token, &config).await.unwrap();
 
-        assert_eq!(page["stdout"], "output data");
-        assert_eq!(page["exit_code"], 0);
-        assert_eq!(page["duration_ms"], 42);
-        assert!(page["next_page"].is_null()); // final page has no next_page
+        assert_eq!(page.stdout, "output data");
+        assert_eq!(page.exit_code.unwrap(), 0);
+        assert_eq!(page.duration_ms.unwrap(), 42);
+        assert!(page.next_page.is_none()); // final page has no next_page
         // Session should be removed after final page
         assert!(sm.borrow().get_by_token(&token).is_none());
     }
@@ -1274,9 +1305,9 @@ mod tests {
         let config = streaming_config(32768);
         let page = build_page(&sm, &token, &config).await.unwrap();
 
-        assert_eq!(page["stdout"], "partial output");
-        assert!(page["exit_code"].is_null()); // not final
-        let next_page = page["next_page"].as_str().unwrap();
+        assert_eq!(page.stdout, "partial output");
+        assert!(page.exit_code.is_none()); // not final
+        let next_page = page.next_page.as_ref().unwrap();
         assert!(!next_page.is_empty());
         // Old token should be invalid
         assert!(sm.borrow().get_by_token(&token).is_none());
@@ -1296,9 +1327,9 @@ mod tests {
         let page = build_page(&sm, &token, &config).await.unwrap();
 
         // Should only get 50 bytes
-        assert_eq!(page["stdout"].as_str().unwrap().len(), 50);
+        assert_eq!(page.stdout.len(), 50);
         // Should have a next_page (still has data)
-        assert!(page["next_page"].as_str().is_some());
+        assert!(page.next_page.is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1313,15 +1344,15 @@ mod tests {
 
         // First page: should get 50 bytes but NOT be final (50 bytes remain)
         let page1 = build_page(&sm, &token, &config).await.unwrap();
-        assert_eq!(page1["stdout"].as_str().unwrap().len(), 50);
-        assert!(page1["exit_code"].is_null(), "should not be final page yet");
-        let token2 = page1["next_page"].as_str().unwrap();
+        assert_eq!(page1.stdout.len(), 50);
+        assert!(page1.exit_code.is_none(), "should not be final page yet");
+        let token2 = page1.next_page.as_ref().unwrap();
 
         // Second page: drain remaining 50 bytes, now it's final
         let page2 = build_page(&sm, token2, &config).await.unwrap();
-        assert_eq!(page2["stdout"].as_str().unwrap().len(), 50);
-        assert_eq!(page2["exit_code"], 0);
-        assert!(page2["next_page"].is_null());
+        assert_eq!(page2.stdout.len(), 50);
+        assert_eq!(page2.exit_code.unwrap(), 0);
+        assert!(page2.next_page.is_none());
         // Session cleaned up
         assert!(sm.borrow().get_by_token(token2).is_none());
     }
@@ -1337,11 +1368,11 @@ mod tests {
         let page = build_page(&sm, &token, &config).await.unwrap();
 
         // stdout gets first 40, stderr gets remaining budget (50-40=10)
-        assert_eq!(page["stdout"].as_str().unwrap().len(), 40);
-        assert_eq!(page["stderr"].as_str().unwrap().len(), 10);
+        assert_eq!(page.stdout.len(), 40);
+        assert_eq!(page.stderr.len(), 10);
         // Still has remaining stderr data, so NOT final even though completed
-        assert!(page["exit_code"].is_null());
-        assert!(page["next_page"].as_str().is_some());
+        assert!(page.exit_code.is_none());
+        assert!(page.next_page.is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1363,10 +1394,10 @@ mod tests {
         let config = streaming_config(32768);
         let page = build_page(&sm, &token, &config).await.unwrap();
 
-        assert_eq!(page["stdout"], "");
-        assert_eq!(page["stderr"], "");
-        assert_eq!(page["exit_code"], 0);
-        assert!(page["next_page"].is_null());
+        assert_eq!(page.stdout, "");
+        assert_eq!(page.stderr, "");
+        assert_eq!(page.exit_code.unwrap(), 0);
+        assert!(page.next_page.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1379,9 +1410,9 @@ mod tests {
         let page = build_page(&sm, &token, &config).await.unwrap();
 
         // After timeout, should return an empty intermediate page
-        assert_eq!(page["stdout"], "");
-        assert_eq!(page["stderr"], "");
-        assert!(page["next_page"].as_str().is_some());
+        assert_eq!(page.stdout, "");
+        assert_eq!(page.stderr, "");
+        assert!(page.next_page.is_some());
     }
 
     // -- handle_output tests --
@@ -1571,10 +1602,10 @@ mod tests {
             let page = build_page(&sm, &token, &config).await.unwrap();
 
             // Should be a FINAL page — coalesced data + exit code in one response.
-            assert_eq!(page["stdout"], "fast output");
-            assert_eq!(page["exit_code"], 0);
+            assert_eq!(page.stdout, "fast output");
+            assert_eq!(page.exit_code.unwrap(), 0);
             assert!(
-                page["next_page"].is_null(),
+                page.next_page.is_none(),
                 "fast command should not require a second page"
             );
             // Session should be cleaned up
