@@ -294,7 +294,7 @@ checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
 
 [[package]]
 name = "commando-agent"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "capnp",
@@ -305,6 +305,7 @@ dependencies = [
  "gethostname",
  "libc",
  "serde",
+ "serde_json",
  "shell-words",
  "socket2 0.5.10",
  "tokio",
@@ -317,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "commando-cli"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "clap",
  "reqwest",
@@ -328,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "commando-common"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "capnp",
  "capnp-rpc",
@@ -340,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "commando-gateway"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "axum",
