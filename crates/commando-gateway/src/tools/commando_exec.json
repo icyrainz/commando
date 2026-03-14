@@ -1,0 +1,31 @@
+{
+  "name": "commando_exec",
+  "description": "Execute a shell command on a target machine. If the response includes a next_page field, the command is still running — call commando_output with the page token to get more output.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "Fully qualified target name (e.g., 'node-1/my-app', 'my-desktop')"
+      },
+      "command": {
+        "type": "string",
+        "description": "Shell command to execute"
+      },
+      "work_dir": {
+        "type": "string",
+        "description": "Working directory (default: home dir)"
+      },
+      "timeout": {
+        "type": "number",
+        "description": "Timeout in seconds (default: 60)"
+      },
+      "env": {
+        "type": "object",
+        "description": "Additional environment variables",
+        "additionalProperties": { "type": "string" }
+      }
+    },
+    "required": ["target", "command"]
+  }
+}

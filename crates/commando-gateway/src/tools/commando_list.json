@@ -1,0 +1,12 @@
+{
+  "name": "commando_list",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "filter": {
+        "type": "string",
+        "description": "Case-insensitive substring match against target name and tags"
+      }
+    }
+  }
+}

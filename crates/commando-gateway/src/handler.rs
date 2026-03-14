@@ -64,88 +64,25 @@ pub fn process_initialize(request: &Value) -> Value {
 }
 
 pub fn process_tools_list(request: &Value, expose_exec: bool) -> Value {
-    let list_description = if expose_exec {
-        "List all registered targets with their status, shell, tags, and reachability."
+    let mut list_tool: Value =
+        serde_json::from_str(include_str!("tools/commando_list.json")).unwrap();
+    list_tool["description"] = if expose_exec {
+        "List all registered targets with their status, shell, tags, and reachability.".into()
     } else {
-        "List all available commando targets with their status and IP. To execute commands on a target, use the Bash tool: commando exec <target> '<command>'"
+        "List all available commando targets with their status and IP. To execute commands on a target, use the Bash tool: commando exec <target> '<command>'".into()
     };
 
-    let mut tools = vec![
-        json!({
-            "name": "commando_list",
-            "description": list_description,
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "filter": {
-                        "type": "string",
-                        "description": "Case-insensitive substring match against target name and tags"
-                    }
-                }
-            }
-        }),
-        json!({
-            "name": "commando_ping",
-            "description": "Health check a specific agent. Returns hostname, uptime, shell, and version.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": {
-                        "type": "string",
-                        "description": "Fully qualified target name"
-                    }
-                },
-                "required": ["target"]
-            }
-        }),
-    ];
+    let ping_tool: Value = serde_json::from_str(include_str!("tools/commando_ping.json")).unwrap();
+
+    let mut tools = vec![list_tool, ping_tool];
 
     if expose_exec {
-        tools.push(json!({
-            "name": "commando_exec",
-            "description": "Execute a shell command on a target machine. If the response includes a next_page field, the command is still running — call commando_output with the page token to get more output.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": {
-                        "type": "string",
-                        "description": "Fully qualified target name (e.g., 'node-1/my-app', 'my-desktop')"
-                    },
-                    "command": {
-                        "type": "string",
-                        "description": "Shell command to execute"
-                    },
-                    "work_dir": {
-                        "type": "string",
-                        "description": "Working directory (default: home dir)"
-                    },
-                    "timeout": {
-                        "type": "number",
-                        "description": "Timeout in seconds (default: 60)"
-                    },
-                    "env": {
-                        "type": "object",
-                        "description": "Additional environment variables",
-                        "additionalProperties": { "type": "string" }
-                    }
-                },
-                "required": ["target", "command"]
-            }
-        }));
-        tools.push(json!({
-            "name": "commando_output",
-            "description": "Get the next page of output from a streaming command. Use when commando_exec returns a next_page token.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["page"],
-                "properties": {
-                    "page": {
-                        "type": "string",
-                        "description": "Page token from previous commando_exec or commando_output response"
-                    }
-                }
-            }
-        }));
+        let exec_tool: Value =
+            serde_json::from_str(include_str!("tools/commando_exec.json")).unwrap();
+        let output_tool: Value =
+            serde_json::from_str(include_str!("tools/commando_output.json")).unwrap();
+        tools.push(exec_tool);
+        tools.push(output_tool);
     }
 
     json!({

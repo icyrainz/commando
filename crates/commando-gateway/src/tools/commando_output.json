@@ -1,0 +1,14 @@
+{
+  "name": "commando_output",
+  "description": "Get the next page of output from a streaming command. Use when commando_exec returns a next_page token.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["page"],
+    "properties": {
+      "page": {
+        "type": "string",
+        "description": "Page token from previous commando_exec or commando_output response"
+      }
+    }
+  }
+}

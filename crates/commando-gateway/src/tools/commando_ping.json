@@ -1,0 +1,14 @@
+{
+  "name": "commando_ping",
+  "description": "Health check a specific agent. Returns hostname, uptime, shell, and version.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "Fully qualified target name"
+      }
+    },
+    "required": ["target"]
+  }
+}
