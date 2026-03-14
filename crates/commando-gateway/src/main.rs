@@ -146,6 +146,13 @@ async fn run_gateway(config: Arc<config::GatewayConfig>) -> Result<()> {
         config.agent.max_concurrent_per_target,
     ));
 
+    let audit = Arc::new(commando_gateway::audit::create_logger(
+        config.server.audit_log_path.as_deref(),
+        &config.cache_dir,
+        config.server.audit_log_max_bytes,
+    ));
+    info!(audit_log = %audit.path().display(), "audit logging enabled");
+
     // Run initial ping cycle for all targets (manual and discovered)
     run_ping_cycle(&config, &registry).await;
 
@@ -175,8 +182,10 @@ async fn run_gateway(config: Arc<config::GatewayConfig>) -> Result<()> {
 
     // Run MCP server on selected transport
     match config.server.transport.as_str() {
-        "stdio" => mcp::run_stdio_loop(config, registry, limiter).await,
-        "streamable-http" => streamable::run_streamable_server(config, registry, limiter).await,
+        "stdio" => mcp::run_stdio_loop(config, registry, limiter, audit).await,
+        "streamable-http" => {
+            streamable::run_streamable_server(config, registry, limiter, audit).await
+        }
         other => {
             anyhow::bail!("unknown transport: {other} (expected 'stdio' or 'streamable-http')")
         }

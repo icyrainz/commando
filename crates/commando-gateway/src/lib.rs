@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod config;
 pub mod handler;
 pub mod mcp;

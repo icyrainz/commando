@@ -20,6 +20,8 @@ fn test_config() -> Arc<GatewayConfig> {
             port: 0,
             api_key: Some(TEST_API_KEY.to_string()),
             execution_mode: "cli".to_string(),
+            audit_log_path: Some("/dev/null".to_string()),
+            audit_log_max_bytes: 10 * 1024 * 1024,
         },
         proxmox: None,
         agent: AgentConnectionConfig {
@@ -40,7 +42,11 @@ async fn start_server() -> String {
     let registry = Arc::new(Mutex::new(Registry::new()));
     let limiter = Arc::new(ConcurrencyLimiter::new(4));
 
-    let app = streamable::build_app(config, registry, limiter);
+    let audit = Arc::new(commando_gateway::audit::AuditLogger::new(
+        std::path::PathBuf::from("/dev/null"),
+        10 * 1024 * 1024,
+    ));
+    let app = streamable::build_app(config, registry, limiter, audit);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 

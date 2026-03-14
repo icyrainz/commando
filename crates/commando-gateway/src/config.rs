@@ -99,6 +99,12 @@ pub struct ServerConfig {
     ///   No CLI install needed, but output may be truncated by Claude Code.
     #[serde(default = "default_execution_mode")]
     pub execution_mode: String,
+    /// Path to the JSONL audit log file. Defaults to {cache_dir}/audit.log.
+    /// Set to "/dev/null" to disable.
+    pub audit_log_path: Option<String>,
+    /// Max audit log size in bytes before rotation. Default: 10MB.
+    #[serde(default = "default_audit_log_max_bytes")]
+    pub audit_log_max_bytes: u64,
 }
 
 impl ServerConfig {
@@ -115,6 +121,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("port", &self.port)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("execution_mode", &self.execution_mode)
+            .field("audit_log_path", &self.audit_log_path)
             .finish()
     }
 }
@@ -127,12 +134,17 @@ impl Default for ServerConfig {
             port: default_server_port(),
             api_key: None,
             execution_mode: default_execution_mode(),
+            audit_log_path: None,
+            audit_log_max_bytes: default_audit_log_max_bytes(),
         }
     }
 }
 
 fn default_execution_mode() -> String {
     "cli".to_string()
+}
+fn default_audit_log_max_bytes() -> u64 {
+    10 * 1024 * 1024 // 10MB
 }
 
 fn default_transport() -> String {

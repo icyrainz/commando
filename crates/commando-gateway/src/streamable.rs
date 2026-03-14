@@ -14,6 +14,7 @@ use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tracing::info;
 
+use crate::audit::AuditLogger;
 use crate::config::GatewayConfig;
 use crate::handler;
 use crate::registry::Registry;
@@ -38,6 +39,7 @@ pub fn build_app(
     config: Arc<GatewayConfig>,
     registry: Arc<Mutex<Registry>>,
     limiter: Arc<handler::ConcurrencyLimiter>,
+    audit: Arc<AuditLogger>,
 ) -> Router {
     let (work_tx, mut work_rx) = tokio::sync::mpsc::channel::<WorkItem>(64);
     let api_key = Arc::new(config.server.api_key.clone().unwrap_or_default());
@@ -71,9 +73,10 @@ pub fn build_app(
             let reg = registry.clone();
             let lim = limiter.clone();
             let smap = session_map.clone();
+            let aud = audit.clone();
             tokio::task::spawn_local(async move {
                 let result =
-                    handler::dispatch_request(&item.request, &cfg, &reg, &lim, &smap).await;
+                    handler::dispatch_request(&item.request, &cfg, &reg, &lim, &smap, &aud).await;
                 let _ = item.response_tx.send(result);
             });
         }
@@ -106,10 +109,11 @@ pub async fn run_streamable_server(
     config: Arc<GatewayConfig>,
     registry: Arc<Mutex<Registry>>,
     limiter: Arc<handler::ConcurrencyLimiter>,
+    audit: Arc<AuditLogger>,
 ) -> Result<()> {
     let bind = config.server.bind.clone();
     let port = config.server.port;
-    let app = build_app(config, registry, limiter);
+    let app = build_app(config, registry, limiter, audit);
 
     let addr = format!("{bind}:{port}");
     let listener = TcpListener::bind(&addr).await?;

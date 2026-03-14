@@ -381,6 +381,34 @@ For encrypting all traffic (including gateway ↔ agent), use a network-level ov
 
 This is the simplest path to full encryption and is standard practice in homelabs.
 
+## Audit Log
+
+Every command executed through Commando is logged to a JSONL file for accountability. This is especially important when AI agents have root access to your fleet.
+
+**Default path:** `{cache_dir}/audit.log` (typically `/var/lib/commando/audit.log` inside the Docker container)
+
+**Format:** One JSON object per line:
+```jsonl
+{"ts":"2026-03-14T19:30:00Z","target":"akio-lab/akio-arr","command":"docker ps","exit_code":0,"duration_ms":150,"source":"rest"}
+{"ts":"2026-03-14T19:30:05Z","target":"bad-target","command":"echo hi","source":"mcp","error":"unknown target: bad-target"}
+```
+
+**Configuration:**
+```toml
+[server]
+audit_log_path = "/var/lib/commando/audit.log"  # default: {cache_dir}/audit.log
+audit_log_max_bytes = 10485760                   # default: 10MB, rotates to .log.1
+```
+
+**View recent commands:**
+```bash
+# Inside the gateway container or on the host
+tail -f /var/lib/commando/audit.log | jq .
+
+# Search for commands on a specific target
+grep '"akio-lab/akio-arr"' /var/lib/commando/audit.log | jq .
+```
+
 ## Troubleshooting
 
 **Check gateway logs:**

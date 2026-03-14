@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 use tracing::info;
 
+use crate::audit::{AuditEntry, AuditLogger};
 use crate::config::{GatewayConfig, StreamingConfig};
 use crate::registry::Registry;
 use crate::rpc;
@@ -144,6 +145,7 @@ pub async fn dispatch_request(
     registry: &Arc<Mutex<Registry>>,
     limiter: &Arc<ConcurrencyLimiter>,
     session_map: &Rc<RefCell<SessionMap>>,
+    audit: &Arc<AuditLogger>,
 ) -> Option<Value> {
     // Handle REST API requests (sent via __rest marker)
     if let Some(rest_type) = request["__rest"].as_str() {
@@ -154,7 +156,7 @@ pub async fn dispatch_request(
                 let work_dir = request["work_dir"].as_str().unwrap_or("");
                 let timeout = request["timeout"].as_u64().map(|t| t as u32);
                 // extra_env intentionally empty — --env flag omitted from CLI v1
-                match handle_exec_core(
+                let result = handle_exec_core(
                     target,
                     command,
                     work_dir,
@@ -165,8 +167,9 @@ pub async fn dispatch_request(
                     limiter,
                     session_map,
                 )
-                .await
-                {
+                .await;
+                audit_exec(audit, target, command, &result, "rest");
+                match result {
                     Ok(page) => serde_json::to_value(&page).unwrap(),
                     Err(e) => json!({"error": e.message, "_gateway": e.is_gateway_error}),
                 }
@@ -205,7 +208,9 @@ pub async fn dispatch_request(
     let response = match method {
         "initialize" => process_initialize(request),
         "tools/list" => process_tools_list(request, config.server.is_mcp_exec_mode()),
-        "tools/call" => handle_tools_call(request, config, registry, limiter, session_map).await,
+        "tools/call" => {
+            handle_tools_call(request, config, registry, limiter, session_map, audit).await
+        }
         _ => make_error_response(id.clone(), -32601, &format!("Method not found: {method}")),
     };
 
@@ -218,17 +223,61 @@ async fn handle_tools_call(
     registry: &Arc<Mutex<Registry>>,
     limiter: &Arc<ConcurrencyLimiter>,
     session_map: &Rc<RefCell<SessionMap>>,
+    audit: &Arc<AuditLogger>,
 ) -> Value {
     let id = &request["id"];
     let tool_name = request["params"]["name"].as_str().unwrap_or("");
     let args = &request["params"]["arguments"];
 
     match tool_name {
-        "commando_exec" => handle_exec(id, args, config, registry, limiter, session_map).await,
+        "commando_exec" => {
+            handle_exec(id, args, config, registry, limiter, session_map, audit).await
+        }
         "commando_list" => handle_list(id, args, config, registry),
         "commando_ping" => handle_ping(id, args, config, registry).await,
         "commando_output" => handle_output(id, args, session_map, &config.streaming).await,
         _ => make_tool_error(id, &format!("Unknown tool: {tool_name}")),
+    }
+}
+
+fn audit_exec(
+    audit: &AuditLogger,
+    target: &str,
+    command: &str,
+    result: &Result<ExecPage, HandlerError>,
+    source: &str,
+) {
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let cmd = if command.len() > 500 {
+        &command[..500]
+    } else {
+        command
+    };
+    match result {
+        Ok(page) => {
+            audit.log(&AuditEntry {
+                ts,
+                target,
+                command: cmd,
+                exit_code: page.exit_code,
+                duration_ms: page.duration_ms,
+                request_id: None,
+                source,
+                error: None,
+            });
+        }
+        Err(e) => {
+            audit.log(&AuditEntry {
+                ts,
+                target,
+                command: cmd,
+                exit_code: None,
+                duration_ms: None,
+                request_id: None,
+                source,
+                error: Some(&e.message),
+            });
+        }
     }
 }
 
@@ -336,6 +385,7 @@ async fn handle_exec(
     registry: &Arc<Mutex<Registry>>,
     limiter: &Arc<ConcurrencyLimiter>,
     session_map: &Rc<RefCell<SessionMap>>,
+    audit: &Arc<AuditLogger>,
 ) -> Value {
     let target_name = match args["target"].as_str() {
         Some(t) => t,
@@ -356,7 +406,7 @@ async fn handle_exec(
         })
         .unwrap_or_default();
 
-    match handle_exec_core(
+    let result = handle_exec_core(
         target_name,
         command,
         work_dir,
@@ -367,8 +417,9 @@ async fn handle_exec(
         limiter,
         session_map,
     )
-    .await
-    {
+    .await;
+    audit_exec(audit, target_name, command, &result, "mcp");
+    match result {
         Ok(page) => format_page_response(id, &page),
         Err(e) => make_tool_error(id, &e.message),
     }
@@ -718,6 +769,13 @@ mod tests {
         Rc::new(RefCell::new(SessionMap::new()))
     }
 
+    fn test_audit() -> Arc<AuditLogger> {
+        Arc::new(AuditLogger::new(
+            std::path::PathBuf::from("/dev/null"),
+            10 * 1024 * 1024,
+        ))
+    }
+
     #[test]
     fn handle_initialize() {
         let request = json!({
@@ -879,9 +937,16 @@ mod tests {
                 "arguments": { "command": "echo hi" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
-            .await
-            .unwrap();
+        let resp = dispatch_request(
+            &request,
+            &config,
+            &registry,
+            &limiter,
+            &test_session_map(),
+            &test_audit(),
+        )
+        .await
+        .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
         assert!(
             resp["result"]["content"][0]["text"]
@@ -906,9 +971,16 @@ mod tests {
                 "arguments": { "target": "nonexistent", "command": "echo hi" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
-            .await
-            .unwrap();
+        let resp = dispatch_request(
+            &request,
+            &config,
+            &registry,
+            &limiter,
+            &test_session_map(),
+            &test_audit(),
+        )
+        .await
+        .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
         assert!(
             resp["result"]["content"][0]["text"]
@@ -934,9 +1006,16 @@ mod tests {
                 "arguments": { "target": "my-box", "command": "echo hi" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
-            .await
-            .unwrap();
+        let resp = dispatch_request(
+            &request,
+            &config,
+            &registry,
+            &limiter,
+            &test_session_map(),
+            &test_audit(),
+        )
+        .await
+        .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
         assert!(
             resp["result"]["content"][0]["text"]
@@ -964,9 +1043,16 @@ mod tests {
                 "arguments": { "target": "my-box", "command": "echo hi" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
-            .await
-            .unwrap();
+        let resp = dispatch_request(
+            &request,
+            &config,
+            &registry,
+            &limiter,
+            &test_session_map(),
+            &test_audit(),
+        )
+        .await
+        .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
         assert!(
             resp["result"]["content"][0]["text"]
@@ -991,9 +1077,16 @@ mod tests {
                 "arguments": {}
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
-            .await
-            .unwrap();
+        let resp = dispatch_request(
+            &request,
+            &config,
+            &registry,
+            &limiter,
+            &test_session_map(),
+            &test_audit(),
+        )
+        .await
+        .unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("my-box"));
         assert!(text.contains("10.0.0.5"));
@@ -1014,9 +1107,16 @@ mod tests {
                 "arguments": { "filter": "nonexistent" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
-            .await
-            .unwrap();
+        let resp = dispatch_request(
+            &request,
+            &config,
+            &registry,
+            &limiter,
+            &test_session_map(),
+            &test_audit(),
+        )
+        .await
+        .unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(!text.contains("my-box"));
     }
@@ -1036,9 +1136,16 @@ mod tests {
                 "arguments": { "target": "nonexistent" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
-            .await
-            .unwrap();
+        let resp = dispatch_request(
+            &request,
+            &config,
+            &registry,
+            &limiter,
+            &test_session_map(),
+            &test_audit(),
+        )
+        .await
+        .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
         assert!(
             resp["result"]["content"][0]["text"]
@@ -1063,9 +1170,16 @@ mod tests {
                 "arguments": { "target": "my-box" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
-            .await
-            .unwrap();
+        let resp = dispatch_request(
+            &request,
+            &config,
+            &registry,
+            &limiter,
+            &test_session_map(),
+            &test_audit(),
+        )
+        .await
+        .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
         assert!(
             resp["result"]["content"][0]["text"]
@@ -1090,9 +1204,16 @@ mod tests {
                 "arguments": {}
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
-            .await
-            .unwrap();
+        let resp = dispatch_request(
+            &request,
+            &config,
+            &registry,
+            &limiter,
+            &test_session_map(),
+            &test_audit(),
+        )
+        .await
+        .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
         assert!(
             resp["result"]["content"][0]["text"]
@@ -1141,9 +1262,16 @@ mod tests {
                 "arguments": { "target": "node-1/stopped-app", "command": "echo hi" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
-            .await
-            .unwrap();
+        let resp = dispatch_request(
+            &request,
+            &config,
+            &registry,
+            &limiter,
+            &test_session_map(),
+            &test_audit(),
+        )
+        .await
+        .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
@@ -1191,9 +1319,16 @@ mod tests {
                 "arguments": { "target": "node-1/stopped-app" }
             }
         });
-        let resp = dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
-            .await
-            .unwrap();
+        let resp = dispatch_request(
+            &request,
+            &config,
+            &registry,
+            &limiter,
+            &test_session_map(),
+            &test_audit(),
+        )
+        .await
+        .unwrap();
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
@@ -1219,7 +1354,8 @@ mod tests {
                 &config,
                 &registry,
                 &limiter,
-                &test_session_map()
+                &test_session_map(),
+                &test_audit(),
             )
             .await
             .is_none()
@@ -1232,9 +1368,16 @@ mod tests {
             "method": "notifications/initialized"
         });
         assert!(
-            dispatch_request(&null_id, &config, &registry, &limiter, &test_session_map())
-                .await
-                .is_none()
+            dispatch_request(
+                &null_id,
+                &config,
+                &registry,
+                &limiter,
+                &test_session_map(),
+                &test_audit()
+            )
+            .await
+            .is_none()
         );
 
         // Request: has id — should return Some
@@ -1245,9 +1388,16 @@ mod tests {
             "params": {}
         });
         assert!(
-            dispatch_request(&request, &config, &registry, &limiter, &test_session_map())
-                .await
-                .is_some()
+            dispatch_request(
+                &request,
+                &config,
+                &registry,
+                &limiter,
+                &test_session_map(),
+                &test_audit()
+            )
+            .await
+            .is_some()
         );
     }
 

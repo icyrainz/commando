@@ -7,6 +7,7 @@ use anyhow::Result;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use crate::audit::AuditLogger;
 use crate::config::GatewayConfig;
 use crate::handler;
 use crate::registry::Registry;
@@ -17,6 +18,7 @@ pub async fn run_stdio_loop(
     config: Arc<GatewayConfig>,
     registry: Arc<Mutex<Registry>>,
     limiter: Arc<handler::ConcurrencyLimiter>,
+    audit: Arc<AuditLogger>,
 ) -> Result<()> {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
@@ -57,7 +59,8 @@ pub async fn run_stdio_loop(
         };
 
         if let Some(response) =
-            handler::dispatch_request(&request, &config, &registry, &limiter, &session_map).await
+            handler::dispatch_request(&request, &config, &registry, &limiter, &session_map, &audit)
+                .await
         {
             write_response(&mut stdout, &response).await?;
         }
