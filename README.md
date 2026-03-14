@@ -1,12 +1,12 @@
 # Commando
 
-Run commands on any Linux machine through MCP tool calls. No SSH escaping, no nested shells, no Ansible playbooks. One tool call, one shell layer.
+Run commands on any Linux machine — no SSH escaping, no nested shells, no Ansible playbooks. One command, one shell layer.
 
-```
-commando_exec(target="web-server", command="docker compose ps --format json")
+```bash
+commando exec web-server "docker compose ps --format json"
 ```
 
-Your AI coding agent gets `commando_list` and `commando_ping` as MCP tools for target discovery, and the `commando` CLI for command execution with full output streaming.
+Your AI coding agent discovers targets via MCP (`commando_list`, `commando_ping`) and executes commands via the `commando` CLI with full output streaming.
 
 ## Why
 
@@ -102,6 +102,8 @@ connect_timeout_secs = 5
 
 # PSKs (Pre-Shared Keys) added here as you deploy agents
 [agent.psk]
+
+# [[targets]] blocks added here as you deploy agents (step 2)
 EOF
 chmod 600 /etc/commando/gateway.toml
 
@@ -127,7 +129,7 @@ Verify: `curl http://localhost:9877/health` → `{"status":"ok"}`
 
 ### 2. Install Agents
 
-SSH into each target machine and run:
+SSH into each target machine as root and run:
 
 ```bash
 curl -sL https://raw.githubusercontent.com/icyrainz/commando/main/deploy/install-agent.sh | bash
@@ -237,6 +239,17 @@ host = "192.168.1.51"
 shell = "sh"
 tags = ["database"]
 ```
+
+## MCP-Only Mode (Optional)
+
+If you prefer not to install the CLI and want Claude Code to execute commands entirely through MCP tools, add to `gateway.toml`:
+
+```toml
+[server]
+expose_exec_tool = true
+```
+
+This exposes `commando_exec` and `commando_output` as MCP tools. The trade-off: Claude Code's MCP output rendering may truncate long command output. The CLI avoids this by using native Bash rendering.
 
 ## Proxmox Auto-Discovery
 
