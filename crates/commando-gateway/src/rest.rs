@@ -97,10 +97,7 @@ pub async fn handle_ping(
     }
 }
 
-async fn send_work(
-    state: &crate::streamable::AppState,
-    request: Value,
-) -> Result<Value, String> {
+async fn send_work(state: &crate::streamable::AppState, request: Value) -> Result<Value, String> {
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
     state
         .work_tx
