@@ -22,14 +22,20 @@ fn error_response(status: axum::http::StatusCode, msg: &str) -> Response {
 
 pub async fn handle_exec_post(
     State(state): State<crate::streamable::AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ExecRequest>,
 ) -> Response {
+    let profile = headers
+        .get("x-commando-profile")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == "true" || v == "1");
     let internal_req = json!({
         "__rest": "exec",
         "target": req.target,
         "command": req.command,
         "timeout": req.timeout,
         "work_dir": req.work_dir.unwrap_or_default(),
+        "__profile": profile,
     });
     match send_work(&state, internal_req).await {
         Ok(resp) => {
@@ -127,6 +133,7 @@ mod tests {
             duration_ms: Some(150),
             timed_out: None,
             next_page: None,
+            _profile: None,
         };
         let json = serde_json::to_value(&page).unwrap();
         assert_eq!(json["stdout"], "hello");
@@ -145,6 +152,7 @@ mod tests {
             duration_ms: None,
             timed_out: None,
             next_page: Some("abc123".to_string()),
+            _profile: None,
         };
         let json = serde_json::to_value(&page).unwrap();
         assert_eq!(json["next_page"], "abc123");
@@ -160,6 +168,7 @@ mod tests {
             duration_ms: Some(60000),
             timed_out: Some(true),
             next_page: None,
+            _profile: None,
         };
         let json = serde_json::to_value(&page).unwrap();
         assert_eq!(json["exit_code"], 124);

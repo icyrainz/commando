@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 /// A page of streaming command output.
 #[derive(Debug, Clone, Serialize)]
@@ -13,6 +14,17 @@ pub struct ExecPage {
     pub timed_out: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_page: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _profile: Option<ProfileData>,
+}
+
+/// Timing breakdown for profiling mode.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ProfileData {
+    /// Ordered map of stage_name -> elapsed_ms
+    pub stages: BTreeMap<String, f64>,
+    /// Total gateway-side processing time
+    pub total_ms: f64,
 }
 
 /// Target info for REST API (minimal fields for CLI display).

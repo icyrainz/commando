@@ -25,6 +25,9 @@ enum Commands {
         /// Working directory on target
         #[arg(long)]
         workdir: Option<String>,
+        /// Show end-to-end latency breakdown
+        #[arg(long)]
+        profile: bool,
     },
     /// List available targets
     List,
@@ -73,6 +76,7 @@ async fn run(cli: Cli) -> i32 {
             command,
             timeout,
             workdir,
+            profile,
         } => {
             cmd_exec(
                 &client,
@@ -82,6 +86,7 @@ async fn run(cli: Cli) -> i32 {
                 &command,
                 timeout,
                 workdir.as_deref(),
+                profile,
             )
             .await
         }
@@ -90,6 +95,7 @@ async fn run(cli: Cli) -> i32 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_exec(
     client: &reqwest::Client,
     base_url: &str,
@@ -98,8 +104,12 @@ async fn cmd_exec(
     command: &str,
     timeout: Option<u32>,
     workdir: Option<&str>,
+    profile: bool,
 ) -> i32 {
     use std::io::Write;
+    use std::time::Instant;
+
+    let t_start = Instant::now();
     let url = format!("{base_url}/api/exec");
     let mut body = serde_json::json!({"target": target, "command": command});
     if let Some(t) = timeout {
@@ -109,13 +119,12 @@ async fn cmd_exec(
         body["work_dir"] = serde_json::json!(w);
     }
 
-    let resp = match client
-        .post(&url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-    {
+    let mut req = client.post(&url).bearer_auth(api_key).json(&body);
+    if profile {
+        req = req.header("X-Commando-Profile", "true");
+    }
+
+    let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {e}");
@@ -129,6 +138,7 @@ async fn cmd_exec(
         eprintln!("error: {msg} (HTTP {status})");
         return 1;
     }
+    let t_first_resp = Instant::now();
     let mut json: serde_json::Value = match resp.json().await {
         Ok(j) => j,
         Err(e) => {
@@ -136,6 +146,12 @@ async fn cmd_exec(
             return 1;
         }
     };
+    let t_first_parsed = Instant::now();
+
+    // Capture server-side profile from first page
+    let server_profile = json.get("_profile").cloned();
+
+    let mut page_count = 1u32;
 
     loop {
         if let Some(stdout) = json["stdout"].as_str()
@@ -151,6 +167,17 @@ async fn cmd_exec(
             let _ = std::io::stderr().flush();
         }
         if let Some(exit_code) = json["exit_code"].as_i64() {
+            if profile {
+                let t_end = Instant::now();
+                print_profile(
+                    t_start,
+                    t_first_resp,
+                    t_first_parsed,
+                    t_end,
+                    page_count,
+                    &server_profile,
+                );
+            }
             return exit_code as i32;
         }
         let next_page = match json["next_page"].as_str() {
@@ -182,7 +209,58 @@ async fn cmd_exec(
                 return 1;
             }
         };
+        page_count += 1;
     }
+}
+
+fn print_profile(
+    t_start: std::time::Instant,
+    t_first_resp: std::time::Instant,
+    t_first_parsed: std::time::Instant,
+    t_end: std::time::Instant,
+    page_count: u32,
+    server_profile: &Option<serde_json::Value>,
+) {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+
+    eprintln!();
+    eprintln!("─── profile ──────────────────────────────────");
+    eprintln!("  client");
+    eprintln!(
+        "    http_roundtrip      {:>8.2}ms",
+        ms(t_first_resp.duration_since(t_start))
+    );
+    eprintln!(
+        "    parse_response      {:>8.2}ms",
+        ms(t_first_parsed.duration_since(t_first_resp))
+    );
+    if page_count > 1 {
+        eprintln!(
+            "    extra_pages ({:>3})   {:>8.2}ms",
+            page_count - 1,
+            ms(t_end.duration_since(t_first_parsed))
+        );
+    }
+    eprintln!(
+        "    total               {:>8.2}ms",
+        ms(t_end.duration_since(t_start))
+    );
+
+    if let Some(sp) = server_profile {
+        if let Some(stages) = sp["stages"].as_object() {
+            eprintln!("  gateway");
+            for (name, val) in stages {
+                if let Some(v) = val.as_f64() {
+                    eprintln!("    {:<20} {:>8.2}ms", name, v);
+                }
+            }
+        }
+        if let Some(total) = sp["total_ms"].as_f64() {
+            eprintln!("    {:<20} {:>8.2}ms", "total", total);
+        }
+    }
+    eprintln!("  pages: {page_count}");
+    eprintln!("──────────────────────────────────────────────");
 }
 
 async fn cmd_list(client: &reqwest::Client, base_url: &str, api_key: &str) -> i32 {

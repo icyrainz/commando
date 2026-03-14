@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -14,6 +15,50 @@ use crate::registry::Registry;
 use crate::rpc;
 use crate::session::SessionMap;
 use crate::types::*;
+
+/// Helper for collecting stage timings in profiling mode.
+pub struct Profiler {
+    enabled: bool,
+    start: Instant,
+    last: Instant,
+    stages: BTreeMap<String, f64>,
+}
+
+impl Profiler {
+    pub fn new(enabled: bool) -> Self {
+        let now = Instant::now();
+        Self {
+            enabled,
+            start: now,
+            last: now,
+            stages: BTreeMap::new(),
+        }
+    }
+
+    pub fn stage(&mut self, name: &str) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last);
+        self.stages
+            .insert(name.to_string(), elapsed.as_secs_f64() * 1000.0);
+        self.last = now;
+    }
+
+    pub fn finish(mut self) -> Option<ProfileData> {
+        if !self.enabled {
+            return None;
+        }
+        let total = self.start.elapsed().as_secs_f64() * 1000.0;
+        // Insert total
+        self.stages.insert("_total".to_string(), total);
+        Some(ProfileData {
+            stages: self.stages,
+            total_ms: total,
+        })
+    }
+}
 
 /// Per-target concurrency semaphore (simple counter-based).
 pub struct ConcurrencyLimiter {
@@ -149,12 +194,14 @@ pub async fn dispatch_request(
 ) -> Option<Value> {
     // Handle REST API requests (sent via __rest marker)
     if let Some(rest_type) = request["__rest"].as_str() {
+        let profile_enabled = request["__profile"].as_bool().unwrap_or(false);
         let result = match rest_type {
             "exec" => {
                 let target = request["target"].as_str().unwrap_or("");
                 let command = request["command"].as_str().unwrap_or("");
                 let work_dir = request["work_dir"].as_str().unwrap_or("");
                 let timeout = request["timeout"].as_u64().map(|t| t as u32);
+                let mut profiler = Profiler::new(profile_enabled);
                 // extra_env intentionally empty — --env flag omitted from CLI v1
                 let result = handle_exec_core(
                     target,
@@ -166,11 +213,18 @@ pub async fn dispatch_request(
                     registry,
                     limiter,
                     session_map,
+                    &mut profiler,
                 )
                 .await;
+                profiler.stage("audit");
                 audit_exec(audit, target, command, &result, "rest");
+                profiler.stage("serialize");
+                let profile_data = profiler.finish();
                 match result {
-                    Ok(page) => serde_json::to_value(&page).unwrap(),
+                    Ok(mut page) => {
+                        page._profile = profile_data;
+                        serde_json::to_value(&page).unwrap()
+                    }
                     Err(e) => json!({"error": e.message, "_gateway": e.is_gateway_error}),
                 }
             }
@@ -292,6 +346,7 @@ pub async fn handle_exec_core(
     registry: &Arc<Mutex<Registry>>,
     limiter: &Arc<ConcurrencyLimiter>,
     session_map: &Rc<RefCell<SessionMap>>,
+    profiler: &mut Profiler,
 ) -> Result<ExecPage, HandlerError> {
     let timeout = timeout_secs.unwrap_or(config.agent.default_timeout_secs);
 
@@ -306,6 +361,7 @@ pub async fn handle_exec_core(
             }
         }
     };
+    profiler.stage("registry_lookup");
 
     if host.is_empty() {
         return Err(HandlerError::bad_request(format!(
@@ -330,6 +386,7 @@ pub async fn handle_exec_core(
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
+    profiler.stage("setup");
 
     info!(
         target = target_name,
@@ -357,6 +414,7 @@ pub async fn handle_exec_core(
         limiter.clone(),
         target_name.to_string(),
     );
+    profiler.stage("spawn_rpc");
 
     // Store the JoinHandle so cleanup can abort it if needed
     {
@@ -373,9 +431,11 @@ pub async fn handle_exec_core(
     }
 
     // Build and return the first page
-    build_page(session_map, &token, &config.streaming)
+    let page = build_page(session_map, &token, &config.streaming)
         .await
-        .map_err(HandlerError::bad_request)
+        .map_err(HandlerError::bad_request)?;
+    profiler.stage("build_page");
+    Ok(page)
 }
 
 async fn handle_exec(
@@ -406,6 +466,7 @@ async fn handle_exec(
         })
         .unwrap_or_default();
 
+    let mut profiler = Profiler::new(false); // MCP path: no profiling
     let result = handle_exec_core(
         target_name,
         command,
@@ -416,6 +477,7 @@ async fn handle_exec(
         registry,
         limiter,
         session_map,
+        &mut profiler,
     )
     .await;
     audit_exec(audit, target_name, command, &result, "mcp");
@@ -584,6 +646,7 @@ pub async fn build_page(
             duration_ms: Some(duration_ms),
             timed_out: if timed_out { Some(true) } else { None },
             next_page: None,
+            _profile: None,
         })
     } else {
         // Still running: rotate token
@@ -599,6 +662,7 @@ pub async fn build_page(
             duration_ms: None,
             timed_out: None,
             next_page: Some(new_token),
+            _profile: None,
         })
     }
 }
@@ -1447,6 +1511,7 @@ mod tests {
             duration_ms: Some(10),
             timed_out: None,
             next_page: None,
+            _profile: None,
         };
         let resp = format_page_response(&id, &page);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -1466,6 +1531,7 @@ mod tests {
             duration_ms: Some(5),
             timed_out: None,
             next_page: None,
+            _profile: None,
         };
         let resp = format_page_response(&id, &page);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -1483,6 +1549,7 @@ mod tests {
             duration_ms: Some(0),
             timed_out: None,
             next_page: None,
+            _profile: None,
         };
         let resp = format_page_response(&id, &page);
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
@@ -1498,6 +1565,7 @@ mod tests {
             duration_ms: Some(5000),
             timed_out: Some(true),
             next_page: None,
+            _profile: None,
         };
         let resp = format_page_response(&id, &page);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -1515,6 +1583,7 @@ mod tests {
             duration_ms: None,
             timed_out: None,
             next_page: Some("abc123".to_string()),
+            _profile: None,
         };
         let resp = format_page_response(&id, &page);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -1533,6 +1602,7 @@ mod tests {
             duration_ms: None,
             timed_out: None,
             next_page: Some("tok123".to_string()),
+            _profile: None,
         };
         let resp = format_page_response(&id, &page);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
