@@ -43,10 +43,10 @@ The gateway is a persistent HTTP server. No SSH handshake per command.
 
 | Method | Latency | Notes |
 |--------|---------|-------|
-| **Commando** | **~18ms** | HTTP POST → Cap'n Proto RPC |
-| **SSH** | **~1050ms** | SSH handshake + command per invocation |
+| **Commando CLI** | **~107ms** | CLI → HTTP → gateway → Cap'n Proto RPC |
+| **SSH + pct exec** | **~1073ms** | SSH handshake + pct exec per invocation |
 
-**~58x faster.** Measured on LAN with `hostname` as the test command.
+**~10x faster.** Measured on LAN with `hostname` as the test command (average of 10 runs, v0.5.5).
 
 For an AI agent executing dozens of commands per task, this is the difference between a responsive workflow and waiting.
 
