@@ -43,10 +43,11 @@ The gateway is a persistent HTTP server. No SSH handshake per command.
 
 | Method | Latency | Notes |
 |--------|---------|-------|
-| **Commando CLI** | **~107ms** | CLI → HTTP → gateway → Cap'n Proto RPC |
-| **SSH + pct exec** | **~1073ms** | SSH handshake + pct exec per invocation |
+| **Commando (CLI or MCP)** | **~110ms** | HTTP → gateway → Cap'n Proto RPC |
+| **SSH direct** | **~390ms** | SSH handshake per invocation |
+| **SSH + pct exec** | **~1065ms** | SSH handshake + Proxmox pct exec |
 
-**~10x faster.** Measured on LAN with `hostname` as the test command (average of 10 runs, v0.5.5).
+**3-10x faster** depending on target type. Measured on LAN with `hostname` (average of 10 runs, v0.5.5). CLI and MCP execution modes have identical performance.
 
 For an AI agent executing dozens of commands per task, this is the difference between a responsive workflow and waiting.
 
