@@ -279,10 +279,13 @@ Type=simple
 ExecStart=/usr/local/bin/commando-agent --config /etc/commando/agent.toml
 Restart=always
 RestartSec=5
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+Note: `ProtectSystem`, `ProtectHome`, and `PrivateTmp` are intentionally omitted — systemd's sandboxing directives apply to all child processes, not just the agent itself. Since the agent's purpose is executing arbitrary root commands, these restrictions break legitimate operations (`apt-get install`, shared `/tmp` access, etc.). `NoNewPrivileges=yes` is the only hardening kept — it prevents privilege escalation beyond root without restricting what root can do.
 
 **Process execution flow:**
 1. Accept TCP connection (with `SO_KEEPALIVE` enabled)
@@ -520,8 +523,8 @@ Last updated: 2026-03-14. Feedback sources: homelab user review, DevOps/SRE revi
 
 ### Implemented
 
-- ~~**Streaming output:**~~ Paginated output via `execStream` RPC + `commando_output` MCP tool. See `docs/superpowers/specs/2026-03-12-streaming-exec-design.md`.
-- ~~**CLI + REST API:**~~ `commando exec/list/ping` CLI with REST endpoints on gateway. See `docs/superpowers/specs/2026-03-14-commando-cli-design.md`.
+- ~~**Streaming output:**~~ Paginated output via `execStream` RPC + `commando_output` MCP tool.
+- ~~**CLI + REST API:**~~ `commando exec/list/ping` CLI with REST endpoints on gateway.
 
 ### High Priority
 

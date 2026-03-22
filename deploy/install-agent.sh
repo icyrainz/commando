@@ -82,8 +82,6 @@ ExecStart=/usr/local/bin/commando-agent --config /etc/commando/agent.toml
 Restart=always
 RestartSec=5
 NoNewPrivileges=yes
-ProtectSystem=true
-PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
