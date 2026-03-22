@@ -105,7 +105,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
     cat > "$CONFIG_FILE" <<TOML
 bind = "$DEFAULT_BIND"
 port = 9876
-shell = "sh"
+shell = "bash"
 psk = "$PSK"
 TOML
     chmod 600 "$CONFIG_FILE"
