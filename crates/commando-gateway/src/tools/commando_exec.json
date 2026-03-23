@@ -18,7 +18,7 @@
       },
       "timeout": {
         "type": "number",
-        "description": "Timeout in seconds (default: 60)"
+        "description": "Command timeout in seconds (default: 300). Increase for long-running operations like bulk disk maintenance, large backups, or commands iterating over many targets."
       },
       "env": {
         "type": "object",
