@@ -167,7 +167,7 @@ fn default_agent_port() -> u16 {
     9876
 }
 fn default_timeout() -> u32 {
-    60
+    300
 }
 fn default_connect_timeout() -> u64 {
     5
@@ -320,7 +320,7 @@ token_secret = "xxxx"
 "#;
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.agent.default_port, 9876);
-        assert_eq!(config.agent.default_timeout_secs, 60);
+        assert_eq!(config.agent.default_timeout_secs, 300);
         assert_eq!(config.agent.connect_timeout_secs, 5);
         assert_eq!(config.agent.max_concurrent_per_target, 4);
         assert!(config.targets.is_empty());
