@@ -19,7 +19,7 @@
 
 [agent]
 default_port = 9876
-default_timeout_secs = 60
+default_timeout_secs = 300
 connect_timeout_secs = 5
 max_concurrent_per_target = 4
 

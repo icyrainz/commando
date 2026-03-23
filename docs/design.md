@@ -333,7 +333,7 @@ discovery_interval_secs = 60
 
 [agent]
 default_port = 9876
-default_timeout_secs = 60
+default_timeout_secs = 300
 connect_timeout_secs = 5       # TCP connect timeout to agents
 max_concurrent_per_target = 4  # semaphore limit per agent
 
