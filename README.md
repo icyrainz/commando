@@ -277,16 +277,38 @@ shell = "sh"
 tags = ["database"]
 ```
 
-## MCP-Only Mode (Optional)
+## Execution Modes
 
-If you prefer not to install the CLI and want Claude Code to execute commands entirely through MCP tools, set the execution mode in `gateway.toml`:
+The gateway supports two execution modes, controlled by `execution_mode` in `gateway.toml`:
+
+### CLI Mode (Default)
+
+```toml
+[server]
+execution_mode = "cli"   # this is the default, can be omitted
+```
+
+Only `commando_list` and `commando_ping` are exposed as MCP tools. Command execution goes through the `commando exec` CLI via Bash. This is the recommended mode — CLI output streams natively in the terminal with no size limits or token overhead.
+
+**Requires:** CLI installed on the machine running Claude Code (see [Install the CLI](#3-install-the-cli)).
+
+### MCP Mode
 
 ```toml
 [server]
 execution_mode = "mcp"
 ```
 
-This exposes `commando_exec` and `commando_output` as MCP tools (default is `"cli"` which hides them). The trade-off: Claude Code's MCP output rendering may truncate long command output. The CLI avoids this by using native Bash rendering.
+Additionally exposes `commando_exec` and `commando_output` as MCP tools. Claude Code executes commands entirely through MCP — no CLI install needed.
+
+**Trade-off:** MCP tool output gets loaded into the LLM context window, which can truncate large outputs and waste tokens. Use this mode when you can't install the CLI (e.g., cloud-hosted agents) or prefer a simpler setup.
+
+### Switching Modes
+
+1. Edit `execution_mode` in `/etc/commando/gateway.toml`
+2. Restart the gateway: `cd ~/commando && docker compose restart`
+
+No agent-side changes needed — the mode only affects which MCP tools the gateway advertises to Claude Code.
 
 ## Proxmox Auto-Discovery
 
