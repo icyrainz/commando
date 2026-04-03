@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -6,6 +7,17 @@ use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
 use crate::wrapper;
+
+const FALLBACK_HOME: &str = "/root";
+const FALLBACK_USER: &str = "root";
+
+fn current_user_env() -> (PathBuf, String) {
+    nix::unistd::User::from_uid(nix::unistd::getuid())
+        .ok()
+        .flatten()
+        .map(|u| (u.dir, u.name))
+        .unwrap_or_else(|| (PathBuf::from(FALLBACK_HOME), FALLBACK_USER.to_string()))
+}
 
 pub struct ExecOpts {
     pub shell: String,
@@ -38,9 +50,10 @@ fn build_command(
     };
 
     // Clean environment — do NOT inherit agent's env
+    let (home, user) = current_user_env();
     cmd.env_clear();
-    cmd.env("HOME", "/root");
-    cmd.env("USER", "root");
+    cmd.env("HOME", &home);
+    cmd.env("USER", &user);
     cmd.env(
         "PATH",
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -358,6 +371,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn exec_env_home_and_user_match_current_uid() {
+        let (expected_home, expected_user) = current_user_env();
+        let result = execute("echo $HOME:$USER", "", 60, &[], &default_opts())
+            .await
+            .unwrap();
+        let output = String::from_utf8_lossy(&result.stdout).trim().to_string();
+        assert_eq!(
+            output,
+            format!("{}:{}", expected_home.display(), expected_user),
+        );
     }
 
     #[tokio::test]

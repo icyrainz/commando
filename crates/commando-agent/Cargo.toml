@@ -22,3 +22,4 @@ socket2 = "0.5"
 uuid = { version = "1", features = ["v4"] }
 gethostname = "0.5"
 shell-words = "1"
+nix = { version = "0.29", features = ["user"] }
