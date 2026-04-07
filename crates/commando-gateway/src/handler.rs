@@ -113,9 +113,9 @@ pub fn process_tools_list(request: &Value, expose_exec: bool) -> Value {
     let mut list_tool: Value =
         serde_json::from_str(include_str!("tools/commando_list.json")).unwrap();
     list_tool["description"] = if expose_exec {
-        "List all registered targets with their status, shell, tags, and reachability.".into()
+        "List managed Commando targets with their status, shell, tags, and reachability. Prefer commando_exec for command execution on these targets.".into()
     } else {
-        "List all available commando targets with their status and IP. To execute commands on a target, use the Bash tool: commando exec <target> '<command>'".into()
+        "List managed Commando targets with their status, shell, tags, and reachability. Use the Bash tool to run: commando exec <target> '<command>'".into()
     };
 
     let ping_tool: Value = serde_json::from_str(include_str!("tools/commando_ping.json")).unwrap();
@@ -904,9 +904,15 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"commando_list"));
         assert!(names.contains(&"commando_ping"));
-        // commando_list description should mention CLI
-        let list_desc = tools[0]["description"].as_str().unwrap();
+        // commando_list description should point CLI clients at Bash/commando exec
+        let list_desc = tools
+            .iter()
+            .find(|tool| tool["name"] == "commando_list")
+            .and_then(|tool| tool["description"].as_str())
+            .unwrap();
+        assert!(list_desc.contains("Bash tool"));
         assert!(list_desc.contains("commando exec"));
+        assert!(!list_desc.contains("CLI mode"));
     }
 
     #[test]
@@ -925,6 +931,23 @@ mod tests {
         assert!(names.contains(&"commando_ping"));
         assert!(names.contains(&"commando_exec"));
         assert!(names.contains(&"commando_output"));
+
+        // commando_list description should point MCP clients at commando_exec
+        let list_desc = tools
+            .iter()
+            .find(|tool| tool["name"] == "commando_list")
+            .and_then(|tool| tool["description"].as_str())
+            .unwrap();
+        assert!(list_desc.contains("Prefer commando_exec"));
+        assert!(!list_desc.contains("MCP exec mode"));
+
+        let exec_desc = tools
+            .iter()
+            .find(|tool| tool["name"] == "commando_exec")
+            .and_then(|tool| tool["description"].as_str())
+            .unwrap();
+        assert!(exec_desc.contains("Preferred way"));
+        assert!(!exec_desc.contains("MCP exec mode"));
     }
 
     #[test]

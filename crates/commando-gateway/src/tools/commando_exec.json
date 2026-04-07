@@ -1,6 +1,6 @@
 {
   "name": "commando_exec",
-  "description": "Execute a shell command on a target machine. If the response includes a next_page field, the command is still running — call commando_output with the page token to get more output.",
+  "description": "Preferred way to execute a shell command on a managed Commando target. If the response includes a next_page field, the command is still running — call commando_output with the page token to get more output.",
   "inputSchema": {
     "type": "object",
     "properties": {
