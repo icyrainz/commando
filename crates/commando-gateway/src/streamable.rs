@@ -294,4 +294,31 @@ mod tests {
         assert_eq!(next_page_token(Some(&v)), None);
         assert_eq!(next_page_token(None), None);
     }
+
+    fn page(exit_code: Option<i32>, next_page: Option<&str>) -> crate::types::ExecPage {
+        crate::types::ExecPage {
+            stdout: "out".to_string(),
+            stderr: String::new(),
+            exit_code,
+            duration_ms: exit_code.map(|_| 3),
+            timed_out: None,
+            truncated: false,
+            next_page: next_page.map(str::to_string),
+            error: None,
+            _profile: None,
+        }
+    }
+
+    #[test]
+    fn next_page_token_from_real_formatter_running_page() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let v = crate::handler::format_page_response(&json!(1), &page(None, Some(token)));
+        assert_eq!(next_page_token(Some(&v)).as_deref(), Some(token));
+    }
+
+    #[test]
+    fn next_page_token_none_from_real_formatter_final_page() {
+        let v = crate::handler::format_page_response(&json!(1), &page(Some(0), None));
+        assert_eq!(next_page_token(Some(&v)), None);
+    }
 }

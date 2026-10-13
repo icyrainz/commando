@@ -13,7 +13,7 @@ use crate::audit::{AuditLogger, ExecAudit};
 use crate::config::{GatewayConfig, StreamingConfig};
 use crate::registry::Registry;
 use crate::rpc;
-use crate::session::SessionMap;
+use crate::session::{SessionMap, StreamExecResult};
 use crate::types::*;
 
 /// Helper for collecting stage timings in profiling mode.
@@ -579,7 +579,7 @@ async fn handle_exec(
 }
 
 /// Convert a page response into MCP tool result text.
-fn format_page_response(id: &Value, page: &ExecPage) -> Value {
+pub(crate) fn format_page_response(id: &Value, page: &ExecPage) -> Value {
     let mut text = String::new();
     if !page.stdout.is_empty() {
         text.push_str(&page.stdout);
@@ -668,6 +668,19 @@ impl Drop for PageGuard<'_> {
     }
 }
 
+/// The fields of a finished command that a final page carries.
+type FinalResult = (i32, u64, bool, bool, Option<String>);
+
+fn final_result(r: &StreamExecResult) -> FinalResult {
+    (
+        r.exit_code,
+        r.duration_ms,
+        r.timed_out,
+        r.truncated,
+        r.error.clone(),
+    )
+}
+
 async fn build_page_inner(
     session_map: &Rc<RefCell<SessionMap>>,
     token: &str,
@@ -753,15 +766,7 @@ async fn build_page_inner(
             .get_by_token(token)
             .ok_or_else(|| "session lost during drain".to_string())?;
         if session.completed && !has_remaining {
-            session.exec_result.as_ref().map(|r| {
-                (
-                    r.exit_code,
-                    r.duration_ms,
-                    r.timed_out,
-                    r.truncated,
-                    r.error.clone(),
-                )
-            })
+            session.exec_result.as_ref().map(final_result)
         } else {
             None
         }
@@ -780,15 +785,7 @@ async fn build_page_inner(
                 let map = session_map.borrow();
                 match map.get_by_token(token) {
                     Some(s) if s.completed && s.total_buffered() == 0 => {
-                        exec_result_data = s.exec_result.as_ref().map(|r| {
-                            (
-                                r.exit_code,
-                                r.duration_ms,
-                                r.timed_out,
-                                r.truncated,
-                                r.error.clone(),
-                            )
-                        });
+                        exec_result_data = s.exec_result.as_ref().map(final_result);
                         break;
                     }
                     Some(s) => s.notify.clone(),

@@ -234,7 +234,7 @@ Claude Code now has:
 
 **Why the split?** MCP tools handle discovery — Claude Code sees available targets and can health-check them without needing to know hostnames or IPs. The CLI handles execution via Bash because MCP tool output gets loaded into the LLM context window, which truncates large outputs and wastes tokens. The CLI streams output natively in the terminal with no size limits.
 
-**Cancellation:** a command runs only while its client is attached. Ctrl-C in the CLI or a dropped HTTP connection cancels the remote command. A session that is not polled for `session_idle_timeout_secs` (default 60) is cancelled. A client that keeps polling keeps the command alive, however long it runs. The disconnect reaches the gateway only if every hop passes it on (a reverse proxy such as Caddy or nginx does by default; a buffering layer may not); the idle timeout is the fallback.
+**Cancellation:** a command runs only while its client is attached. Ctrl-C in the CLI or a dropped HTTP connection cancels the remote command. A session that is not polled for `session_idle_timeout_secs` (default 60) is cancelled. A client that keeps polling keeps the command alive, however long it runs. The disconnect reaches the gateway only if every hop passes it on (a reverse proxy such as Caddy or nginx does by default; a buffering layer may not); the idle timeout is the fallback. Cancel-on-disconnect and the buffer cap need agent 0.6.0 or later. An older agent keeps the command running when its client goes away, and the audit log still records `aborted`.
 
 ### 5. Verify
 
@@ -365,6 +365,7 @@ It preserves existing config and only replaces the binary + service file.
 ```bash
 cd ~/commando && docker compose pull && docker compose up -d
 ```
+Restarting the gateway closes every agent connection, so every command that is running is cancelled. Deploy the gateway when no command is running.
 
 ## Security
 

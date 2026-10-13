@@ -147,5 +147,5 @@ Pulls the Docker image from `ghcr.io/icyrainz/commando-gateway` and restarts the
 4. Wait for CI Release workflow: `gh run watch <id> --exit-status`
 5. Update LXC agents: `COMMANDO_VERSION=vX.Y.Z ./deploy/update-agents.sh <proxmox-node> ...`
 6. Update standalone agents: `ssh root@<host> "curl -sL .../install-agent.sh | COMMANDO_VERSION=vX.Y.Z bash"`
-7. Update gateway: pull latest Docker image and restart on the gateway LXC
+7. Update gateway: pull latest Docker image and restart on the gateway LXC. Restarting the gateway closes every agent connection, so every command that is running is cancelled; deploy the gateway when no command is running
 8. Verify: `commando_ping` a few targets to confirm version

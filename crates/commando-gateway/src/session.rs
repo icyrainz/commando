@@ -59,6 +59,16 @@ pub struct Session {
 }
 
 impl Session {
+    /// Wake pages waiting on this session so they fail now, not at their
+    /// deadline, then abort the rpc task.
+    fn shut_down(&mut self) {
+        self.notify.notify_waiters();
+        self.drained.notify_waiters();
+        if let Some(task) = self.rpc_task.take() {
+            task.abort();
+        }
+    }
+
     fn new() -> Self {
         Self {
             stdout_buffer: VecDeque::new(),
@@ -195,12 +205,7 @@ impl SessionMap {
     pub fn cancel_by_token(&mut self, token: &str) -> bool {
         match self.remove_by_token(token) {
             Some(mut session) => {
-                // Wake pages waiting on this session so they fail now, not at their deadline.
-                session.notify.notify_waiters();
-                session.drained.notify_waiters();
-                if let Some(task) = session.rpc_task.take() {
-                    task.abort();
-                }
+                session.shut_down();
                 true
             }
             None => false,
@@ -218,11 +223,7 @@ impl SessionMap {
 
         for session_id in &expired_ids {
             if let Some(mut session) = self.sessions.remove(session_id) {
-                session.notify.notify_waiters();
-                session.drained.notify_waiters();
-                if let Some(task) = session.rpc_task.take() {
-                    task.abort();
-                }
+                session.shut_down();
             }
         }
 

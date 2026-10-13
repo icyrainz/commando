@@ -171,6 +171,11 @@ async fn cmd_exec(
         if let Some(error) = error {
             eprintln!("error: {error}");
         }
+        if exit_code.is_some() {
+            for note in final_notes(&json) {
+                eprintln!("{note}");
+            }
+        }
         if error.is_some() || exit_code.is_some() {
             if profile {
                 let t_end = Instant::now();
@@ -220,6 +225,18 @@ async fn cmd_exec(
         };
         page_count += 1;
     }
+}
+
+/// Notes printed on stderr after the output of a final page.
+fn final_notes(page: &serde_json::Value) -> Vec<&'static str> {
+    let mut notes = Vec::new();
+    if page["timed_out"].as_bool().unwrap_or(false) {
+        notes.push("[timed out]");
+    }
+    if page["truncated"].as_bool().unwrap_or(false) {
+        notes.push("[output truncated]");
+    }
+    notes
 }
 
 fn print_profile(
@@ -330,4 +347,33 @@ async fn cmd_ping(client: &reqwest::Client, base_url: &str, api_key: &str, targe
     let version = json["version"].as_str().unwrap_or("?");
     println!("pong from {target} in {latency}ms (v{version})");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn final_notes_neither() {
+        assert!(final_notes(&json!({"exit_code": 0})).is_empty());
+    }
+
+    #[test]
+    fn final_notes_timed_out() {
+        let page = json!({"exit_code": 124, "timed_out": true});
+        assert_eq!(final_notes(&page), ["[timed out]"]);
+    }
+
+    #[test]
+    fn final_notes_truncated() {
+        let page = json!({"exit_code": 0, "truncated": true});
+        assert_eq!(final_notes(&page), ["[output truncated]"]);
+    }
+
+    #[test]
+    fn final_notes_both() {
+        let page = json!({"exit_code": 0, "timed_out": true, "truncated": true});
+        assert_eq!(final_notes(&page), ["[timed out]", "[output truncated]"]);
+    }
 }

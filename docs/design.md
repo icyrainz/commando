@@ -199,7 +199,7 @@ A discovery cycle does not replace the whole registry. A node that answers repla
 
 ## MCP Tools
 
-The gateway exposes three tools to Claude Code:
+The gateway exposes four tools to Claude Code:
 
 ### `commando_exec`
 
@@ -210,7 +210,7 @@ Execute a command on a target machine.
 | `target` | string | yes | Fully qualified target name (e.g., `node-1/my-app`, `my-desktop`) |
 | `command` | string | yes | Shell command to execute |
 | `work_dir` | string | no | Working directory (default: home dir) |
-| `timeout` | number | no | Timeout in seconds (default: 60) |
+| `timeout` | number | no | Timeout in seconds (default: 300) |
 | `env` | object | no | Additional environment variables (e.g., `{"PGPASSWORD": "xxx"}`) merged with the clean base env |
 
 **Returns:** stdout, stderr, exit code, duration, timed_out, truncated
@@ -239,6 +239,16 @@ Health check a specific agent.
 
 **Returns:** hostname, uptime, shell, version, reachability
 
+### `commando_output`
+
+Fetch the next page of a running `commando_exec` command.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `page` | string | yes | The `next_page` token from the previous page |
+
+**Returns:** the same fields as `commando_exec`. A page that has `next_page` and no exit code means the command still runs.
+
 ## Components
 
 ### Commando Agent (`commando-agent`)
@@ -252,7 +262,7 @@ A single static Rust binary (~2-4MB) that runs on every target machine.
 - Execute commands using the configured shell (`sh -c`, `bash -c`, `fish -c`). Any shell configured in `agent.toml` must support the `-c <command>` interface
 - Return stdout, stderr, exit code, and timing
 - In the non-streaming `exec` RPC, cap buffered stdout/stderr at `max_output_bytes` (default 128KB). If either stream exceeds the limit, keep the **last** `max_output_bytes` (tail truncation) and set `truncated = true` in the response. The gateway does not use `exec`; it uses `exec_stream`, which is not cut at 128KB. Streaming is bounded by the agent's flow control (at most 16 `receive` calls in flight; the agent stops reading the command's output until the oldest is answered) and by the gateway's `[streaming] session_buffer_max_bytes` (default 8 MiB), which holds back the answers while a session is over its cap. An agent without flow control (v0.5.14 and earlier) is not bounded by the cap. Back-pressure has a cost: when a client reads slower than the command writes and the buffer is full, the agent stops reading, the command blocks on its output, and its timeout keeps running, so it can end as `timed_out` (exit 137) although it would finish quickly with a fast reader. While the gateway itself holds `receive` answers, the `exec_stream` call deadline is extended by one grace period at a time; the idle cleanup bounds a client that stops polling. Redirect verbose output to a file on the target when the client will not read it. When output is lost at the command deadline, the agent sets `truncated` on the `exec_stream` result and the gateway passes it on
-- On timeout: send SIGTERM to the process group, wait for the leader to exit for at most 5s, then SIGKILL the group and reap. Return buffered stdout/stderr with `timedOut = true`, exit code 137. A command is also killed (same SIGTERM, 5s, SIGKILL) when its client goes away: the call is aborted or the connection closes
+- On timeout: send SIGTERM to the process group, wait for the leader to exit for at most 5s, then SIGKILL the group and reap. Return buffered stdout/stderr with `timedOut = true`, exit code 137. A command is also killed (same SIGTERM, 5s, SIGKILL) when its client goes away: the call is aborted or the connection closes. This and the buffer cap need agent 0.6.0 or later; an older agent keeps the command running when its client goes away, and the audit log still records `aborted`
 - Respond to ping requests with hostname, uptime, shell, and agent version
 
 **Configuration** (`/etc/commando/agent.toml`, must be `chmod 600 root:root` — contains the agent PSK):
@@ -298,7 +308,7 @@ Note: `ProtectSystem`, `ProtectHome`, and `PrivateTmp` are intentionally omitted
    - `LANG=C.UTF-8`, `TERM=dumb`, `NO_COLOR=1` (`TERM=dumb` and `NO_COLOR` are intentional for non-interactive exec: disables pagers, color escape sequences, and curses output that would pollute captured stdout)
 6. Wait for completion (with timeout)
 7. If timeout expires: SIGTERM the entire process group (`kill(-pgid, SIGTERM)`), wait for the leader to exit for at most 5s, then SIGKILL the group and reap the leader, set `timedOut = true`
-8. If the client goes away while a child process is running (the call is aborted, or the RPC connection drops), the dropped call future kills the process group: SIGTERM at once, SIGKILL after 5s if the group still exists, and the leader is reaped. The `setsid()` process group ensures all child processes (e.g., subprocesses spawned by `docker compose`) are cleaned up — no orphans. When the leader exits normally, the guard is disarmed: a background child the command started (`nohup x &`) keeps running. After the leader exits, the agent waits for more pipe data for 200 ms in total and reads at most one pipe capacity more per stream (64 KiB on kernels with 4 KiB pages, up to 1 MiB on larger pages), so a background child that holds the pipe does not block the call. The agent then keeps discarding that child's output, so the child is not killed by SIGPIPE; it still dies when the agent service restarts
+8. If the client goes away while a child process is running (the call is aborted, or the RPC connection drops), the dropped call future kills the process group: SIGTERM at once, SIGKILL after 5s if the group still exists, and the leader is reaped. The `setsid()` process group ensures all child processes (e.g., subprocesses spawned by `docker compose`) are cleaned up — no orphans. When the leader exits normally, the guard is disarmed: a background child the command started (`nohup x &`) keeps running. After the leader exits, the agent waits for more pipe data for 200 ms in total and reads at most one pipe capacity more per stream (64 KiB on kernels with 4 KiB pages, up to 1 MiB on larger pages), so a background child that holds the pipe does not block the call. The agent then keeps discarding that child's output, so the child is not killed by SIGPIPE; it still dies when the agent service restarts. One exception: if the call is dropped inside that 200 ms drain after the command exited, the pipes close and a background child that writes can get SIGPIPE
 9. Return `ExecResult` with captured stdout/stderr, exit code, timing, and timeout flag
 
 ### Commando Gateway (`commando-gateway`)
@@ -310,7 +320,7 @@ An MCP server that bridges Claude Code to the agent network.
 - Maintain the target registry (auto-discovery + manual targets from `gateway.toml`)
 - Route `commando_exec` calls to the correct agent via Cap'n Proto RPC — converts the MCP `env` object (`{"KEY": "val"}`) to Cap'n Proto `List(EnvVar)` format
 - Enforce per-target concurrency limits via a configurable semaphore (default: 4 concurrent execs per agent)
-- Provide `commando_list` and `commando_ping` tools
+- Provide `commando_list`, `commando_ping` and `commando_output` tools
 
 **Connection model:** Connect-per-request. Each `commando_exec` or `commando_ping` call opens a fresh TCP connection to the target agent, authenticates, executes, and closes. This is simple and avoids stale connection bugs. The latency overhead (~1-5ms on LAN for TCP handshake + auth) is negligible for human-initiated commands. TCP connect timeout is `connect_timeout_secs` (default: 5s) — if the agent host is unreachable, the call fails fast rather than hanging for the OS default (~2 min).
 
@@ -539,7 +549,6 @@ Last updated: 2026-03-14. Feedback sources: homelab user review, DevOps/SRE revi
 - **Non-root execution mode:** Configurable `user` field per target in `gateway.toml`. Agent runs as root but `su`s to the specified user before executing commands. Root should require explicit config. *(Requested by: homelab, DevOps reviewers)*
 - **Per-caller authorization:** Replace single API key with per-user credentials (JWT, mTLS, or OIDC). Add target-level ACLs. Required for team use. *(Requested by: DevOps reviewer)*
 - **Target-scoped environment presets:** Per-target `env` in `gateway.toml` (e.g., `KUBECONFIG`, `DOCKER_HOST`) injected into every command. Saves tokens by eliminating repetitive `--env` flags. *(Requested by: AI tooling reviewer)*
-- **CLI read_timeout bug:** The CLI's 30s `read_timeout` can timeout on commands that take >30s before producing any output. Should be configurable or set to `command_timeout + margin`. *(Found by: AI tooling reviewer)*
 
 ### Low Priority / Nice to Have
 
@@ -552,4 +561,4 @@ Last updated: 2026-03-14. Feedback sources: homelab user review, DevOps/SRE revi
 - **Graceful agent shutdown:** On SIGTERM, SIGTERM all active child process groups (5s grace + SIGKILL) before exiting
 - **Version negotiation:** `agentVersion` compatibility checks in gateway to detect incompatible agents
 - ~~**Rename `expose_exec_tool`:**~~ **Done** — renamed to `execution_mode` ("cli" or "mcp")
-- **Binary checksum verification:** Install scripts should verify checksums or signatures of downloaded binaries
+- ~~**Binary checksum verification:**~~ **Done** — the release publishes `SHA256SUMS`; the install and update scripts verify it
