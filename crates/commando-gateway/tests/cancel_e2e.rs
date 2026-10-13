@@ -315,11 +315,11 @@ fn polling_client_keeps_command_alive_past_idle_timeout() {
         let agent = start_agent(1).await;
         let gw = start_gateway(agent.port, 1, 2).await;
 
+        let started = Instant::now();
         let mut page = gw
             .post_exec("sleep 5; echo done".to_string())
             .await
             .unwrap();
-        let started = Instant::now();
         let mut stdout = String::new();
         loop {
             stdout.push_str(page["stdout"].as_str().unwrap_or(""));

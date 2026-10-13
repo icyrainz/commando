@@ -234,7 +234,7 @@ Claude Code now has:
 
 **Why the split?** MCP tools handle discovery — Claude Code sees available targets and can health-check them without needing to know hostnames or IPs. The CLI handles execution via Bash because MCP tool output gets loaded into the LLM context window, which truncates large outputs and wastes tokens. The CLI streams output natively in the terminal with no size limits.
 
-**Cancellation:** a command runs only while its client is attached. Ctrl-C in the CLI or a dropped HTTP connection cancels the remote command. A session that is not polled for `session_idle_timeout_secs` (default 60) is cancelled. A client that keeps polling keeps the command alive, however long it runs. The disconnect reaches the gateway only if every hop passes it on (a reverse proxy such as Caddy or nginx does by default; a buffering layer may not); the idle timeout is the fallback. Cancel-on-disconnect and the buffer cap need agent 0.6.0 or later. An older agent keeps the command running when its client goes away, and the audit log still records `aborted`.
+**Cancellation:** a command runs only while its client is attached. Ctrl-C in the CLI or a dropped HTTP connection cancels the remote command. A session that is not polled for `session_idle_timeout_secs` (default 60) is cancelled. A client that keeps polling keeps the command alive until the command's own timeout (default 300 s), when the agent kills it. The CLI polls only while it can write its output, so a CLI whose stdout is not being read (for example piped into a pager that is left idle) stops polling, and the command is cancelled after the idle timeout. The disconnect reaches the gateway only if every hop passes it on (a reverse proxy such as Caddy or nginx does by default; a buffering layer may not); the idle timeout is the fallback. Cancel-on-disconnect and the buffer cap need agent 0.6.0 or later. An older agent keeps the command running when its client goes away, and the audit log still records `aborted`.
 
 ### 5. Verify
 
@@ -365,7 +365,7 @@ It preserves existing config and only replaces the binary + service file.
 ```bash
 cd ~/commando && docker compose pull && docker compose up -d
 ```
-Restarting the gateway closes every agent connection, so every command that is running is cancelled. Deploy the gateway when no command is running.
+Restarting the gateway closes every agent connection, so every command that is running on an agent at 0.6.0 or later is cancelled. Deploy the gateway when no command is running.
 
 ## Security
 
@@ -450,7 +450,7 @@ Every command executed through Commando is logged to a JSONL file for accountabi
 - `completed`: the agent returned an exit code. `duration_ms` is the agent's measure.
 - `timed_out`: the command hit its timeout. `exit_code` and the agent's `duration_ms` are present.
 - `rpc_error`: connect, authentication or the RPC failed. `error` has the text. `duration_ms` is the gateway's wall time.
-- `aborted`: the gateway dropped the RPC task, for example when the session expired because no client polled. `duration_ms` is the gateway's wall time. This is the gateway's statement that it dropped the task, not a report from the agent; the agent kills the command when that connection closes.
+- `aborted`: the gateway dropped the RPC task, for example when the session expired because no client polled. `duration_ms` is the gateway's wall time. This is the gateway's statement that it dropped the task, not a report from the agent; with agent 0.6.0 or later, the agent kills the command when that connection closes.
 
 An `end` event also has `"truncated":true` when the agent lost output at the command deadline.
 

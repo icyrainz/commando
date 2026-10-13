@@ -1,7 +1,7 @@
 # Commando — Zero-Escaping Command Relay for Homelab
 
 **Date:** 2026-03-10
-**Status:** Design approved, pending implementation
+**Status:** Implemented
 
 ## Problem
 
@@ -91,10 +91,8 @@ Claude Code (any workstation)
 
 ## Cap'n Proto Schema
 
-The schema file ID must be globally unique. Generate with `capnp id` before first use.
-
 ```capnp
-@0xb7c5e6a2d3f41890;  # PLACEHOLDER — replace with output of `capnp id`
+@0xb0eb2ca2d3b76d2a;
 
 # Capability-based auth: the bootstrap interface is Authenticator. The client
 # requests a challenge nonce, then proves PSK knowledge via HMAC — the PSK
@@ -117,6 +115,14 @@ interface Authenticator {
 interface CommandAgent {
   exec @0 (request :ExecRequest) -> (result :ExecResult);
   ping @1 () -> (pong :PingResult);
+  execStream @2 (request :ExecRequest, receiver :OutputReceiver)
+    -> (result :ExecResult);
+}
+
+interface OutputReceiver {
+  receive @0 (data :Data, stream :UInt8) -> ();
+  # stream: 0 = stdout, 1 = stderr
+  # Agent calls this as output arrives from the child process.
 }
 
 struct ExecRequest {
@@ -143,6 +149,7 @@ struct ExecResult {
   timedOut @4 :Bool;      # True if the process was killed due to timeout
   truncated @5 :Bool;     # True if output was truncated due to size limit
   requestId @6 :Text;     # Echoed from ExecRequest for cross-component log correlation
+  profilerJson @7 :Text;  # Optional JSON-encoded timing breakdown (always populated by the agent)
 }
 
 struct PingResult {
@@ -258,7 +265,7 @@ A single static Rust binary (~2-4MB) that runs on every target machine.
 **Responsibilities:**
 - Listen on configured bind address and TCP port `9876` for Cap'n Proto RPC connections. Enable `SO_KEEPALIVE` on accepted sockets so the agent detects dead connections promptly during long-running commands — this ensures process group cleanup (step 8) fires even if the gateway crashes without a clean TCP close
 - Authenticate incoming connections via pre-shared key (PSK) using the `Authenticator` capability interface. On success, returns a `CommandAgent` capability — the client cannot call `exec` or `ping` without it. Simple rate limiting for v1: after 3 consecutive auth failures from the same peer IP, delay responses by 1 second. Per-IP failure counters are held in an in-memory map and cleared on successful auth from that IP
-- Enforce a local concurrency limit (`max_concurrent`, default: 8) using an RAII guard tied to connection lifetime — the guard is acquired when an `exec` call starts and released when the connection closes (whether the exec completes normally, times out, or the connection drops). This ensures the counter never leaks. The agent rejects `exec` calls with an RPC error when the limit is reached. This is the true backstop: it protects the host regardless of how many gateways connect. The gateway's `max_concurrent_per_target` (default: 4) is a courtesy limit per gateway instance — multiple Claude Code sessions can collectively reach the agent's hard limit
+- Enforce a local concurrency limit (`max_concurrent`, default: 8) using an RAII guard tied to connection lifetime — the guard is acquired when an `exec` call starts and released when that `exec` call ends (whether the exec completes normally, times out, or the connection drops). This ensures the counter never leaks. The agent rejects `exec` calls with an RPC error when the limit is reached. This is the true backstop: it protects the host regardless of how many gateways connect. The gateway's `max_concurrent_per_target` (default: 4) is a courtesy limit per gateway instance — multiple Claude Code sessions can collectively reach the agent's hard limit
 - Execute commands using the configured shell (`sh -c`, `bash -c`, `fish -c`). Any shell configured in `agent.toml` must support the `-c <command>` interface
 - Return stdout, stderr, exit code, and timing
 - In the non-streaming `exec` RPC, cap buffered stdout/stderr at `max_output_bytes` (default 128KB). If either stream exceeds the limit, keep the **last** `max_output_bytes` (tail truncation) and set `truncated = true` in the response. The gateway does not use `exec`; it uses `exec_stream`, which is not cut at 128KB. Streaming is bounded by the agent's flow control (at most 16 `receive` calls in flight; the agent stops reading the command's output until the oldest is answered) and by the gateway's `[streaming] session_buffer_max_bytes` (default 8 MiB), which holds back the answers while a session is over its cap. An agent without flow control (v0.5.14 and earlier) is not bounded by the cap. Back-pressure has a cost: when a client reads slower than the command writes and the buffer is full, the agent stops reading, the command blocks on its output, and its timeout keeps running, so it can end as `timed_out` (exit 137) although it would finish quickly with a fast reader. While the gateway itself holds `receive` answers, the `exec_stream` call deadline is extended by one grace period at a time; the idle cleanup bounds a client that stops polling. Redirect verbose output to a file on the target when the client will not read it. When output is lost at the command deadline, the agent sets `truncated` on the `exec_stream` result and the gateway passes it on
@@ -326,7 +333,7 @@ An MCP server that bridges Claude Code to the agent network.
 
 **Error handling:** Before connecting, the gateway validates that the target exists in the registry and has a PSK configured in `[agent.psk]`. Missing targets return an MCP error: `"unknown target: <name>"`. Targets discovered via Proxmox but without a PSK return: `"no PSK configured for target: <name>"`. This makes unconfigured agents visible without silent failures.
 
-**Runtime:** The gateway uses a single-threaded tokio runtime (`tokio::runtime::Builder::new_current_thread()`). This sidesteps `capnp-rpc`'s `!Send` constraint entirely — `RpcSystem` uses `Rc` internally, but on a single-threaded runtime no `Send` bound is required. Concurrent MCP requests (e.g., two `commando_exec` calls) are handled via async I/O on the single thread, which is sufficient since all work is I/O-bound (waiting on agent TCP responses). Each Claude Code instance launches its own gateway process via SSH, so there is no cross-instance contention.
+**Runtime:** The gateway uses a single-threaded tokio runtime (`tokio::runtime::Builder::new_current_thread()`). This sidesteps `capnp-rpc`'s `!Send` constraint entirely — `RpcSystem` uses `Rc` internally, but on a single-threaded runtime no `Send` bound is required. Concurrent MCP requests (e.g., two `commando_exec` calls) are handled via async I/O on the single thread, which is sufficient since all work is I/O-bound (waiting on agent TCP responses). The gateway is one long-running service (streamable HTTP, optional stdio) shared by all Claude Code instances and the CLI.
 
 **Configuration** (`/etc/commando/gateway.toml`, must be `chmod 600 root:root` — contains all agent PSKs and the Proxmox API token):
 ```toml
