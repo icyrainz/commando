@@ -18,7 +18,7 @@ use crate::audit::AuditLogger;
 use crate::config::GatewayConfig;
 use crate::handler;
 use crate::registry::Registry;
-use crate::session::SessionMap;
+use crate::session::{self, SessionMap};
 
 /// Work item sent from axum handlers (outside LocalSet) to the RPC worker (inside LocalSet).
 pub struct WorkItem {
@@ -51,22 +51,7 @@ pub fn build_app(
     tokio::task::spawn_local(async move {
         let session_map = Rc::new(RefCell::new(SessionMap::new()));
 
-        // Spawn idle cleanup timer
-        let cleanup_map = session_map.clone();
-        let idle_timeout = Duration::from_secs(idle_timeout_secs);
-        tokio::task::spawn_local(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
-            loop {
-                interval.tick().await;
-                let expired = cleanup_map.borrow_mut().cleanup_expired(idle_timeout);
-                if !expired.is_empty() {
-                    info!(
-                        count = expired.len(),
-                        "cleaned up expired streaming sessions"
-                    );
-                }
-            }
-        });
+        session::spawn_idle_cleanup(session_map.clone(), Duration::from_secs(idle_timeout_secs));
 
         while let Some(item) = work_rx.recv().await {
             let cfg = config.clone();
@@ -75,9 +60,22 @@ pub fn build_app(
             let smap = session_map.clone();
             let aud = audit.clone();
             tokio::task::spawn_local(async move {
-                let result =
-                    handler::dispatch_request(&item.request, &cfg, &reg, &lim, &smap, &aud).await;
-                let _ = item.response_tx.send(result);
+                let mut response_tx = item.response_tx;
+                // Client gone: dropping the dispatch future cancels its session.
+                let result = tokio::select! {
+                    result = handler::dispatch_request(&item.request, &cfg, &reg, &lim, &smap, &aud) => result,
+                    _ = response_tx.closed() => return,
+                };
+                // Page was drained and its token rotated; nobody can continue it.
+                if let Err(result) = response_tx.send(result)
+                    && let Some(token) = next_page_token(result.as_ref())
+                    && smap.borrow_mut().cancel_by_token(&token)
+                {
+                    info!(
+                        token = session::token_suffix(&token),
+                        "client went away before the page was delivered, cancelled session"
+                    );
+                }
             });
         }
     });
@@ -103,6 +101,19 @@ pub fn build_app(
     Router::new()
         .merge(authed_routes)
         .route("/health", get(handle_health))
+}
+
+/// The continuation token of a page result: `next_page` in a REST page, or the
+/// `[streaming] next_page=` line in an MCP tool result.
+fn next_page_token(result: Option<&Value>) -> Option<String> {
+    let result = result?;
+    if let Some(token) = result["next_page"].as_str() {
+        return Some(token.to_string());
+    }
+    let text = result["result"]["content"][0]["text"].as_str()?;
+    // Only a 32-hex token at the very end counts; command output may hold the marker.
+    let (_, rest) = text.rsplit_once("[streaming] next_page=")?;
+    (rest.len() == 32 && rest.bytes().all(|b| b.is_ascii_hexdigit())).then(|| rest.to_string())
 }
 
 pub async fn run_streamable_server(
@@ -242,4 +253,41 @@ async fn handle_delete() -> Response {
 
 async fn handle_health() -> Json<Value> {
     Json(json!({"status": "ok"}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_page_token_from_rest_page() {
+        let v = json!({"stdout": "x", "next_page": "abc"});
+        assert_eq!(next_page_token(Some(&v)).as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn next_page_token_from_mcp_text() {
+        let v = json!({"result": {"content": [{"type": "text", "text": "out\n[streaming] next_page=0123456789abcdef0123456789abcdef"}]}});
+        assert_eq!(
+            next_page_token(Some(&v)).as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn next_page_token_ignores_marker_in_command_output() {
+        let text = "echo [streaming] next_page=0123456789abcdef0123456789abcdef\n---\nexit_code: 0 | duration: 3ms";
+        let v = json!({"result": {"content": [{"type": "text", "text": text}]}});
+        assert_eq!(next_page_token(Some(&v)), None);
+        let text = "[streaming] next_page=short";
+        let v = json!({"result": {"content": [{"type": "text", "text": text}]}});
+        assert_eq!(next_page_token(Some(&v)), None);
+    }
+
+    #[test]
+    fn next_page_token_absent_on_final_page() {
+        let v = json!({"stdout": "x", "exit_code": 0});
+        assert_eq!(next_page_token(Some(&v)), None);
+        assert_eq!(next_page_token(None), None);
+    }
 }

@@ -2,12 +2,20 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use std::cell::RefCell;
+
 use rand::Rng as _;
 use tokio::sync::Notify;
+use tracing::info;
 
 pub fn generate_token() -> String {
     let bytes = rand::rng().random::<[u8; 16]>();
     hex::encode(bytes)
+}
+
+/// Last 8 characters of a token, for log lines.
+pub fn token_suffix(token: &str) -> &str {
+    &token[token.len().saturating_sub(8)..]
 }
 
 pub struct StreamExecResult {
@@ -164,6 +172,22 @@ impl SessionMap {
         self.token_to_session.get(token).map(String::as_str)
     }
 
+    /// Remove the session behind `token` and abort its RPC task, which closes
+    /// the agent connection and kills the command. Returns whether one existed.
+    pub fn cancel_by_token(&mut self, token: &str) -> bool {
+        match self.remove_by_token(token) {
+            Some(mut session) => {
+                // Wake pages waiting on this session so they fail now, not at their deadline.
+                session.notify.notify_waiters();
+                if let Some(task) = session.rpc_task.take() {
+                    task.abort();
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn cleanup_expired(&mut self, idle_timeout: Duration) -> Vec<String> {
         let now = Instant::now();
         let expired_ids: Vec<String> = self
@@ -174,10 +198,11 @@ impl SessionMap {
             .collect();
 
         for session_id in &expired_ids {
-            if let Some(mut session) = self.sessions.remove(session_id)
-                && let Some(task) = session.rpc_task.take()
-            {
-                task.abort();
+            if let Some(mut session) = self.sessions.remove(session_id) {
+                session.notify.notify_waiters();
+                if let Some(task) = session.rpc_task.take() {
+                    task.abort();
+                }
             }
         }
 
@@ -187,6 +212,25 @@ impl SessionMap {
 
         expired_ids
     }
+}
+
+/// Spawn the timer that cancels sessions not polled for `idle_timeout`.
+/// Must run inside a `LocalSet`.
+pub fn spawn_idle_cleanup(session_map: Rc<RefCell<SessionMap>>, idle_timeout: Duration) {
+    tokio::task::spawn_local(async move {
+        let period = (idle_timeout / 2).clamp(Duration::from_secs(1), Duration::from_secs(10));
+        let mut interval = tokio::time::interval(period);
+        loop {
+            interval.tick().await;
+            let expired = session_map.borrow_mut().cleanup_expired(idle_timeout);
+            if !expired.is_empty() {
+                info!(
+                    count = expired.len(),
+                    "cleaned up expired streaming sessions"
+                );
+            }
+        }
+    });
 }
 
 impl Default for SessionMap {
@@ -249,6 +293,15 @@ mod tests {
         let expired = map.cleanup_expired(Duration::from_secs(60));
         assert_eq!(expired.len(), 1);
         assert!(map.get_by_token(&token).is_none());
+    }
+
+    #[test]
+    fn session_cancel_by_token_removes_session() {
+        let mut map = SessionMap::new();
+        let (token, _) = map.create_session();
+        assert!(map.cancel_by_token(&token));
+        assert!(map.get_by_token(&token).is_none());
+        assert!(!map.cancel_by_token(&token));
     }
 
     #[test]

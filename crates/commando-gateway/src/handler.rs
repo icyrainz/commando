@@ -628,6 +628,47 @@ pub async fn build_page(
     token: &str,
     config: &StreamingConfig,
 ) -> Result<ExecPage, String> {
+    // A dropped future means the client is gone: cancel the session.
+    let mut guard = PageGuard {
+        session_map,
+        token,
+        armed: true,
+    };
+    let result = build_page_inner(session_map, token, config).await;
+    guard.armed = false;
+    result
+}
+
+/// Cancels the session of a `build_page` call whose future is dropped early.
+struct PageGuard<'a> {
+    session_map: &'a Rc<RefCell<SessionMap>>,
+    token: &'a str,
+    armed: bool,
+}
+
+impl Drop for PageGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // If the map is borrowed, the session is left for the idle cleanup.
+        // Not expected to happen: no borrow is held across an await.
+        if let Ok(mut map) = self.session_map.try_borrow_mut()
+            && map.cancel_by_token(self.token)
+        {
+            info!(
+                token = crate::session::token_suffix(self.token),
+                "client went away mid-request, cancelled session"
+            );
+        }
+    }
+}
+
+async fn build_page_inner(
+    session_map: &Rc<RefCell<SessionMap>>,
+    token: &str,
+    config: &StreamingConfig,
+) -> Result<ExecPage, String> {
     let page_timeout = Duration::from_secs(config.page_timeout_secs);
     let page_max = config.page_max_bytes;
     let deadline = Instant::now() + page_timeout;
@@ -635,12 +676,17 @@ pub async fn build_page(
     // Phase 1: Wait until enough data is available, command completes, or timeout.
     // We keep waiting as long as: no data yet, OR data is under page_max and
     // the command hasn't completed (avoids unnecessary pagination for small output).
+    // Waiting counts as polling: refresh `last_polled` at least twice per idle
+    // timeout so the idle cleanup never aborts a session someone is waiting on.
+    let wait_slice =
+        Duration::from_secs(config.session_idle_timeout_secs / 2).max(Duration::from_millis(100));
     loop {
         let (buffered, completed, notify) = {
-            let map = session_map.borrow();
+            let mut map = session_map.borrow_mut();
             let session = map
-                .get_by_token(token)
+                .get_by_token_mut(token)
                 .ok_or_else(|| "invalid or expired page token".to_string())?;
+            session.touch();
             (
                 session.total_buffered(),
                 session.completed,
@@ -658,7 +704,7 @@ pub async fn build_page(
         }
 
         // Wait for notification or timeout
-        let _ = tokio::time::timeout(remaining, notify.notified()).await;
+        let _ = tokio::time::timeout(remaining.min(wait_slice), notify.notified()).await;
         // Re-loop to check state again
     }
 
@@ -1930,6 +1976,57 @@ mod tests {
         assert_eq!(page.stderr, "");
         assert_eq!(page.exit_code.unwrap(), 0);
         assert!(page.next_page.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_dropped_while_waiting_cancels_session() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        let config = StreamingConfig {
+            page_timeout_secs: 30,
+            page_max_bytes: 32768,
+            session_idle_timeout_secs: 60,
+        };
+
+        let result =
+            tokio::time::timeout(Duration::from_millis(50), build_page(&sm, &token, &config)).await;
+        assert!(result.is_err(), "page should still be waiting");
+        assert!(sm.borrow().get_by_token(&token).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_a_session_wakes_waiting_pages() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        let config = StreamingConfig {
+            page_timeout_secs: 30,
+            page_max_bytes: 32768,
+            session_idle_timeout_secs: 60,
+        };
+
+        let started = Instant::now();
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            sm.borrow_mut().cancel_by_token(&token);
+        };
+        let (result, ()) = tokio::join!(build_page(&sm, &token, &config), cancel);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(result.unwrap_err(), "invalid or expired page token");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_page_completed_keeps_other_sessions() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        let (other, _) = sm.borrow_mut().create_session();
+        populate_session(&sm, &token, b"done", b"", true, 0);
+
+        let page = build_page(&sm, &token, &streaming_config(32768))
+            .await
+            .unwrap();
+        assert_eq!(page.exit_code, Some(0));
+        assert!(sm.borrow().get_by_token(&token).is_none());
+        assert!(sm.borrow().get_by_token(&other).is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]

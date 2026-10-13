@@ -522,7 +522,7 @@ Last updated: 2026-03-14. Feedback sources: homelab user review, DevOps/SRE revi
 
 ### Implemented
 
-- ~~**Streaming output:**~~ Paginated output via `execStream` RPC + `commando_output` MCP tool.
+- ~~**Streaming output:**~~ Paginated output via `execStream` RPC + `commando_output` MCP tool. A command is killed unless its client is polling: a dropped HTTP connection cancels the session at once, and a session not polled for `session_idle_timeout_secs` (default 60) is cancelled.
 - ~~**CLI + REST API:**~~ `commando exec/list/ping` CLI with REST endpoints on gateway.
 
 ### High Priority

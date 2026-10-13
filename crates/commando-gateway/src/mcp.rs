@@ -11,7 +11,7 @@ use crate::audit::AuditLogger;
 use crate::config::GatewayConfig;
 use crate::handler;
 use crate::registry::Registry;
-use crate::session::SessionMap;
+use crate::session::{self, SessionMap};
 
 /// MCP server loop over stdio. Reads JSON-RPC from stdin, writes responses to stdout.
 pub async fn run_stdio_loop(
@@ -26,22 +26,10 @@ pub async fn run_stdio_loop(
 
     let session_map = Rc::new(RefCell::new(SessionMap::new()));
 
-    // Spawn idle cleanup timer
-    let cleanup_map = session_map.clone();
-    let idle_timeout = Duration::from_secs(config.streaming.session_idle_timeout_secs);
-    tokio::task::spawn_local(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
-        loop {
-            interval.tick().await;
-            let expired = cleanup_map.borrow_mut().cleanup_expired(idle_timeout);
-            if !expired.is_empty() {
-                tracing::info!(
-                    count = expired.len(),
-                    "cleaned up expired streaming sessions"
-                );
-            }
-        }
-    });
+    session::spawn_idle_cleanup(
+        session_map.clone(),
+        Duration::from_secs(config.streaming.session_idle_timeout_secs),
+    );
 
     while let Ok(Some(line)) = lines.next_line().await as tokio::io::Result<Option<String>> {
         if line.trim().is_empty() {
