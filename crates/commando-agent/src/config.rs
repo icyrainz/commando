@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AgentConfig {
     pub bind: String,
     #[serde(default = "default_port")]
@@ -12,6 +12,19 @@ pub struct AgentConfig {
     pub max_output_bytes: usize,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
+}
+
+impl std::fmt::Debug for AgentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentConfig")
+            .field("bind", &self.bind)
+            .field("port", &self.port)
+            .field("shell", &self.shell)
+            .field("psk", &"[REDACTED]")
+            .field("max_output_bytes", &self.max_output_bytes)
+            .field("max_concurrent", &self.max_concurrent)
+            .finish()
+    }
 }
 
 fn default_port() -> u16 {
@@ -28,10 +41,14 @@ fn default_max_concurrent() -> usize {
 }
 
 impl AgentConfig {
-    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+    /// Load the config. Also returns the paths of unknown keys.
+    pub fn load(path: &std::path::Path) -> anyhow::Result<(Self, Vec<String>)> {
         let content = std::fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&content)?;
-        Ok(config)
+        let mut unknown = Vec::new();
+        let config: Self = serde_ignored::deserialize(toml::Deserializer::new(&content), |p| {
+            unknown.push(p.to_string())
+        })?;
+        Ok((config, unknown))
     }
 }
 
@@ -81,5 +98,28 @@ wrapper = "x"
 "#;
         let config: AgentConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.bind, "0.0.0.0");
+    }
+
+    #[test]
+    fn load_reports_unknown_keys() {
+        let dir = std::env::temp_dir().join(format!("commando-agent-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.toml");
+        std::fs::write(
+            &path,
+            "bind = \"0.0.0.0\"\npsk = \"s\"\nmax_concurent = 3\n",
+        )
+        .unwrap();
+        let (_, unknown) = AgentConfig::load(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(unknown, vec!["max_concurent".to_string()]);
+    }
+
+    #[test]
+    fn debug_redacts_psk() {
+        let config: AgentConfig =
+            toml::from_str("bind = \"0.0.0.0\"\npsk = \"psk-secret-value\"\n").unwrap();
+        let out = format!("{:?}", config);
+        assert!(!out.contains("psk-secret-value"), "{out}");
     }
 }

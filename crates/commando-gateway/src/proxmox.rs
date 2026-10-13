@@ -32,13 +32,37 @@ fn extract_ip(interfaces: &[InterfaceEntry]) -> Option<String> {
     })
 }
 
+/// Result of one node's discovery.
+#[derive(Default)]
+pub struct NodeDiscovery {
+    pub targets: Vec<DiscoveredTarget>,
+    /// Names whose interface lookup failed; the registry keeps their previous entry.
+    pub retain: Vec<String>,
+}
+
+/// Fetch the IP of a running LXC. `Err` means the lookup failed; `Ok(None)` means no IP.
+async fn lookup_ip(
+    client: &reqwest::Client,
+    url: &str,
+    auth_header: &str,
+) -> Result<Option<String>> {
+    let resp = client
+        .get(url)
+        .header("Authorization", auth_header)
+        .send()
+        .await?
+        .error_for_status()?;
+    let ifaces: ProxmoxResponse<Vec<InterfaceEntry>> = resp.json().await?;
+    Ok(extract_ip(&ifaces.data))
+}
+
 /// Discover all LXC containers on a Proxmox node.
 pub async fn discover_node(
     client: &reqwest::Client,
     node: &crate::config::ProxmoxNode,
     config: &ProxmoxConfig,
     default_port: u16,
-) -> Result<Vec<DiscoveredTarget>> {
+) -> Result<NodeDiscovery> {
     let base_url = format!("https://{}:{}/api2/json", node.host, node.port);
     let auth_header = format!(
         "PVEAPIToken={}!{}={}",
@@ -55,12 +79,12 @@ pub async fn discover_node(
         .error_for_status()?;
     let lxc_list: ProxmoxResponse<Vec<LxcEntry>> = resp.json().await?;
 
-    let mut targets = Vec::new();
+    let mut result = NodeDiscovery::default();
 
     for lxc in &lxc_list.data {
         if lxc.status != "running" {
             // Stopped/paused LXCs have no guest agent — skip the interface lookup
-            targets.push(DiscoveredTarget {
+            result.targets.push(DiscoveredTarget {
                 name: format!("{}/{}", node.name, lxc.name),
                 host: "".to_string(),
                 port: default_port,
@@ -74,40 +98,36 @@ pub async fn discover_node(
             "{}/nodes/{}/lxc/{}/interfaces",
             base_url, node.name, lxc.vmid
         );
-        let ip = match client
-            .get(&iface_url)
-            .header("Authorization", &auth_header)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                if let Ok(iface_resp) = resp.json::<ProxmoxResponse<Vec<InterfaceEntry>>>().await {
-                    extract_ip(&iface_resp.data)
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
-        };
-
-        if let Some(host) = ip {
-            targets.push(DiscoveredTarget {
-                name: format!("{}/{}", node.name, lxc.name),
+        let name = format!("{}/{}", node.name, lxc.name);
+        match lookup_ip(client, &iface_url, &auth_header).await {
+            Ok(Some(host)) => result.targets.push(DiscoveredTarget {
+                name,
                 host,
                 port: default_port,
                 status: lxc.status.clone(),
-            });
-        } else {
-            tracing::warn!(
-                node = %node.name,
-                vmid = lxc.vmid,
-                name = %lxc.name,
-                "could not determine IP for LXC, skipping"
-            );
+            }),
+            Ok(None) => {
+                tracing::warn!(
+                    node = %node.name,
+                    vmid = lxc.vmid,
+                    name = %lxc.name,
+                    "could not determine IP for LXC, skipping"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    node = %node.name,
+                    vmid = lxc.vmid,
+                    name = %lxc.name,
+                    error = %e,
+                    "interface lookup failed for LXC, keeping previous entry"
+                );
+                result.retain.push(name);
+            }
         }
     }
 
-    Ok(targets)
+    Ok(result)
 }
 
 #[cfg(test)]

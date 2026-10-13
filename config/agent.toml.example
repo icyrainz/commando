@@ -1,5 +1,6 @@
 # Commando Agent Configuration
 # Copy to /etc/commando/agent.toml and set chmod 600 root:root
+# Validate with: commando-agent --check-config --config /etc/commando/agent.toml
 
 bind = "0.0.0.0"           # Bind to all interfaces (or restrict to a LAN IP)
 port = 9876

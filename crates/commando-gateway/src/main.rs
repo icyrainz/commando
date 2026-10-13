@@ -33,11 +33,15 @@ struct Cli {
     /// Registry cache directory
     #[arg(long)]
     cache_dir: Option<String>,
+
+    /// Load and validate the config, print warnings, then exit
+    #[arg(long)]
+    check_config: bool,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let mut config = config::GatewayConfig::load(&cli.config)?;
+/// Load the config, apply CLI/env overrides, and run startup checks.
+fn load_config(cli: &Cli) -> Result<(config::GatewayConfig, Vec<String>)> {
+    let (mut config, unknown_keys) = config::GatewayConfig::load(&cli.config)?;
 
     // CLI overrides for server settings
     if let Some(transport) = &cli.transport {
@@ -68,6 +72,29 @@ fn main() -> Result<()> {
         );
     }
 
+    config.validate()?;
+    Ok((config, unknown_keys))
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let (config, unknown_keys) = match load_config(&cli) {
+        Ok(loaded) => loaded,
+        Err(e) if cli.check_config => {
+            eprintln!("config error: {e:#}");
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e),
+    };
+
+    if cli.check_config {
+        for key in &unknown_keys {
+            eprintln!("warning: unknown config key: {key}");
+        }
+        println!("config OK");
+        return Ok(());
+    }
+
     let config = Arc::new(config);
 
     // Structured JSON logging to stderr (stdout is for MCP protocol)
@@ -80,6 +107,10 @@ fn main() -> Result<()> {
         )
         .with_target(false)
         .init();
+
+    for key in &unknown_keys {
+        warn!(key = %key, "unknown config key");
+    }
 
     info!(
         proxmox_nodes = config.proxmox.as_ref().map(|p| p.nodes.len()).unwrap_or(0),
@@ -205,6 +236,8 @@ async fn run_discovery_cycle(config: &config::GatewayConfig, registry: &Arc<Mute
         .unwrap_or_default();
 
     let mut all_discovered = Vec::new();
+    let mut failed_nodes = Vec::new();
+    let mut retain = Vec::new();
 
     for node in &proxmox_config.nodes {
         match proxmox::discover_node(
@@ -215,17 +248,32 @@ async fn run_discovery_cycle(config: &config::GatewayConfig, registry: &Arc<Mute
         )
         .await
         {
-            Ok(targets) => {
-                info!(node = %node.name, count = targets.len(), "discovered LXC targets");
-                all_discovered.extend(targets);
+            Ok(found) => {
+                info!(node = %node.name, count = found.targets.len(), "discovered LXC targets");
+                all_discovered.extend(found.targets);
+                retain.extend(found.retain);
             }
             Err(e) => {
-                error!(node = %node.name, error = %e, "Proxmox discovery failed");
+                error!(node = %node.name, error = %e, "Proxmox discovery failed, keeping previous targets");
+                failed_nodes.push(node.name.clone());
             }
         }
     }
 
-    registry.lock().unwrap().update_discovered(all_discovered);
+    let configured: Vec<String> = proxmox_config
+        .nodes
+        .iter()
+        .map(|n| n.name.clone())
+        .collect();
+    let orphaned = registry.lock().unwrap().update_discovered_for_nodes(
+        all_discovered,
+        &configured,
+        &failed_nodes,
+        &retain,
+    );
+    if !orphaned.is_empty() {
+        info!(names = ?orphaned, "dropped discovered targets under no configured node");
+    }
 
     // Save cache to disk
     let cache_dir = std::path::Path::new(&config.cache_dir);

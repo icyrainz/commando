@@ -87,12 +87,69 @@ impl Registry {
 
     /// Replace all previously discovered targets with the new set, then re-apply manual overrides.
     pub fn update_discovered(&mut self, discovered: Vec<DiscoveredTarget>) {
-        // Remove all currently discovered targets from the merged map.
-        self.targets.retain(|_, v| v.source == TargetSource::Manual);
+        self.replace_discovered(discovered, |_| true);
+    }
+
+    /// Replace discovered targets, except those of configured nodes whose call failed
+    /// (`failed_nodes`) and names in `retain` (failed lookups).
+    /// Returns the dropped names that sit under no node in `configured_nodes`.
+    pub fn update_discovered_for_nodes(
+        &mut self,
+        discovered: Vec<DiscoveredTarget>,
+        configured_nodes: &[String],
+        failed_nodes: &[String],
+        retain: &[String],
+    ) -> Vec<String> {
+        let under = |name: &str, nodes: &[String]| {
+            nodes.iter().any(|n| {
+                name.strip_prefix(n.as_str())
+                    .is_some_and(|r| r.starts_with('/'))
+            })
+        };
+        let mut orphaned: Vec<String> = self
+            .targets
+            .iter()
+            .filter(|(name, t)| {
+                t.source == TargetSource::Discovered
+                    && !under(name, configured_nodes)
+                    && !retain.contains(name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        orphaned.sort();
+        self.replace_discovered(discovered, |name| {
+            !under(name, failed_nodes) && !retain.iter().any(|r| r == name)
+        });
+        orphaned
+    }
+
+    /// Drop discovered targets selected by `replace`, then insert `discovered`.
+    /// A target that keeps its host and port keeps its reachability.
+    fn replace_discovered(
+        &mut self,
+        discovered: Vec<DiscoveredTarget>,
+        replace: impl Fn(&str) -> bool,
+    ) {
+        let stale: Vec<String> = self
+            .targets
+            .iter()
+            .filter(|(name, t)| t.source == TargetSource::Discovered && replace(name))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let old: HashMap<String, Target> = stale
+            .into_iter()
+            .filter_map(|name| self.targets.remove(&name).map(|t| (name, t)))
+            .collect();
 
         for d in discovered {
             // Only insert if there is no manual override with the same name.
             if !self.manual_targets.contains_key(&d.name) {
+                let reachable = match old.get(&d.name) {
+                    Some(prev) if prev.host == d.host && prev.port == d.port => {
+                        prev.reachable.clone()
+                    }
+                    _ => Reachability::Unknown,
+                };
                 let target = Target {
                     name: d.name.clone(),
                     host: d.host,
@@ -101,7 +158,7 @@ impl Registry {
                     tags: vec![],
                     source: TargetSource::Discovered,
                     status: d.status,
-                    reachable: Reachability::Unknown,
+                    reachable,
                 };
                 self.targets.insert(d.name, target);
             }
@@ -308,5 +365,96 @@ mod tests {
         let loaded = Registry::from_cache_json(&json).unwrap();
         assert_eq!(loaded.targets.len(), 1);
         assert!(loaded.targets.contains_key("node-1/app"));
+    }
+
+    fn disc(name: &str, host: &str) -> DiscoveredTarget {
+        DiscoveredTarget {
+            name: name.to_string(),
+            host: host.to_string(),
+            port: 9876,
+            status: "running".to_string(),
+        }
+    }
+
+    fn names(registry: &Registry) -> Vec<String> {
+        let mut v: Vec<String> = registry.targets.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn failed_node_keeps_targets() {
+        let mut registry = Registry::new();
+        registry.update_discovered(vec![disc("a/x", "10.0.0.1"), disc("b/y", "10.0.0.2")]);
+
+        // Node "a" answered with a new set; node "b" failed.
+        let orphaned = registry.update_discovered_for_nodes(
+            vec![disc("a/z", "10.0.0.3")],
+            &strs(&["a", "b"]),
+            &strs(&["b"]),
+            &[],
+        );
+        assert!(orphaned.is_empty());
+        assert_eq!(names(&registry), ["a/z", "b/y"]);
+    }
+
+    #[test]
+    fn unconfigured_node_targets_removed_when_sibling_answers() {
+        let mut registry = Registry::new();
+        registry.update_discovered(vec![disc("a/x", "10.0.0.1"), disc("old/foo", "10.0.0.2")]);
+
+        let orphaned = registry.update_discovered_for_nodes(
+            vec![disc("a/x", "10.0.0.1")],
+            &strs(&["a"]),
+            &[],
+            &[],
+        );
+        assert_eq!(orphaned, ["old/foo"]);
+        assert_eq!(names(&registry), ["a/x"]);
+    }
+
+    #[test]
+    fn unconfigured_node_targets_removed_when_all_nodes_fail() {
+        let mut registry = Registry::new();
+        registry.update_discovered(vec![disc("a/x", "10.0.0.1"), disc("old/foo", "10.0.0.2")]);
+
+        let orphaned =
+            registry.update_discovered_for_nodes(vec![], &strs(&["a"]), &strs(&["a"]), &[]);
+        assert_eq!(orphaned, ["old/foo"]);
+        assert_eq!(names(&registry), ["a/x"]);
+    }
+
+    #[test]
+    fn retained_name_survives_on_ok_node() {
+        let mut registry = Registry::new();
+        registry.update_discovered(vec![disc("a/x", "10.0.0.1"), disc("a/gone", "10.0.0.2")]);
+
+        registry.update_discovered_for_nodes(vec![], &strs(&["a"]), &[], &strs(&["a/x"]));
+        assert_eq!(names(&registry), ["a/x"]);
+    }
+
+    #[test]
+    fn reachable_kept_when_host_and_port_unchanged() {
+        let mut registry = Registry::new();
+        registry.update_discovered(vec![disc("a/x", "10.0.0.1"), disc("a/y", "10.0.0.2")]);
+        registry.set_reachable("a/x", Reachability::Reachable);
+        registry.set_reachable("a/y", Reachability::Unreachable);
+
+        registry.update_discovered_for_nodes(
+            vec![disc("a/x", "10.0.0.1"), disc("a/y", "10.0.0.9")],
+            &strs(&["a"]),
+            &[],
+            &[],
+        );
+        assert_eq!(registry.targets["a/x"].reachable, Reachability::Reachable);
+        assert_eq!(registry.targets["a/y"].reachable, Reachability::Unknown);
+
+        registry.set_reachable("a/x", Reachability::Reachable);
+        registry.update_discovered(vec![disc("a/x", "10.0.0.1")]);
+        assert_eq!(registry.targets["a/x"].reachable, Reachability::Reachable);
     }
 }

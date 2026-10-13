@@ -19,11 +19,32 @@ use commando_agent::rpc::{self, ConcurrencyGuard};
 struct Cli {
     #[arg(long, default_value = "/etc/commando/agent.toml")]
     config: std::path::PathBuf,
+
+    /// Load and validate the config, print warnings, then exit
+    #[arg(long)]
+    check_config: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Rc::new(config::AgentConfig::load(&cli.config)?);
+    let (config, unknown_keys) = match config::AgentConfig::load(&cli.config) {
+        Ok(loaded) => loaded,
+        Err(e) if cli.check_config => {
+            eprintln!("config error: {e:#}");
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e),
+    };
+
+    if cli.check_config {
+        for key in &unknown_keys {
+            eprintln!("warning: unknown config key: {key}");
+        }
+        println!("config OK");
+        return Ok(());
+    }
+
+    let config = Rc::new(config);
 
     // Structured JSON logging
     tracing_subscriber::fmt()
@@ -34,6 +55,10 @@ fn main() -> Result<()> {
         )
         .with_target(false)
         .init();
+
+    for key in &unknown_keys {
+        warn!(key = %key, "unknown config key");
+    }
 
     info!(
         bind = %config.bind,

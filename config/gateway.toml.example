@@ -1,5 +1,6 @@
 # Commando Gateway Configuration
 # Copy to /etc/commando/gateway.toml and set chmod 600 root:root
+# Validate with: commando-gateway --check-config --config /etc/commando/gateway.toml
 
 # MCP server transport: "streamable-http" (HTTP, default) or "stdio" (stdin/stdout)
 # [server]

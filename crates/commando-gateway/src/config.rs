@@ -36,7 +36,7 @@ impl Default for StreamingConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ProxmoxConfig {
     pub nodes: Vec<ProxmoxNode>,
     pub user: String,
@@ -44,6 +44,18 @@ pub struct ProxmoxConfig {
     pub token_secret: String,
     #[serde(default = "default_discovery_interval")]
     pub discovery_interval_secs: u64,
+}
+
+impl std::fmt::Debug for ProxmoxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxmoxConfig")
+            .field("nodes", &self.nodes)
+            .field("user", &self.user)
+            .field("token_id", &self.token_id)
+            .field("token_secret", &"[REDACTED]")
+            .field("discovery_interval_secs", &self.discovery_interval_secs)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,7 +66,7 @@ pub struct ProxmoxNode {
     pub port: u16,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AgentConnectionConfig {
     #[serde(default = "default_agent_port")]
     pub default_port: u16,
@@ -66,6 +78,20 @@ pub struct AgentConnectionConfig {
     pub max_concurrent_per_target: usize,
     #[serde(default)]
     pub psk: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for AgentConnectionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let psk: std::collections::BTreeMap<&String, &str> =
+            self.psk.keys().map(|k| (k, "[REDACTED]")).collect();
+        f.debug_struct("AgentConnectionConfig")
+            .field("default_port", &self.default_port)
+            .field("default_timeout_secs", &self.default_timeout_secs)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("max_concurrent_per_target", &self.max_concurrent_per_target)
+            .field("psk", &psk)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -192,10 +218,29 @@ fn default_session_idle_timeout() -> u64 {
 }
 
 impl GatewayConfig {
-    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+    /// Load and validate the config. Also returns the paths of unknown keys.
+    pub fn load(path: &std::path::Path) -> anyhow::Result<(Self, Vec<String>)> {
         let content = std::fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&content)?;
-        Ok(config)
+        let mut unknown = Vec::new();
+        let config: Self = serde_ignored::deserialize(toml::Deserializer::new(&content), |p| {
+            unknown.push(p.to_string())
+        })?;
+        config.validate()?;
+        Ok((config, unknown))
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let transport = self.server.transport.as_str();
+        if !matches!(transport, "stdio" | "streamable-http") {
+            anyhow::bail!(
+                "invalid transport {transport:?} (expected \"stdio\" or \"streamable-http\")"
+            );
+        }
+        let mode = self.server.execution_mode.as_str();
+        if !matches!(mode, "cli" | "mcp") {
+            anyhow::bail!("invalid execution_mode {mode:?} (expected \"cli\" or \"mcp\")");
+        }
+        Ok(())
     }
 }
 
@@ -343,5 +388,82 @@ host = "192.168.1.50"
         assert!(config.proxmox.is_none());
         assert_eq!(config.targets.len(), 1);
         assert_eq!(config.agent.psk["my-target"], "secret");
+    }
+
+    fn load_str(toml_str: &str) -> anyhow::Result<(GatewayConfig, Vec<String>)> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gateway.toml");
+        std::fs::write(&path, toml_str).unwrap();
+        GatewayConfig::load(&path)
+    }
+
+    #[test]
+    fn unknown_keys_are_reported() {
+        let (config, unknown) = load_str(
+            r#"
+bogus = 1
+
+[server]
+transprot = "stdio"
+
+[agent]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.server.transport, "streamable-http");
+        assert_eq!(unknown.len(), 2);
+        assert!(unknown.contains(&"bogus".to_string()));
+        assert!(unknown.contains(&"server.transprot".to_string()));
+    }
+
+    #[test]
+    fn known_keys_report_nothing() {
+        let (_, unknown) = load_str("[agent]\n[agent.psk]\nmy-target = \"s\"\n").unwrap();
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn bad_execution_mode_rejected() {
+        let err = load_str("[server]\nexecution_mode = \"cli \"\n[agent]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"cli \""), "{err}");
+        assert!(err.contains("\"mcp\""), "{err}");
+    }
+
+    #[test]
+    fn bad_transport_rejected() {
+        let err = load_str("[server]\ntransport = \"http\"\n[agent]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"http\""), "{err}");
+        assert!(err.contains("streamable-http"), "{err}");
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let (config, _) = load_str(
+            r#"
+[server]
+api_key = "api-secret-value"
+
+[proxmox]
+nodes = []
+user = "root@pam"
+token_id = "commando"
+token_secret = "token-secret-value"
+
+[agent]
+
+[agent.psk]
+my-target = "psk-secret-value"
+"#,
+        )
+        .unwrap();
+        let out = format!("{:?}", config);
+        assert!(!out.contains("api-secret-value"), "{out}");
+        assert!(!out.contains("token-secret-value"), "{out}");
+        assert!(!out.contains("psk-secret-value"), "{out}");
+        assert!(out.contains("my-target"));
     }
 }
