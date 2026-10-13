@@ -86,8 +86,23 @@ async fn run_server(config: Rc<config::AgentConfig>) -> Result<()> {
     let concurrency_guard = Rc::new(ConcurrencyGuard::new(config.max_concurrent));
     let agent_start_time = std::time::Instant::now();
 
+    const MIN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+    let mut backoff = MIN_BACKOFF;
+
     loop {
-        let (stream, peer_addr) = listener.accept().await?;
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(accepted) => {
+                backoff = MIN_BACKOFF;
+                accepted
+            }
+            Err(e) => {
+                warn!(error = %e, retry_in_ms = backoff.as_millis() as u64, "accept failed");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                continue;
+            }
+        };
 
         // Enable SO_KEEPALIVE
         let socket_ref = socket2::SockRef::from(&stream);

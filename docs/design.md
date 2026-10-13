@@ -252,7 +252,7 @@ A single static Rust binary (~2-4MB) that runs on every target machine.
 - Execute commands using the configured shell (`sh -c`, `bash -c`, `fish -c`). Any shell configured in `agent.toml` must support the `-c <command>` interface
 - Return stdout, stderr, exit code, and timing
 - Cap buffered stdout/stderr at `max_output_bytes` (default 128KB). If either stream exceeds the limit, keep the **last** `max_output_bytes` (tail truncation) and set `truncated = true` in the response. Tail truncation is intentional: errors and final output are at the end, which is what matters for debugging. 128KB is chosen because MCP tool results feed directly into the LLM context window — 1MB+ of text would far exceed useful context
-- On timeout: send SIGTERM, wait 5s grace period, then SIGKILL if still alive. Return buffered stdout/stderr with `timedOut = true`
+- On timeout: send SIGTERM to the process group, wait for the leader to exit for at most 5s, then SIGKILL the group and reap. Return buffered stdout/stderr with `timedOut = true`, exit code 137. A command is also killed (same SIGTERM, 5s, SIGKILL) when its client goes away: the call is aborted or the connection closes
 - Respond to ping requests with hostname, uptime, shell, and agent version
 
 **Configuration** (`/etc/commando/agent.toml`, must be `chmod 600 root:root` — contains the agent PSK):
@@ -297,8 +297,8 @@ Note: `ProtectSystem`, `ProtectHome`, and `PrivateTmp` are intentionally omitted
    - `SHELL` = configured shell from `agent.toml`
    - `LANG=C.UTF-8`, `TERM=dumb`, `NO_COLOR=1` (`TERM=dumb` and `NO_COLOR` are intentional for non-interactive exec: disables pagers, color escape sequences, and curses output that would pollute captured stdout)
 6. Wait for completion (with timeout)
-7. If timeout expires: SIGTERM the entire process group (`kill(-pgid, SIGTERM)`), wait 5s, SIGKILL the group if still alive, set `timedOut = true`
-8. If the RPC connection drops while a child process is running: SIGTERM the entire process group (same 5s grace + SIGKILL). The `setsid()` process group ensures all child processes (e.g., subprocesses spawned by `docker compose`) are cleaned up — no orphans. The agent tracks active child PIDs per connection and cleans up on disconnect
+7. If timeout expires: SIGTERM the entire process group (`kill(-pgid, SIGTERM)`), wait for the leader to exit for at most 5s, then SIGKILL the group and reap the leader, set `timedOut = true`
+8. If the client goes away while a child process is running (the call is aborted, or the RPC connection drops), the dropped call future kills the process group: SIGTERM at once, SIGKILL after 5s if the group still exists, and the leader is reaped. The `setsid()` process group ensures all child processes (e.g., subprocesses spawned by `docker compose`) are cleaned up — no orphans. When the leader exits normally, the guard is disarmed: a background child the command started (`nohup x &`) keeps running. After the leader exits, the agent waits for more pipe data for 200 ms in total and reads at most 64 KiB more per stream, so a background child that holds the pipe does not block the call. The agent then keeps discarding that child's output, so the child is not killed by SIGPIPE; it still dies when the agent service restarts
 9. Return `ExecResult` with captured stdout/stderr, exit code, timing, and timeout flag
 
 ### Commando Gateway (`commando-gateway`)

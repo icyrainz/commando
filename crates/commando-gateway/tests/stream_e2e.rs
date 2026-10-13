@@ -326,6 +326,20 @@ fn large_output_arrives_complete_across_pages() {
 }
 
 #[test]
+fn five_megabytes_arrive_complete_and_in_order() {
+    run_local(async {
+        let agent = start_agent(4).await;
+        let gw = Gateway::new(agent.port);
+        let out = gw.exec("seq 1 800000").await;
+        let expected: String = (1..=800_000).map(|n| format!("{n}\n")).collect();
+        assert!(expected.len() > 5_000_000);
+        assert_eq!(out.exit_code, Some(0));
+        assert_eq!(out.stdout.len(), expected.len());
+        assert!(out.stdout == expected, "output differs or is out of order");
+    });
+}
+
+#[test]
 fn work_dir_and_extra_env_reach_the_command() {
     run_local(async {
         let agent = start_agent(4).await;
@@ -354,7 +368,7 @@ fn timeout_reports_timed_out_and_137() {
         let out = gw.exec_with("sleep 30", "", Some(1), vec![]).await;
         assert!(out.timed_out);
         assert_eq!(out.exit_code, Some(137));
-        assert!(started.elapsed() < Duration::from_secs(15));
+        assert!(started.elapsed() < Duration::from_secs(4));
     });
 }
 
@@ -389,10 +403,10 @@ fn finding_a_gateway_task_abort() {
         let released = eventually(Duration::from_secs(5), || permit_available(&agent.guard)).await;
         let connection_closed =
             eventually(Duration::from_secs(5), || agent.open_connections.get() == 0).await;
-        let alive = process_alive(pid.0);
+        let gone = eventually(Duration::from_secs(5), || !process_alive(pid.0)).await;
         println!("FINDING: (a) gateway task abort: agent permit released = {released}");
         println!("FINDING: (a) gateway task abort: connection closed = {connection_closed}");
-        println!("FINDING: (a) gateway task abort: remote process alive = {alive}");
+        println!("FINDING: (a) gateway task abort: remote process gone = {gone}");
 
         assert!(released, "agent exec_stream future should be dropped");
         assert!(connection_closed, "connection closes after the abort");
@@ -407,8 +421,7 @@ fn finding_a_gateway_task_abort() {
         for _ in 0..max {
             gw.limiter.release(TARGET);
         }
-        // current behavior; the agent lifecycle row will change this and must flip this assertion
-        assert!(alive, "remote process survives the abort");
+        assert!(gone, "remote process is killed by the abort");
     });
 }
 
@@ -503,15 +516,14 @@ fn finding_b_connection_close() {
 
         let released = eventually(Duration::from_secs(5), || permit_available(&agent.guard)).await;
         let closed = eventually(Duration::from_secs(5), || agent.open_connections.get() == 0).await;
-        let alive = process_alive(pid.0);
+        let gone = eventually(Duration::from_secs(5), || !process_alive(pid.0)).await;
         println!("FINDING: (b) connection close: agent permit released = {released}");
         println!("FINDING: (b) connection close: connection handler returned = {closed}");
-        println!("FINDING: (b) connection close: remote process alive = {alive}");
+        println!("FINDING: (b) connection close: remote process gone = {gone}");
 
         assert!(released, "agent exec_stream future should be dropped");
         assert!(closed, "agent connection handler should return");
-        // current behavior; the agent lifecycle row will change this and must flip this assertion
-        assert!(alive, "remote process survives the disconnect");
+        assert!(gone, "remote process is killed by the disconnect");
     });
 }
 

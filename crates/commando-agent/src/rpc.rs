@@ -1,8 +1,10 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures::AsyncReadExt;
@@ -13,6 +15,15 @@ use commando_common::commando_capnp::{authenticator, command_agent, output_recei
 
 use crate::config::AgentConfig;
 use crate::process::{self, ExecOpts};
+
+/// Wait between SIGTERM and SIGKILL when a command is stopped.
+const KILL_GRACE: Duration = Duration::from_secs(5);
+/// How long to keep reading pipes after the command's shell exited.
+const PIPE_DRAIN: Duration = Duration::from_millis(200);
+/// A connection that has not authenticated within this time is closed.
+const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum `receive` calls awaiting a response in `exec_stream`.
+const MAX_IN_FLIGHT: usize = 16;
 
 /// Rate-limiting state per peer IP
 pub struct RateLimitState {
@@ -28,6 +39,7 @@ pub struct AuthenticatorImpl {
     rate_limits: Rc<RefCell<HashMap<IpAddr, RateLimitState>>>,
     concurrency_guard: Rc<ConcurrencyGuard>,
     agent_start_time: Instant,
+    authenticated: Rc<Cell<bool>>,
 }
 
 /// Tracks concurrent exec calls. ConcurrencyPermit releases on Drop (RAII).
@@ -84,6 +96,7 @@ impl AuthenticatorImpl {
             rate_limits,
             concurrency_guard,
             agent_start_time,
+            authenticated: Rc::new(Cell::new(false)),
         }
     }
 }
@@ -165,6 +178,7 @@ impl authenticator::Server for AuthenticatorImpl {
         r.set_agent(agent_client);
         r.set_agent_version(env!("CARGO_PKG_VERSION"));
 
+        self.authenticated.set(true);
         tracing::info!(peer = %self.peer_ip, "authentication successful");
         Ok(())
     }
@@ -250,6 +264,8 @@ impl command_agent::Server for CommandAgentImpl {
         let opts = ExecOpts {
             shell: self.config.shell.clone(),
             max_output_bytes: self.config.max_output_bytes,
+            kill_grace: KILL_GRACE,
+            pipe_drain: PIPE_DRAIN,
         };
 
         let exec_result = process::execute(&command, &work_dir, timeout_secs, &extra_env, &opts)
@@ -360,13 +376,14 @@ impl command_agent::Server for CommandAgentImpl {
         let opts = ExecOpts {
             shell: self.config.shell.clone(),
             max_output_bytes: self.config.max_output_bytes,
+            kill_grace: KILL_GRACE,
+            pipe_drain: PIPE_DRAIN,
         };
 
-        // Collect JoinHandles for all spawned receive calls so we can await
-        // them after execute_stream returns (draining in-flight RPC sends).
-        let handles: Rc<RefCell<Vec<tokio::task::JoinHandle<()>>>> =
-            Rc::new(RefCell::new(Vec::new()));
-        let handles_clone = handles.clone();
+        // Receive calls sent but not yet answered, oldest first. capnp keeps
+        // call order; the window bounds memory and applies back-pressure.
+        let window: Rc<RefCell<VecDeque<ReceiveCall>>> = Rc::new(RefCell::new(VecDeque::new()));
+        let window_cb = window.clone();
 
         let exec_result = process::execute_stream(
             &command,
@@ -374,30 +391,52 @@ impl command_agent::Server for CommandAgentImpl {
             timeout_secs,
             &extra_env,
             &opts,
-            move |data: &[u8], stream: u8| {
-                let mut req = receiver.receive_request();
-                {
-                    let mut p = req.get();
-                    p.set_data(data);
-                    p.set_stream(stream);
+            move |data: Vec<u8>, stream: u8| {
+                let receiver = receiver.clone();
+                let window = window_cb.clone();
+                async move {
+                    if window.borrow().len() >= MAX_IN_FLIGHT {
+                        let oldest = window.borrow_mut().pop_front();
+                        if let Some(call) = oldest {
+                            call.await?;
+                        }
+                    }
+                    let mut req = receiver.receive_request();
+                    {
+                        let mut p = req.get();
+                        p.set_data(&data);
+                        p.set_stream(stream);
+                    }
+                    let send_promise = req.send().promise;
+                    window
+                        .borrow_mut()
+                        .push_back(Box::pin(async move { send_promise.await.map(|_| ()) }));
+                    Ok(())
                 }
-                let send_promise = req.send().promise;
-                let handle = tokio::task::spawn_local(async move {
-                    let _ = send_promise.await;
-                });
-                handles_clone.borrow_mut().push(handle);
             },
         )
-        .await
-        .map_err(|e| capnp::Error::failed(format!("exec_stream error: {e}")))?;
+        .await;
 
         let t_exec_done = Instant::now();
 
-        // Drain all pending receive calls before returning the result.
-        let pending: Vec<_> = handles.borrow_mut().drain(..).collect();
-        let drain_count = pending.len();
-        for handle in pending {
-            let _ = handle.await;
+        // Await every in-flight receive call on every path. A failed call
+        // means the client is gone: return an error (the command is already
+        // stopped by now, or was killed when the runner returned).
+        let drain_count = window.borrow().len();
+        let mut receive_error = None;
+        loop {
+            let oldest = window.borrow_mut().pop_front();
+            let Some(call) = oldest else { break };
+            if let Err(e) = call.await
+                && receive_error.is_none()
+            {
+                receive_error = Some(e);
+            }
+        }
+        let exec_result =
+            exec_result.map_err(|e| capnp::Error::failed(format!("exec_stream error: {e}")))?;
+        if let Some(e) = receive_error {
+            return Err(capnp::Error::failed(format!("receive failed: {e}")));
         }
 
         let t_drain_done = Instant::now();
@@ -426,7 +465,7 @@ impl command_agent::Server for CommandAgentImpl {
         r.set_exit_code(exec_result.exit_code);
         r.set_duration_ms(exec_result.duration_ms);
         r.set_timed_out(exec_result.timed_out);
-        r.set_truncated(false);
+        r.set_truncated(exec_result.truncated);
         r.set_request_id(&request_id);
         r.set_profiler_json(&profile_json);
 
@@ -452,6 +491,8 @@ impl command_agent::Server for CommandAgentImpl {
     }
 }
 
+type ReceiveCall = Pin<Box<dyn Future<Output = Result<(), capnp::Error>>>>;
+
 /// Handle a single incoming connection: set up Cap'n Proto RPC with the authenticator.
 pub async fn handle_connection(
     stream: tokio::net::TcpStream,
@@ -460,6 +501,27 @@ pub async fn handle_connection(
     rate_limits: Rc<RefCell<HashMap<IpAddr, RateLimitState>>>,
     concurrency_guard: Rc<ConcurrencyGuard>,
     agent_start_time: Instant,
+) -> Result<()> {
+    handle_connection_with(
+        stream,
+        peer_ip,
+        config,
+        rate_limits,
+        concurrency_guard,
+        agent_start_time,
+        PRE_AUTH_TIMEOUT,
+    )
+    .await
+}
+
+async fn handle_connection_with(
+    stream: tokio::net::TcpStream,
+    peer_ip: IpAddr,
+    config: Rc<AgentConfig>,
+    rate_limits: Rc<RefCell<HashMap<IpAddr, RateLimitState>>>,
+    concurrency_guard: Rc<ConcurrencyGuard>,
+    agent_start_time: Instant,
+    pre_auth_timeout: Duration,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     let stream = stream.compat();
@@ -479,9 +541,22 @@ pub async fn handle_connection(
         concurrency_guard,
         agent_start_time,
     );
+    let authenticated = authenticator.authenticated.clone();
     let auth_client: authenticator::Client = capnp_rpc::new_client(authenticator);
 
-    let rpc_system = capnp_rpc::RpcSystem::new(Box::new(network), Some(auth_client.client));
+    let mut rpc_system = Box::pin(capnp_rpc::RpcSystem::new(
+        Box::new(network),
+        Some(auth_client.client),
+    ));
+
+    tokio::select! {
+        r = &mut rpc_system => return Ok(r?),
+        _ = tokio::time::sleep(pre_auth_timeout) => {}
+    }
+    if !authenticated.get() {
+        tracing::warn!(peer = %peer_ip, "closing connection: not authenticated in time");
+        return Ok(());
+    }
 
     rpc_system.await?;
     Ok(())
@@ -490,6 +565,45 @@ pub async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unauthenticated_connection_is_closed() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let _client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .unwrap();
+                let (stream, peer) = listener.accept().await.unwrap();
+                let config = Rc::new(AgentConfig {
+                    bind: "127.0.0.1".to_string(),
+                    port: 0,
+                    shell: "sh".to_string(),
+                    psk: "psk".to_string(),
+                    max_output_bytes: 1024,
+                    max_concurrent: 1,
+                });
+                let started = Instant::now();
+                let done = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    handle_connection_with(
+                        stream,
+                        peer.ip(),
+                        config,
+                        Rc::new(RefCell::new(HashMap::new())),
+                        Rc::new(ConcurrencyGuard::new(1)),
+                        Instant::now(),
+                        Duration::from_millis(200),
+                    ),
+                )
+                .await;
+                assert!(done.expect("connection was not closed").is_ok());
+                assert!(started.elapsed() < Duration::from_secs(2));
+            })
+            .await;
+    }
 
     #[test]
     fn concurrency_guard_acquire_and_release() {
