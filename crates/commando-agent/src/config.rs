@@ -12,15 +12,6 @@ pub struct AgentConfig {
     pub max_output_bytes: usize,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
-    /// When true, wrap commands with `rtk` for token-optimized output.
-    /// Requires `rtk` binary on PATH. Shorthand for `wrapper = "rtk"`.
-    #[serde(default)]
-    pub rtk: bool,
-
-    /// Command wrapper binary for output optimization (e.g., "rtk").
-    /// Takes precedence over the `rtk` field if set.
-    #[serde(default)]
-    pub wrapper: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -42,18 +33,6 @@ impl AgentConfig {
         let config: Self = toml::from_str(&content)?;
         Ok(config)
     }
-
-    /// Returns the wrapper binary name, if any.
-    /// `wrapper` field takes precedence; `rtk = true` is shorthand for `wrapper = "rtk"`.
-    pub fn wrapper_binary(&self) -> Option<&str> {
-        if let Some(ref w) = self.wrapper {
-            Some(w)
-        } else if self.rtk {
-            Some("rtk")
-        } else {
-            None
-        }
-    }
 }
 
 #[cfg(test)]
@@ -69,7 +48,6 @@ shell = "bash"
 psk = "abcdef1234567890"
 max_output_bytes = 131072
 max_concurrent = 8
-rtk = true
 "#;
         let config: AgentConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.bind, "10.0.0.5");
@@ -78,8 +56,6 @@ rtk = true
         assert_eq!(config.psk, "abcdef1234567890");
         assert_eq!(config.max_output_bytes, 131_072);
         assert_eq!(config.max_concurrent, 8);
-        assert!(config.rtk);
-        assert_eq!(config.wrapper_binary(), Some("rtk"));
     }
 
     #[test]
@@ -93,30 +69,17 @@ psk = "secret"
         assert_eq!(config.shell, "sh");
         assert_eq!(config.max_output_bytes, 131_072);
         assert_eq!(config.max_concurrent, 8);
-        assert!(!config.rtk);
-        assert_eq!(config.wrapper_binary(), None);
     }
 
     #[test]
-    fn parse_custom_wrapper() {
-        let toml_str = r#"
-bind = "0.0.0.0"
-psk = "secret"
-wrapper = "my-optimizer"
-"#;
-        let config: AgentConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.wrapper_binary(), Some("my-optimizer"));
-    }
-
-    #[test]
-    fn wrapper_overrides_rtk() {
+    fn legacy_rtk_and_wrapper_keys_are_ignored() {
         let toml_str = r#"
 bind = "0.0.0.0"
 psk = "secret"
 rtk = true
-wrapper = "custom-bin"
+wrapper = "x"
 "#;
         let config: AgentConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.wrapper_binary(), Some("custom-bin"));
+        assert_eq!(config.bind, "0.0.0.0");
     }
 }

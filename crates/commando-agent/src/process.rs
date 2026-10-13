@@ -6,8 +6,6 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
-use crate::wrapper;
-
 const FALLBACK_HOME: &str = "/root";
 const FALLBACK_USER: &str = "root";
 
@@ -22,8 +20,6 @@ fn current_user_env() -> (PathBuf, String) {
 pub struct ExecOpts {
     pub shell: String,
     pub max_output_bytes: usize,
-    /// Wrapper binary name (e.g., "rtk"). None = no wrapping.
-    pub wrapper: Option<String>,
 }
 
 pub struct ExecResult {
@@ -41,13 +37,8 @@ fn build_command(
     extra_env: &[(String, String)],
     opts: &ExecOpts,
 ) -> Command {
-    let mut cmd = if let Some(ref bin) = opts.wrapper {
-        wrapper::build_command(command, &opts.shell, bin)
-    } else {
-        let mut c = Command::new(&opts.shell);
-        c.arg("-c").arg(command);
-        c
-    };
+    let mut cmd = Command::new(&opts.shell);
+    cmd.arg("-c").arg(command);
 
     // Clean environment — do NOT inherit agent's env
     let (home, user) = current_user_env();
@@ -321,7 +312,6 @@ mod tests {
         ExecOpts {
             shell: "sh".to_string(),
             max_output_bytes: 131_072,
-            wrapper: None,
         }
     }
 
@@ -415,7 +405,6 @@ mod tests {
         let opts = ExecOpts {
             shell: "sh".to_string(),
             max_output_bytes: 100,
-            wrapper: None,
         };
         // Generate more than 100 bytes of output
         let result = execute("yes | head -n 200", "", 60, &[], &opts)
