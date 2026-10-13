@@ -5,6 +5,7 @@ resolver = "2"
 [workspace.package]
 version = "0.5.13"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 
 [workspace.dependencies]
@@ -19,5 +20,4 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 anyhow = "1"
-thiserror = "2"
 axum = "0.8"

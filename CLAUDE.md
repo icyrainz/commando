@@ -4,7 +4,7 @@ Zero-escaping command relay for homelab. See `docs/design.md` for full design.
 
 ## Build
 
-Requires Rust nightly (edition 2024):
+CI builds with current stable. Edition 2024 with let chains needs Rust 1.88 or later. `cargo +nightly` also works:
 
 ```bash
 cargo +nightly build --release
@@ -69,7 +69,7 @@ Always run these before pushing to remote:
 
 ```bash
 cargo +nightly fmt -- --check
-cargo +nightly clippy -- -D warnings
+cargo +nightly clippy --all-targets -- -D warnings
 cargo +nightly test
 ```
 
@@ -141,7 +141,7 @@ Pulls the Docker image from `ghcr.io/icyrainz/commando-gateway` and restarts the
 
 ## Release Workflow
 
-1. Run pre-push checks: `cargo +nightly fmt -- --check && cargo +nightly clippy -- -D warnings && cargo +nightly test`
+1. Run pre-push checks: `cargo +nightly fmt -- --check && cargo +nightly clippy --all-targets -- -D warnings && cargo +nightly test`
 2. Bump version in `Cargo.toml` (workspace-level), `cargo +nightly check` to update `Cargo.lock`
 3. Commit, tag (`vX.Y.Z`), push with `--tags`
 4. Wait for CI Release workflow: `gh run watch <id> --exit-status`

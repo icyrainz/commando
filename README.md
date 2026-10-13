@@ -491,7 +491,7 @@ docker logs commando-gateway --tail 50 -f   # follow live
 
 ## Building from Source
 
-Requires Rust nightly (edition 2024) and the `capnproto` system package:
+CI builds with current stable. Edition 2024 with let chains needs Rust 1.88 or later; `cargo +nightly` also works. Requires the `capnproto` system package:
 
 | Distro | Command |
 |--------|---------|

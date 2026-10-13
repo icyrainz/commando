@@ -1750,7 +1750,7 @@ mod tests {
         let sm = test_session_map();
         let (token, _) = sm.borrow_mut().create_session();
         // 40 bytes stdout + 40 bytes stderr, page max 50
-        populate_session(&sm, &token, &vec![b'O'; 40], &vec![b'E'; 40], true, 0);
+        populate_session(&sm, &token, &[b'O'; 40], &[b'E'; 40], true, 0);
 
         let config = streaming_config(50);
         let page = build_page(&sm, &token, &config).await.unwrap();
