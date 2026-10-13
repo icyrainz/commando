@@ -110,7 +110,7 @@ Requires: SSH root access to Proxmox nodes. Uses `pct list/push/exec` to deploy 
 ```
 Example: `./deploy/update-agents.sh akio-lab akio-garage`
 
-Requires: SSH root access to Proxmox nodes. Downloads the latest release from GitHub (or set `COMMANDO_VERSION=v0.3.2`), pushes binary + service file to every running LXC that already has an agent, restarts the service. Does NOT touch config or PSKs. Skips LXCs without an existing agent.
+Requires: SSH root access to Proxmox nodes. Downloads the latest release from GitHub (or set `COMMANDO_VERSION=v0.3.2`), pushes binary + service file to every running LXC that already has an agent, restarts the service. Does NOT touch config or PSKs. Skips LXCs without an existing agent. Set `COMMANDO_VMIDS="101 102"` to update only those VMIDs.
 
 ### Update/deploy gateway
 

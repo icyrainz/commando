@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Install or update the commando CLI on macOS or Linux.
 #
-# Downloads the correct binary from GitHub releases and installs to ~/.local/bin.
+# Downloads the correct binary from GitHub releases, verifies it against the
+# release SHA256SUMS (detects corrupted downloads; warns and continues if the
+# release has none), and installs to ~/.local/bin.
 # No root access required.
 #
 # Usage:
@@ -32,10 +34,57 @@ esac
 
 # Resolve download URL
 if [ "$VERSION" = "latest" ]; then
-    URL="https://github.com/$REPO/releases/latest/download/$BINARY_NAME"
+    BASE_URL="https://github.com/$REPO/releases/latest/download"
 else
-    URL="https://github.com/$REPO/releases/download/$VERSION/$BINARY_NAME"
+    BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
 fi
+URL="$BASE_URL/$BINARY_NAME"
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+# Verify $1 against the release SHA256SUMS entry for $2. Warn if the release has none.
+verify_checksum() {
+    local file="$1" name="$2" sums code expected actual
+    sums=$(mktemp)
+    code=$(curl -sSL -o "$sums" -w '%{http_code}' "$BASE_URL/SHA256SUMS") || {
+        rm -f "$sums"
+        echo "Error: could not download SHA256SUMS"
+        return 1
+    }
+    case "$code" in
+        200) ;;
+        404)
+            rm -f "$sums"
+            echo "Warning: release has no SHA256SUMS, skipping checksum verification"
+            return 0
+            ;;
+        *)
+            rm -f "$sums"
+            echo "Error: SHA256SUMS download returned HTTP $code"
+            return 1
+            ;;
+    esac
+    expected=$(awk -v n="$name" '$2 == n || $2 == "*" n {print $1; exit}' "$sums")
+    rm -f "$sums"
+    if [ -z "$expected" ]; then
+        echo "Error: SHA256SUMS has no entry for $name"
+        return 1
+    fi
+    actual=$(sha256_of "$file")
+    if [ "$expected" != "$actual" ]; then
+        echo "Error: checksum mismatch for $name"
+        echo "  expected $expected"
+        echo "  actual   $actual"
+        return 1
+    fi
+    echo "Checksum OK ($name)"
+}
 
 echo "=== Commando CLI Installer ==="
 echo "Platform: ${OS} ${ARCH}"
@@ -46,9 +95,11 @@ echo ""
 echo "Downloading $URL ..."
 mkdir -p "$INSTALL_DIR"
 TMPBIN=$(mktemp)
+trap 'rm -f "$TMPBIN"' EXIT
 curl -fSL -o "$TMPBIN" "$URL"
 chmod +x "$TMPBIN"
 echo "Downloaded $(wc -c < "$TMPBIN" | tr -d ' ') bytes"
+verify_checksum "$TMPBIN" "$BINARY_NAME"
 
 # Verify it runs
 if ! "$TMPBIN" --version >/dev/null 2>&1; then
@@ -106,17 +157,21 @@ else
 
     # Configure Claude Code MCP if 'claude' is available
     if command -v claude >/dev/null 2>&1; then
-        echo "Configuring Claude Code MCP server..."
-        claude mcp add commando \
-            --transport http \
-            --url "${COMMANDO_URL}/mcp" \
-            --header "Authorization: Bearer ${COMMANDO_API_KEY}" 2>/dev/null \
-            && echo "Claude Code MCP configured." \
-            || echo "Warning: failed to configure Claude Code MCP. Add manually with:"
-        echo "  claude mcp add commando --transport http --url \"\$COMMANDO_URL/mcp\" --header \"Authorization: Bearer \$COMMANDO_API_KEY\""
+        if claude mcp get commando </dev/null >/dev/null 2>&1; then
+            echo "Claude Code MCP already configured."
+        else
+            echo "Configuring Claude Code MCP server..."
+            if claude mcp add --scope user --transport http commando "${COMMANDO_URL}/mcp" \
+                --header "Authorization: Bearer ${COMMANDO_API_KEY}" </dev/null; then
+                echo "Claude Code MCP configured."
+            else
+                echo "Warning: failed to configure Claude Code MCP. Add manually with:"
+                echo "  claude mcp add --scope user --transport http commando \"\$COMMANDO_URL/mcp\" --header \"Authorization: Bearer \$COMMANDO_API_KEY\""
+            fi
+        fi
     else
         echo "To connect Claude Code, run:"
-        echo "  claude mcp add commando --transport http --url \"\$COMMANDO_URL/mcp\" --header \"Authorization: Bearer \$COMMANDO_API_KEY\""
+        echo "  claude mcp add --scope user --transport http commando \"\$COMMANDO_URL/mcp\" --header \"Authorization: Bearer \$COMMANDO_API_KEY\""
     fi
 
     echo ""

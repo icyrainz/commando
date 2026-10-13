@@ -221,7 +221,7 @@ Verify: `commando list` should show your targets.
 Add the MCP server for target discovery:
 
 ```bash
-claude mcp add commando --transport http --url "$COMMANDO_URL/mcp" \
+claude mcp add --scope user --transport http commando "$COMMANDO_URL/mcp" \
   --header "Authorization: Bearer $COMMANDO_API_KEY"
 ```
 

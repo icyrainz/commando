@@ -146,6 +146,9 @@ jobs:
           mv artifacts/binaries-macos-arm64/commando commando-cli-aarch64-macos
           chmod +x commando-*-linux commando-*-macos
 
+      - name: Generate checksums
+        run: sha256sum commando-*-linux commando-*-macos > SHA256SUMS
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -158,3 +161,4 @@ jobs:
             commando-agent-aarch64-linux
             commando-cli-aarch64-linux
             commando-cli-aarch64-macos
+            SHA256SUMS

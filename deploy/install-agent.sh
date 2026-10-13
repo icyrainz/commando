@@ -3,7 +3,9 @@
 # Works for both Proxmox LXCs and standalone hosts — architecture-agnostic.
 #
 # What it does:
-#   - Downloads the correct binary from GitHub releases
+#   - Downloads the correct binary from GitHub releases and verifies it against
+#     the release SHA256SUMS (detects corrupted downloads; warns and continues if
+#     the release has none)
 #   - Installs/updates /usr/local/bin/commando-agent and the systemd service
 #   - First install: generates a PSK, creates /etc/commando/agent.toml,
 #     and prints the TOML snippets to add to gateway.toml
@@ -42,10 +44,57 @@ esac
 
 # Resolve download URL
 if [ "$VERSION" = "latest" ]; then
-    URL="https://github.com/$REPO/releases/latest/download/$BINARY_NAME"
+    BASE_URL="https://github.com/$REPO/releases/latest/download"
 else
-    URL="https://github.com/$REPO/releases/download/$VERSION/$BINARY_NAME"
+    BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
 fi
+URL="$BASE_URL/$BINARY_NAME"
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+# Verify $1 against the release SHA256SUMS entry for $2. Warn if the release has none.
+verify_checksum() {
+    local file="$1" name="$2" sums code expected actual
+    sums=$(mktemp)
+    code=$(curl -sSL -o "$sums" -w '%{http_code}' "$BASE_URL/SHA256SUMS") || {
+        rm -f "$sums"
+        echo "Error: could not download SHA256SUMS"
+        return 1
+    }
+    case "$code" in
+        200) ;;
+        404)
+            rm -f "$sums"
+            echo "Warning: release has no SHA256SUMS, skipping checksum verification"
+            return 0
+            ;;
+        *)
+            rm -f "$sums"
+            echo "Error: SHA256SUMS download returned HTTP $code"
+            return 1
+            ;;
+    esac
+    expected=$(awk -v n="$name" '$2 == n || $2 == "*" n {print $1; exit}' "$sums")
+    rm -f "$sums"
+    if [ -z "$expected" ]; then
+        echo "Error: SHA256SUMS has no entry for $name"
+        return 1
+    fi
+    actual=$(sha256_of "$file")
+    if [ "$expected" != "$actual" ]; then
+        echo "Error: checksum mismatch for $name"
+        echo "  expected $expected"
+        echo "  actual   $actual"
+        return 1
+    fi
+    echo "Checksum OK ($name)"
+}
 
 echo "=== Commando Agent Installer ==="
 echo "Architecture: $ARCH"
@@ -55,9 +104,11 @@ echo ""
 # Download binary
 echo "Downloading $URL ..."
 TMPBIN=$(mktemp)
+trap 'rm -f "$TMPBIN"' EXIT
 curl -fSL -o "$TMPBIN" "$URL"
 chmod +x "$TMPBIN"
 echo "Downloaded $(wc -c < "$TMPBIN" | tr -d ' ') bytes"
+verify_checksum "$TMPBIN" "$BINARY_NAME"
 
 # Stop existing agent if running
 if systemctl is-active --quiet commando-agent 2>/dev/null; then
