@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -27,8 +27,8 @@ pub struct RpcProfile {
 }
 
 pub struct Session {
-    pub stdout_buffer: Vec<u8>,
-    pub stderr_buffer: Vec<u8>,
+    stdout_buffer: VecDeque<u8>,
+    stderr_buffer: VecDeque<u8>,
     pub completed: bool,
     pub exec_result: Option<StreamExecResult>,
     pub rpc_profile: Option<RpcProfile>,
@@ -40,8 +40,8 @@ pub struct Session {
 impl Session {
     fn new() -> Self {
         Self {
-            stdout_buffer: Vec::new(),
-            stderr_buffer: Vec::new(),
+            stdout_buffer: VecDeque::new(),
+            stderr_buffer: VecDeque::new(),
             completed: false,
             exec_result: None,
             rpc_profile: None,
@@ -51,30 +51,54 @@ impl Session {
         }
     }
 
+    pub fn push_stdout(&mut self, data: &[u8]) {
+        self.stdout_buffer.extend(data);
+    }
+
+    pub fn push_stderr(&mut self, data: &[u8]) {
+        self.stderr_buffer.extend(data);
+    }
+
     pub fn drain_stdout(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.stdout_buffer)
+        self.stdout_buffer.drain(..).collect()
     }
 
     pub fn drain_stderr(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.stderr_buffer)
+        self.stderr_buffer.drain(..).collect()
     }
 
+    /// Remove up to `max_bytes` from the front of stdout. Cost is O(returned bytes).
     pub fn drain_stdout_up_to(&mut self, max_bytes: usize) -> Vec<u8> {
-        if self.stdout_buffer.len() <= max_bytes {
-            std::mem::take(&mut self.stdout_buffer)
-        } else {
-            let remainder = self.stdout_buffer.split_off(max_bytes);
-            std::mem::replace(&mut self.stdout_buffer, remainder)
+        let n = max_bytes.min(self.stdout_buffer.len());
+        self.stdout_buffer.drain(..n).collect()
+    }
+
+    /// Remove up to `max_bytes` from the front of stderr. Cost is O(returned bytes).
+    pub fn drain_stderr_up_to(&mut self, max_bytes: usize) -> Vec<u8> {
+        let n = max_bytes.min(self.stderr_buffer.len());
+        self.stderr_buffer.drain(..n).collect()
+    }
+
+    /// Return bytes to the front of stdout (undo part of a drain).
+    pub fn put_back_stdout(&mut self, bytes: &[u8]) {
+        for &b in bytes.iter().rev() {
+            self.stdout_buffer.push_front(b);
         }
     }
 
-    pub fn drain_stderr_up_to(&mut self, max_bytes: usize) -> Vec<u8> {
-        if self.stderr_buffer.len() <= max_bytes {
-            std::mem::take(&mut self.stderr_buffer)
-        } else {
-            let remainder = self.stderr_buffer.split_off(max_bytes);
-            std::mem::replace(&mut self.stderr_buffer, remainder)
+    /// Return bytes to the front of stderr (undo part of a drain).
+    pub fn put_back_stderr(&mut self, bytes: &[u8]) {
+        for &b in bytes.iter().rev() {
+            self.stderr_buffer.push_front(b);
         }
+    }
+
+    pub fn stdout_buffered(&self) -> usize {
+        self.stdout_buffer.len()
+    }
+
+    pub fn stderr_buffered(&self) -> usize {
+        self.stderr_buffer.len()
     }
 
     pub fn touch(&mut self) {
@@ -197,16 +221,10 @@ mod tests {
         let (token, _) = map.create_session();
         map.get_by_token_mut(&token)
             .unwrap()
-            .stdout_buffer
-            .extend_from_slice(b"hello world");
+            .push_stdout(b"hello world");
         let drained = map.get_by_token_mut(&token).unwrap().drain_stdout();
         assert_eq!(drained, b"hello world");
-        assert!(
-            map.get_by_token_mut(&token)
-                .unwrap()
-                .stdout_buffer
-                .is_empty()
-        );
+        assert_eq!(map.get_by_token_mut(&token).unwrap().stdout_buffered(), 0);
     }
 
     #[test]
@@ -215,8 +233,7 @@ mod tests {
         let (token, _) = map.create_session();
         map.get_by_token_mut(&token)
             .unwrap()
-            .stderr_buffer
-            .extend_from_slice(b"err msg");
+            .push_stderr(b"err msg");
         let drained = map.get_by_token_mut(&token).unwrap().drain_stderr();
         assert_eq!(drained, b"err msg");
     }
@@ -245,11 +262,21 @@ mod tests {
         let mut map = SessionMap::new();
         let (token, _) = map.create_session();
         let session = map.get_by_token_mut(&token).unwrap();
-        session
-            .stdout_buffer
-            .extend_from_slice(b"hello world, this is a longer message");
+        session.push_stdout(b"hello world, this is a longer message");
         let drained = session.drain_stdout_up_to(11);
         assert_eq!(drained, b"hello world");
-        assert_eq!(session.stdout_buffer, b", this is a longer message");
+        assert_eq!(session.drain_stdout(), b", this is a longer message");
+    }
+
+    #[test]
+    fn session_put_back_restores_front() {
+        let mut map = SessionMap::new();
+        let (token, _) = map.create_session();
+        let session = map.get_by_token_mut(&token).unwrap();
+        session.push_stdout(b"abcdef");
+        let drained = session.drain_stdout_up_to(4);
+        session.put_back_stdout(&drained[2..]);
+        session.push_stdout(b"gh");
+        assert_eq!(session.drain_stdout(), b"cdefgh");
     }
 }

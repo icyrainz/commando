@@ -209,8 +209,8 @@ impl output_receiver::Server for OutputReceiverImpl {
             let mut map = self.session_map.borrow_mut();
             if let Some(session) = map.get_by_id_mut(&self.session_id) {
                 match stream {
-                    0 => session.stdout_buffer.extend_from_slice(data),
-                    1 => session.stderr_buffer.extend_from_slice(data),
+                    0 => session.push_stdout(data),
+                    1 => session.push_stderr(data),
                     _ => {} // ignore unknown streams
                 }
                 Some(session.notify.clone())
@@ -227,9 +227,18 @@ impl output_receiver::Server for OutputReceiverImpl {
 }
 
 /// RAII guard that releases a concurrency slot on drop.
-struct LimiterGuard {
+///
+/// Create it at the moment `try_acquire` succeeds so every early return or
+/// panic afterwards releases the slot.
+pub struct LimiterGuard {
     limiter: Arc<ConcurrencyLimiter>,
     target: String,
+}
+
+impl LimiterGuard {
+    pub fn new(limiter: Arc<ConcurrencyLimiter>, target: String) -> Self {
+        Self { limiter, target }
+    }
 }
 
 impl Drop for LimiterGuard {
@@ -242,8 +251,8 @@ impl Drop for LimiterGuard {
 ///
 /// Unlike `remote_exec()` which creates a throwaway `LocalSet` per request,
 /// this function uses `spawn_local` directly — the caller must already be
-/// running on the main `LocalSet`. The caller must have already acquired
-/// a concurrency slot; the spawned task releases it via the RAII guard.
+/// running on the main `LocalSet`. The caller passes the `LimiterGuard` for
+/// the slot it acquired; the spawned task owns it and releases the slot on drop.
 #[allow(clippy::too_many_arguments)]
 pub fn start_remote_exec_stream(
     host: &str,
@@ -257,7 +266,7 @@ pub fn start_remote_exec_stream(
     connect_timeout_secs: u64,
     session_map: Rc<RefCell<SessionMap>>,
     session_id: String,
-    limiter: Arc<ConcurrencyLimiter>,
+    guard: LimiterGuard,
     target_name: String,
 ) -> tokio::task::JoinHandle<()> {
     // Clone everything we need into the spawned task.
@@ -269,10 +278,7 @@ pub fn start_remote_exec_stream(
     let request_id = request_id.to_string();
 
     tokio::task::spawn_local(async move {
-        let _guard = LimiterGuard {
-            limiter,
-            target: target_name.clone(),
-        };
+        let _guard = guard;
 
         let result = exec_stream_inner(
             &host,

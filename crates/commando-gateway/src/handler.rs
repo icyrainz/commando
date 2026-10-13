@@ -300,6 +300,50 @@ async fn handle_tools_call(
     }
 }
 
+/// Truncate `s` to at most `max` bytes, cutting at a char boundary.
+fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Length of a trailing, incomplete UTF-8 sequence in `bytes` (0 if none).
+/// Invalid bytes do not count; only a sequence that more bytes could complete.
+fn incomplete_utf8_tail_len(bytes: &[u8]) -> usize {
+    let window = bytes.len().min(3);
+    let tail = &bytes[bytes.len() - window..];
+    let Some(lead) = tail.iter().rposition(|b| b & 0xC0 != 0x80) else {
+        return 0;
+    };
+    match std::str::from_utf8(&tail[lead..]) {
+        Err(e) if e.error_len().is_none() => tail.len() - lead,
+        _ => 0,
+    }
+}
+
+/// Split an incomplete trailing UTF-8 sequence off a drained page and return it
+/// so the caller can put it back at the front of the buffer.
+///
+/// Nothing is held back when `stream_done` (session completed and buffer empty:
+/// the tail is emitted lossy), or when the page was cut by a full `page_max`
+/// and the tail is the whole page (holding it back would stall progress).
+fn take_incomplete_tail(bytes: &mut Vec<u8>, page_max: usize, stream_done: bool) -> Vec<u8> {
+    if stream_done {
+        return Vec::new();
+    }
+    let hold = incomplete_utf8_tail_len(bytes);
+    if hold > 0 && (hold < bytes.len() || bytes.len() < page_max) {
+        bytes.split_off(bytes.len() - hold)
+    } else {
+        Vec::new()
+    }
+}
+
 fn audit_exec(
     audit: &AuditLogger,
     target: &str,
@@ -308,11 +352,7 @@ fn audit_exec(
     source: &str,
 ) {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let cmd = if command.len() > 500 {
-        &command[..500]
-    } else {
-        command
-    };
+    let cmd = truncate_at_char_boundary(command, 500);
     match result {
         Ok(page) => {
             audit.log(&AuditEntry {
@@ -390,13 +430,15 @@ pub async fn handle_exec_core(
             "concurrency limit reached for target: {target_name}"
         )));
     }
+    // Owns the slot from here on: any early return or panic releases it.
+    let guard = rpc::LimiterGuard::new(limiter.clone(), target_name.to_string());
 
     let request_id = uuid::Uuid::new_v4().to_string();
     profiler.stage("setup");
 
     info!(
         target = target_name,
-        command = &command[..command.len().min(200)],
+        command = truncate_at_char_boundary(command, 200),
         request_id = %request_id,
         "executing command"
     );
@@ -404,7 +446,7 @@ pub async fn handle_exec_core(
     // Create a streaming session
     let (token, session_id) = session_map.borrow_mut().create_session();
 
-    // Start the streaming RPC (the spawned task releases the concurrency slot via RAII guard)
+    // Start the streaming RPC (the spawned task owns the guard and releases the slot)
     let join_handle = rpc::start_remote_exec_stream(
         &host,
         port,
@@ -417,7 +459,7 @@ pub async fn handle_exec_core(
         config.agent.connect_timeout_secs,
         session_map.clone(),
         session_id.clone(),
-        limiter.clone(),
+        guard,
         target_name.to_string(),
     );
     profiler.stage("spawn_rpc");
@@ -578,9 +620,16 @@ pub async fn build_page(
             .ok_or_else(|| "invalid or expired page token".to_string())?;
         session.touch();
 
-        let stdout_bytes = session.drain_stdout_up_to(page_max);
+        let mut stdout_bytes = session.drain_stdout_up_to(page_max);
+        let stdout_done = session.completed && session.stdout_buffered() == 0;
+        let tail = take_incomplete_tail(&mut stdout_bytes, page_max, stdout_done);
+        session.put_back_stdout(&tail);
+
         let remaining_budget = page_max.saturating_sub(stdout_bytes.len());
-        let stderr_bytes = session.drain_stderr_up_to(remaining_budget);
+        let mut stderr_bytes = session.drain_stderr_up_to(remaining_budget);
+        let stderr_done = session.completed && session.stderr_buffered() == 0;
+        let tail = take_incomplete_tail(&mut stderr_bytes, page_max, stderr_done);
+        session.put_back_stderr(&tail);
         let has_remaining = session.total_buffered() > 0;
 
         if has_remaining {
@@ -1541,8 +1590,8 @@ mod tests {
     ) {
         let mut map = session_map.borrow_mut();
         let session = map.get_by_token_mut(token).unwrap();
-        session.stdout_buffer.extend_from_slice(stdout);
-        session.stderr_buffer.extend_from_slice(stderr);
+        session.push_stdout(stdout);
+        session.push_stderr(stderr);
         if completed {
             session.completed = true;
             session.exec_result = Some(crate::session::StreamExecResult {
@@ -1963,7 +2012,7 @@ mod tests {
             {
                 let mut map = sm.borrow_mut();
                 let session = map.get_by_token_mut(&token).unwrap();
-                session.stdout_buffer.extend_from_slice(b"fast output");
+                session.push_stdout(b"fast output");
                 session.notify.notify_one();
             }
 
@@ -1999,5 +2048,239 @@ mod tests {
             // Session should be cleaned up
             assert!(sm.borrow().get_by_token(&token).is_none());
         });
+    }
+
+    // ---- Regression: truncation, slot leak, UTF-8 page boundary ----
+
+    #[test]
+    fn truncate_at_char_boundary_cases() {
+        assert_eq!(truncate_at_char_boundary("hello", 10), "hello");
+        assert_eq!(truncate_at_char_boundary("hello", 3), "hel");
+        // "é" is 2 bytes; limit 1 falls inside it.
+        assert_eq!(truncate_at_char_boundary("aéb", 2), "a");
+        assert_eq!(truncate_at_char_boundary("aéb", 3), "aé");
+    }
+
+    #[test]
+    fn incomplete_tail_detection() {
+        assert_eq!(incomplete_utf8_tail_len(b"abc"), 0);
+        assert_eq!(incomplete_utf8_tail_len(b"ab\xC3"), 1);
+        assert_eq!(incomplete_utf8_tail_len(b"ab\xE2\x82"), 2);
+        assert_eq!(incomplete_utf8_tail_len(b"\xF0\x9F\x98"), 3);
+        assert_eq!(incomplete_utf8_tail_len("é".as_bytes()), 0);
+        // Invalid bytes are not held back.
+        assert_eq!(incomplete_utf8_tail_len(b"ab\xFF"), 0);
+        assert_eq!(incomplete_utf8_tail_len(b"\x80\x80\x80"), 0);
+    }
+
+    #[tokio::test]
+    async fn exec_multibyte_command_at_log_limit_does_not_panic() {
+        let _g = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .finish(),
+        );
+        let config = test_config_with_target();
+        let registry = Arc::new(Mutex::new(Registry::from_manual(vec![
+            crate::registry::ManualTargetInput {
+                name: "my-box".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 1,
+                shell: "bash".to_string(),
+                tags: vec![],
+            },
+        ])));
+        let limiter = Arc::new(ConcurrencyLimiter::new(4));
+        // Byte 200 falls inside "é" (bytes 199..201).
+        let command = format!("{}é{}", "a".repeat(199), "b".repeat(10));
+        let local = tokio::task::LocalSet::new();
+        let result = local
+            .run_until(handle_exec_core(
+                "my-box",
+                &command,
+                "",
+                None,
+                vec![],
+                &config,
+                &registry,
+                &limiter,
+                &test_session_map(),
+                &mut Profiler::new(false),
+            ))
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn audit_multibyte_command_at_limit_does_not_panic() {
+        let config = test_config();
+        let registry = registry_with_target();
+        let limiter = Arc::new(ConcurrencyLimiter::new(4));
+        // Byte 500 falls inside "é" (bytes 499..501).
+        let command = format!("{}é", "a".repeat(499));
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "__rest": "exec",
+            "target": "nope",
+            "command": command,
+        });
+        let resp = dispatch_request(
+            &request,
+            &config,
+            &registry,
+            &limiter,
+            &test_session_map(),
+            &test_audit(),
+        )
+        .await;
+        assert!(resp.is_some());
+    }
+
+    #[tokio::test]
+    async fn slot_released_when_failure_between_acquire_and_task_start() {
+        use futures::FutureExt as _;
+        let config = test_config_with_target();
+        let registry = registry_with_target();
+        let limiter = Arc::new(ConcurrencyLimiter::new(4));
+        let session_map = test_session_map();
+        // No LocalSet: spawn_local panics after the slot is acquired.
+        for _ in 0..5 {
+            let mut profiler = Profiler::new(false);
+            let fut = handle_exec_core(
+                "my-box",
+                "echo hi",
+                "",
+                None,
+                vec![],
+                &config,
+                &registry,
+                &limiter,
+                &session_map,
+                &mut profiler,
+            );
+            let outcome = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
+            assert!(
+                outcome.is_err(),
+                "expected spawn_local panic, got {outcome:?}"
+            );
+        }
+        // All slots are free again.
+        for _ in 0..4 {
+            assert!(limiter.try_acquire("my-box"));
+        }
+    }
+
+    #[tokio::test]
+    async fn build_page_does_not_split_multibyte_char() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        let mut input = "a".repeat(15).into_bytes();
+        input.extend_from_slice("é!".as_bytes());
+        populate_session(&sm, &token, &input, b"", true, 0);
+
+        let config = streaming_config(16);
+        let mut out = String::new();
+        let mut token = token;
+        loop {
+            let page = build_page(&sm, &token, &config).await.unwrap();
+            assert!(!page.stdout.contains('\u{FFFD}'));
+            out.push_str(&page.stdout);
+            match page.next_page {
+                Some(t) => token = t,
+                None => break,
+            }
+        }
+        assert_eq!(out.as_bytes(), input.as_slice());
+    }
+
+    #[tokio::test]
+    async fn build_page_emits_lossy_tail_when_session_done() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        // Truncated sequence at the very end of a completed session.
+        populate_session(&sm, &token, b"ab\xC3", b"", true, 0);
+        let page = build_page(&sm, &token, &streaming_config(16))
+            .await
+            .unwrap();
+        assert_eq!(page.stdout, "ab\u{FFFD}");
+        assert!(page.next_page.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_page_holds_lone_partial_char_while_running() {
+        let sm = test_session_map();
+        let (token, session_id) = sm.borrow_mut().create_session();
+        populate_session(&sm, &token, b"ab\xC3", b"", false, 0);
+        let config = streaming_config(32768);
+
+        let page = build_page(&sm, &token, &config).await.unwrap();
+        assert_eq!(page.stdout, "ab");
+        let token = page.next_page.unwrap();
+
+        let page = build_page(&sm, &token, &config).await.unwrap();
+        assert_eq!(page.stdout, "");
+        let token = page.next_page.unwrap();
+
+        {
+            let mut map = sm.borrow_mut();
+            let session = map.get_by_id_mut(&session_id).unwrap();
+            session.push_stdout(b"\xA9");
+            session.completed = true;
+            session.exec_result = Some(crate::session::StreamExecResult {
+                exit_code: 0,
+                duration_ms: 1,
+                timed_out: false,
+            });
+        }
+        let page = build_page(&sm, &token, &config).await.unwrap();
+        assert_eq!(page.stdout, "é");
+        assert!(page.next_page.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_page_stderr_budget_does_not_split_char() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        populate_session(
+            &sm,
+            &token,
+            "a".repeat(15).as_bytes(),
+            "é!".as_bytes(),
+            true,
+            0,
+        );
+        let config = streaming_config(16);
+        let mut stderr = String::new();
+        let mut token = token;
+        loop {
+            let page = build_page(&sm, &token, &config).await.unwrap();
+            assert!(!page.stderr.contains('\u{FFFD}'));
+            stderr.push_str(&page.stderr);
+            match page.next_page {
+                Some(t) => token = t,
+                None => break,
+            }
+        }
+        assert_eq!(stderr, "é!");
+    }
+
+    #[tokio::test]
+    async fn build_page_tiny_page_max_still_progresses() {
+        let sm = test_session_map();
+        let (token, _) = sm.borrow_mut().create_session();
+        populate_session(&sm, &token, "é".as_bytes(), b"", true, 0);
+        let config = streaming_config(1);
+        let mut token = token;
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(pages <= 5, "paging did not terminate");
+            let page = build_page(&sm, &token, &config).await.unwrap();
+            match page.next_page {
+                Some(t) => token = t,
+                None => break,
+            }
+        }
     }
 }
