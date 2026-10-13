@@ -70,7 +70,6 @@ commando exec my-target 'hostname' --profile
     rpc_auth                 0.66ms
     rpc_exec                35.31ms
     build_page              36.32ms
-    audit                    0.00ms
     serialize                0.04ms
     agent_parse_params_ms    0.01ms
     agent_execute_ms        34.93ms
@@ -80,7 +79,7 @@ commando exec my-target 'hostname' --profile
 ──────────────────────────────────────────────
 ```
 
-The dominant cost is `agent_execute_ms` — the shell spawn (`sh -c`) on the target machine. Gateway routing, auth, and audit overhead are <1ms combined.
+The dominant cost is `agent_execute_ms` — the shell spawn (`sh -c`) on the target machine. Gateway routing and auth overhead are <1ms combined.
 
 For an AI agent executing dozens of commands per task, this is the difference between a responsive workflow and waiting.
 
@@ -420,11 +419,32 @@ Every command executed through Commando is logged to a JSONL file for accountabi
 
 **Default path:** `{cache_dir}/audit.log` (typically `/var/lib/commando/audit.log` inside the Docker container)
 
-**Format:** One JSON object per line:
+**Format:** One JSON object per line. A command writes two events linked by `request_id`; a refused request writes one.
+
 ```jsonl
-{"ts":"2026-03-14T19:30:00Z","target":"akio-lab/akio-arr","command":"docker ps","exit_code":0,"duration_ms":150,"source":"rest"}
-{"ts":"2026-03-14T19:30:05Z","target":"bad-target","command":"echo hi","source":"mcp","error":"unknown target: bad-target"}
+{"ts":"2026-03-14T19:30:00Z","event":"start","target":"akio-lab/akio-arr","command":"docker ps","request_id":"6f1c0c1e-6a53-4e0a-9d0e-0b7c5d6f1a2b","source":"rest"}
+{"ts":"2026-03-14T19:30:00Z","event":"end","target":"akio-lab/akio-arr","exit_code":0,"duration_ms":150,"request_id":"6f1c0c1e-6a53-4e0a-9d0e-0b7c5d6f1a2b","source":"rest","outcome":"completed"}
+{"ts":"2026-03-14T19:30:05Z","event":"rejected","target":"bad-target","command":"echo hi","source":"mcp","error":"unknown target: bad-target"}
 ```
+
+| Event | When | Fields |
+|-------|------|--------|
+| `start` | The command is accepted and its RPC task starts | `ts`, `target`, `command` (first 500 bytes), `request_id`, `source` |
+| `end` | The RPC task finishes or is aborted. Written once per `start`, even when no client polls for the result | `ts`, `target`, `request_id`, `source`, `outcome`; `exit_code` and `error` when known; `duration_ms` |
+| `rejected` | The request was refused before a command started (unknown target, no IP, no PSK, concurrency limit) | `ts`, `target`, `command`, `source`, `error` |
+
+`source` is `rest` or `mcp`. `outcome` on an `end` event is one of:
+
+- `completed`: the agent returned an exit code. `duration_ms` is the agent's measure.
+- `timed_out`: the command hit its timeout. `exit_code` and the agent's `duration_ms` are present.
+- `rpc_error`: connect, authentication or the RPC failed. `error` has the text. `duration_ms` is the gateway's wall time.
+- `aborted`: the gateway dropped the RPC task, for example when the session expired because no client polled. `duration_ms` is the gateway's wall time.
+
+A `start` with no matching `end` means the gateway process was killed or crashed before the command finished; the guard cannot run then.
+
+Rotation at `audit_log_max_bytes` can put a `start` in `audit.log.1` and its `end` in `audit.log`.
+
+Format change: an `rpc_error` end event has `error` and no `exit_code`. Before this version an RPC failure was logged with `exit_code: -1`.
 
 **Configuration:**
 ```toml

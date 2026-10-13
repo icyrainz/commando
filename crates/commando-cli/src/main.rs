@@ -166,11 +166,12 @@ async fn cmd_exec(
             eprint!("{stderr}");
             let _ = std::io::stderr().flush();
         }
-        if let Some(error) = json["error"].as_str() {
+        let error = json["error"].as_str();
+        let exit_code = json["exit_code"].as_i64();
+        if let Some(error) = error {
             eprintln!("error: {error}");
-            return 1;
         }
-        if let Some(exit_code) = json["exit_code"].as_i64() {
+        if error.is_some() || exit_code.is_some() {
             if profile {
                 let t_end = Instant::now();
                 print_profile(
@@ -182,7 +183,11 @@ async fn cmd_exec(
                     &server_profile,
                 );
             }
-            return exit_code as i32;
+            return if error.is_some() {
+                1
+            } else {
+                exit_code.unwrap_or(1) as i32
+            };
         }
         let next_page = match json["next_page"].as_str() {
             Some(p) => p.to_string(),

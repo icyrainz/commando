@@ -1,15 +1,25 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use serde::Serialize;
+
+use crate::handler::truncate_at_char_boundary;
+
+/// Longest command text kept in an audit line, in bytes.
+const MAX_COMMAND_BYTES: usize = 500;
 
 #[derive(Serialize)]
 pub struct AuditEntry<'a> {
     pub ts: String,
+    /// `start`, `end` or `rejected`.
+    pub event: &'a str,
     pub target: &'a str,
-    pub command: &'a str,
+    /// Omitted on `end` events; the `start` event with the same `request_id` has it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17,8 +27,15 @@ pub struct AuditEntry<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<&'a str>,
     pub source: &'a str,
+    /// Set on `end` events: `completed`, `timed_out`, `rpc_error` or `aborted`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<&'a str>,
+}
+
+fn now_ts() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 pub struct AuditLogger {
@@ -41,7 +58,8 @@ impl AuditLogger {
     }
 
     pub fn log(&self, entry: &AuditEntry<'_>) {
-        let _lock = self.mu.lock().unwrap();
+        // A poisoned lock only means another writer panicked; the file is still usable.
+        let _lock = self.mu.lock().unwrap_or_else(|e| e.into_inner());
 
         // Rotate if needed
         if let Ok(meta) = fs::metadata(&self.path)
@@ -73,6 +91,121 @@ impl AuditLogger {
     }
 }
 
+impl AuditLogger {
+    /// Log a request that was refused before any command started.
+    pub fn log_rejected(&self, target: &str, command: &str, source: &str, error: &str) {
+        self.log(&AuditEntry {
+            ts: now_ts(),
+            event: "rejected",
+            target,
+            command: Some(truncate_at_char_boundary(command, MAX_COMMAND_BYTES)),
+            exit_code: None,
+            duration_ms: None,
+            request_id: None,
+            source,
+            outcome: None,
+            error: Some(error),
+        });
+    }
+}
+
+enum Finish {
+    Exec {
+        exit_code: i32,
+        duration_ms: u64,
+        timed_out: bool,
+    },
+    RpcError(String),
+}
+
+/// Writes the `start` event on creation and exactly one `end` event on drop.
+///
+/// The rpc task owns it. The task reports the result before it finishes; if the
+/// task is aborted instead, the drop writes an `aborted` end event.
+pub struct ExecAudit {
+    logger: Arc<AuditLogger>,
+    target: String,
+    source: &'static str,
+    request_id: String,
+    started: Instant,
+    finish: Option<Finish>,
+}
+
+impl ExecAudit {
+    pub fn start(
+        logger: Arc<AuditLogger>,
+        target: &str,
+        command: &str,
+        source: &'static str,
+        request_id: &str,
+    ) -> Self {
+        logger.log(&AuditEntry {
+            ts: now_ts(),
+            event: "start",
+            target,
+            command: Some(truncate_at_char_boundary(command, MAX_COMMAND_BYTES)),
+            exit_code: None,
+            duration_ms: None,
+            request_id: Some(request_id),
+            source,
+            outcome: None,
+            error: None,
+        });
+        Self {
+            logger,
+            target: target.to_string(),
+            source,
+            request_id: request_id.to_string(),
+            started: Instant::now(),
+            finish: None,
+        }
+    }
+
+    /// The agent returned a result (`completed`, or `timed_out` when the agent says so).
+    pub fn exec_finished(&mut self, exit_code: i32, duration_ms: u64, timed_out: bool) {
+        self.finish = Some(Finish::Exec {
+            exit_code,
+            duration_ms,
+            timed_out,
+        });
+    }
+
+    /// The rpc failed before or while the command ran.
+    pub fn rpc_failed(&mut self, error: String) {
+        self.finish = Some(Finish::RpcError(error));
+    }
+}
+
+impl Drop for ExecAudit {
+    fn drop(&mut self) {
+        let wall_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let (outcome, exit_code, duration_ms, error) = match self.finish.take() {
+            Some(Finish::Exec {
+                exit_code,
+                duration_ms,
+                timed_out,
+            }) => {
+                let outcome = if timed_out { "timed_out" } else { "completed" };
+                (outcome, Some(exit_code), duration_ms, None)
+            }
+            Some(Finish::RpcError(e)) => ("rpc_error", None, wall_ms, Some(e)),
+            None => ("aborted", None, wall_ms, None),
+        };
+        self.logger.log(&AuditEntry {
+            ts: now_ts(),
+            event: "end",
+            target: &self.target,
+            command: None,
+            exit_code,
+            duration_ms: Some(duration_ms),
+            request_id: Some(&self.request_id),
+            source: self.source,
+            outcome: Some(outcome),
+            error: error.as_deref(),
+        });
+    }
+}
+
 /// Create an AuditLogger from config. If no explicit path is set, defaults to {cache_dir}/audit.log.
 pub fn create_logger(audit_log_path: Option<&str>, cache_dir: &str, max_bytes: u64) -> AuditLogger {
     let path = match audit_log_path {
@@ -98,22 +231,26 @@ mod tests {
 
         logger.log(&AuditEntry {
             ts: "2026-03-14T00:00:00Z".to_string(),
+            event: "end",
             target: "my-box",
-            command: "echo hi",
+            command: Some("echo hi"),
             exit_code: Some(0),
             duration_ms: Some(42),
             request_id: Some("abc"),
             source: "rest",
+            outcome: None,
             error: None,
         });
         logger.log(&AuditEntry {
             ts: "2026-03-14T00:00:01Z".to_string(),
+            event: "end",
             target: "my-box",
-            command: "ls",
+            command: Some("ls"),
             exit_code: Some(0),
             duration_ms: Some(10),
             request_id: Some("def"),
             source: "mcp",
+            outcome: None,
             error: None,
         });
 
@@ -135,12 +272,14 @@ mod tests {
 
         logger.log(&AuditEntry {
             ts: "2026-03-14T00:00:00Z".to_string(),
+            event: "end",
             target: "bad-target",
-            command: "echo hi",
+            command: Some("echo hi"),
             exit_code: None,
             duration_ms: None,
             request_id: None,
             source: "rest",
+            outcome: None,
             error: Some("unknown target: bad-target"),
         });
 
@@ -160,12 +299,14 @@ mod tests {
         for i in 0..10 {
             logger.log(&AuditEntry {
                 ts: format!("2026-03-14T00:00:{i:02}Z"),
+                event: "end",
                 target: "my-box",
-                command: "echo hello world this is a long command to fill up space",
+                command: Some("echo hello world this is a long command to fill up space"),
                 exit_code: Some(0),
                 duration_ms: Some(42),
                 request_id: Some("abc"),
                 source: "rest",
+                outcome: None,
                 error: None,
             });
         }
@@ -178,6 +319,29 @@ mod tests {
     }
 
     #[test]
+    fn exec_audit_without_result_writes_aborted() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = Arc::new(test_logger(dir.path()));
+
+        drop(ExecAudit::start(
+            logger, "my-box", "sleep 60", "mcp", "req-1",
+        ));
+
+        let content = fs::read_to_string(dir.path().join("audit.log")).unwrap();
+        let lines: Vec<serde_json::Value> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["event"], "start");
+        assert_eq!(lines[0]["command"], "sleep 60");
+        assert_eq!(lines[1]["event"], "end");
+        assert_eq!(lines[1]["outcome"], "aborted");
+        assert_eq!(lines[1]["request_id"], "req-1");
+        assert!(lines[1].get("command").is_none());
+    }
+
+    #[test]
     fn truncates_long_commands() {
         let long_cmd = "x".repeat(1000);
         let truncated = &long_cmd[..500];
@@ -187,12 +351,14 @@ mod tests {
 
         logger.log(&AuditEntry {
             ts: "2026-03-14T00:00:00Z".to_string(),
+            event: "end",
             target: "my-box",
-            command: truncated,
+            command: Some(truncated),
             exit_code: Some(0),
             duration_ms: Some(1),
             request_id: None,
             source: "rest",
+            outcome: None,
             error: None,
         });
 

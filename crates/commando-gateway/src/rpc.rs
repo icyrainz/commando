@@ -10,6 +10,7 @@ use tokio::time::timeout;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{error, info};
 
+use crate::audit::ExecAudit;
 use crate::handler::ConcurrencyLimiter;
 use crate::session::{SessionMap, StreamExecResult};
 use commando_common::auth;
@@ -42,6 +43,9 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Slack added to the command timeout for the `exec_stream` call deadline.
 const EXEC_GRACE: Duration = Duration::from_secs(30);
+/// Floor for the authentication deadline: the agent sleeps 1 s after three
+/// failed attempts from one IP, so a 1 s limit would misreport that as a timeout.
+const AUTH_MIN: Duration = Duration::from_secs(2);
 
 type RpcDisconnector = capnp_rpc::Disconnector<capnp_rpc::rpc_twoparty_capnp::Side>;
 
@@ -96,6 +100,7 @@ fn start_rpc(stream: TcpStream) -> (authenticator::Client, RpcDisconnector, Abor
 }
 
 /// The agent's message without capnp's "Failed: " and "remote exception: " prefixes.
+/// A kind other than `Failed` (for example `Disconnected`) stays in the text.
 fn rpc_message(e: &capnp::Error) -> String {
     let mut msg = e.extra.as_str();
     loop {
@@ -109,9 +114,26 @@ fn rpc_message(e: &capnp::Error) -> String {
     }
     if msg.is_empty() {
         e.to_string()
-    } else {
+    } else if e.kind == capnp::ErrorKind::Failed {
         msg.to_string()
+    } else {
+        format!("{:?}: {msg}", e.kind)
     }
+}
+
+/// Error text for a failed `step`, without a doubled step name.
+fn step_error(step: &str, e: &capnp::Error) -> anyhow::Error {
+    let msg = rpc_message(e);
+    if msg.starts_with(step) {
+        anyhow!(msg)
+    } else {
+        anyhow!("{step} failed: {msg}")
+    }
+}
+
+/// Deadline for the authentication exchange.
+fn auth_deadline(connect_timeout_secs: u64) -> Duration {
+    Duration::from_secs(connect_timeout_secs).max(AUTH_MIN)
 }
 
 /// Deadline for the `exec_stream` call. The agent maps a timeout of 0 to 60 s.
@@ -128,14 +150,7 @@ async fn within<T>(
 ) -> Result<T> {
     match timeout(limit, fut).await {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => {
-            let msg = rpc_message(&e);
-            if msg.starts_with(step) {
-                Err(anyhow!(msg))
-            } else {
-                Err(anyhow!("{step} failed: {msg}"))
-            }
-        }
+        Ok(Err(e)) => Err(step_error(step, &e)),
         Err(_) => Err(anyhow!("{step} timed out after {}s", limit.as_secs())),
     }
 }
@@ -212,7 +227,8 @@ pub async fn remote_ping(
     psk: &str,
     connect_timeout_secs: u64,
 ) -> Result<RemotePingResult> {
-    let deadline = Duration::from_secs(connect_timeout_secs.saturating_mul(2));
+    let deadline = Duration::from_secs(connect_timeout_secs)
+        .saturating_add(auth_deadline(connect_timeout_secs));
     let local = tokio::task::LocalSet::new();
     let run = local.run_until(async {
         let stream = connect_stream(host, port, connect_timeout_secs).await?;
@@ -220,15 +236,22 @@ pub async fn remote_ping(
 
         let agent_client = authenticate(&auth_client, psk.as_bytes(), connect_timeout_secs).await?;
 
-        let response = agent_client.ping_request().send().promise.await?;
-        let pong = response.get()?.get_pong()?;
-
-        let ping_result = RemotePingResult {
-            hostname: pong.get_hostname()?.to_str()?.to_string(),
-            uptime_secs: pong.get_uptime_secs(),
-            shell: pong.get_shell()?.to_str()?.to_string(),
-            version: pong.get_version()?.to_str()?.to_string(),
-        };
+        let response = within(
+            "ping",
+            Duration::from_secs(connect_timeout_secs),
+            agent_client.ping_request().send().promise,
+        )
+        .await?;
+        let ping_result = (|| -> Result<RemotePingResult, capnp::Error> {
+            let pong = response.get()?.get_pong()?;
+            Ok(RemotePingResult {
+                hostname: pong.get_hostname()?.to_str()?.to_string(),
+                uptime_secs: pong.get_uptime_secs(),
+                shell: pong.get_shell()?.to_str()?.to_string(),
+                version: pong.get_version()?.to_str()?.to_string(),
+            })
+        })()
+        .map_err(|e| step_error("ping result", &e))?;
 
         drop(agent_client);
         drop(auth_client);
@@ -325,6 +348,7 @@ pub fn start_remote_exec_stream(
     session_id: String,
     guard: LimiterGuard,
     target_name: String,
+    audit: Option<ExecAudit>,
 ) -> tokio::task::JoinHandle<()> {
     // Clone everything we need into the spawned task.
     let host = host.to_string();
@@ -336,6 +360,8 @@ pub fn start_remote_exec_stream(
 
     tokio::task::spawn_local(async move {
         let _guard = guard;
+        // Dropped without a result (task aborted) it writes the `aborted` end event.
+        let mut audit = audit;
 
         let result = exec_stream_inner(
             &host,
@@ -351,6 +377,18 @@ pub fn start_remote_exec_stream(
             session_id.clone(),
         )
         .await;
+
+        // Write the end event before the session reads as completed, so a client
+        // that sees the final page can rely on the log being complete.
+        if let Some(a) = audit.as_mut() {
+            match &result {
+                Ok((exit_code, duration_ms, timed_out, _)) => {
+                    a.exec_finished(*exit_code, *duration_ms, *timed_out);
+                }
+                Err(e) => a.rpc_failed(e.to_string()),
+            }
+        }
+        drop(audit);
 
         // Mark session completed regardless of success/failure.
         // Clone notify before dropping the borrow to avoid holding RefCell across notify_one()
@@ -461,17 +499,23 @@ async fn exec_stream_inner(
         request.send().promise,
     )
     .await?;
-    let result = response.get()?.get_result()?;
-
-    let exit_code = result.get_exit_code();
-    let duration_ms = result.get_duration_ms();
-    let timed_out = result.get_timed_out();
-    let agent_profile_json = result
-        .get_profiler_json()
-        .ok()
-        .and_then(|s| s.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let (exit_code, duration_ms, timed_out, agent_profile_json) =
+        (|| -> Result<_, capnp::Error> {
+            let result = response.get()?.get_result()?;
+            let agent_profile_json = result
+                .get_profiler_json()
+                .ok()
+                .and_then(|s| s.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            Ok((
+                result.get_exit_code(),
+                result.get_duration_ms(),
+                result.get_timed_out(),
+                agent_profile_json,
+            ))
+        })()
+        .map_err(|e| step_error("exec_stream result", &e))?;
     let t_exec_done = Instant::now();
 
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
@@ -496,7 +540,7 @@ async fn exec_stream_inner(
 }
 
 /// Perform HMAC challenge-response authentication, returns CommandAgent capability.
-/// The whole exchange must finish within `connect_timeout_secs`.
+/// The whole exchange must finish within `connect_timeout_secs` (at least `AUTH_MIN`).
 async fn authenticate(
     auth_client: &authenticator::Client,
     psk: &[u8],
@@ -504,7 +548,7 @@ async fn authenticate(
 ) -> Result<command_agent::Client> {
     within(
         "authentication",
-        Duration::from_secs(connect_timeout_secs),
+        auth_deadline(connect_timeout_secs),
         async {
             // Step 1: Get challenge nonce
             let challenge_response = auth_client.challenge_request().send().promise.await?;
@@ -536,6 +580,18 @@ mod tests {
     #[test]
     fn exec_deadline_maps_zero_to_agent_default() {
         assert_eq!(exec_deadline(0), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn auth_deadline_has_a_floor() {
+        assert_eq!(auth_deadline(1), Duration::from_secs(2));
+        assert_eq!(auth_deadline(5), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn rpc_message_keeps_non_failed_kind() {
+        let e = capnp::Error::disconnected("connection reset".into());
+        assert_eq!(rpc_message(&e), "Disconnected: connection reset");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 use tracing::info;
 
-use crate::audit::{AuditEntry, AuditLogger};
+use crate::audit::{AuditLogger, ExecAudit};
 use crate::config::{GatewayConfig, StreamingConfig};
 use crate::registry::Registry;
 use crate::rpc;
@@ -203,7 +203,7 @@ pub async fn dispatch_request(
                 let timeout = request["timeout"].as_u64().map(|t| t as u32);
                 let mut profiler = Profiler::new(profile_enabled);
                 // extra_env intentionally empty — --env flag omitted from CLI v1
-                let result = handle_exec_core(
+                let result = handle_exec_audited(
                     target,
                     command,
                     work_dir,
@@ -214,10 +214,10 @@ pub async fn dispatch_request(
                     limiter,
                     session_map,
                     &mut profiler,
+                    audit,
+                    "rest",
                 )
                 .await;
-                profiler.stage("audit");
-                audit_exec(audit, target, command, &result, "rest");
                 profiler.stage("serialize");
                 let mut profile_data = profiler.finish();
                 match result {
@@ -301,7 +301,7 @@ async fn handle_tools_call(
 }
 
 /// Truncate `s` to at most `max` bytes, cutting at a char boundary.
-fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
+pub(crate) fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }
@@ -344,43 +344,10 @@ fn take_incomplete_tail(bytes: &mut Vec<u8>, page_max: usize, stream_done: bool)
     }
 }
 
-fn audit_exec(
-    audit: &AuditLogger,
-    target: &str,
-    command: &str,
-    result: &Result<ExecPage, HandlerError>,
-    source: &str,
-) {
-    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let cmd = truncate_at_char_boundary(command, 500);
-    match result {
-        Ok(page) => {
-            audit.log(&AuditEntry {
-                ts,
-                target,
-                command: cmd,
-                exit_code: page.exit_code,
-                duration_ms: page.duration_ms,
-                request_id: None,
-                source,
-                error: page.error.as_deref(),
-            });
-        }
-        Err(e) => {
-            audit.log(&AuditEntry {
-                ts,
-                target,
-                command: cmd,
-                exit_code: None,
-                duration_ms: None,
-                request_id: None,
-                source,
-                error: Some(&e.message),
-            });
-        }
-    }
-}
+/// Where an exec request came from and where its audit events go.
+type AuditSink<'a> = (&'a Arc<AuditLogger>, &'static str);
 
+/// Run a command and return its first page, without audit logging.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_exec_core(
     target_name: &str,
@@ -394,23 +361,91 @@ pub async fn handle_exec_core(
     session_map: &Rc<RefCell<SessionMap>>,
     profiler: &mut Profiler,
 ) -> Result<ExecPage, HandlerError> {
-    let timeout = timeout_secs.unwrap_or(config.agent.default_timeout_secs);
+    exec_inner(
+        target_name,
+        command,
+        work_dir,
+        timeout_secs,
+        extra_env,
+        config,
+        registry,
+        limiter,
+        session_map,
+        profiler,
+        None,
+    )
+    .await
+}
 
-    let (host, port, status) = {
-        let reg = registry.lock().unwrap();
-        match reg.get(target_name) {
-            Some(t) => (t.host.clone(), t.port, t.status.clone()),
-            None => {
-                return Err(HandlerError::bad_request(format!(
-                    "unknown target: {target_name}"
-                )));
-            }
+/// Like `handle_exec_core`, plus audit events: `rejected` when the request is
+/// refused, otherwise `start` now and `end` when the rpc task finishes or is aborted.
+/// `source` is `rest` or `mcp`.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_exec_audited(
+    target_name: &str,
+    command: &str,
+    work_dir: &str,
+    timeout_secs: Option<u32>,
+    extra_env: Vec<(String, String)>,
+    config: &Arc<GatewayConfig>,
+    registry: &Arc<Mutex<Registry>>,
+    limiter: &Arc<ConcurrencyLimiter>,
+    session_map: &Rc<RefCell<SessionMap>>,
+    profiler: &mut Profiler,
+    audit: &Arc<AuditLogger>,
+    source: &'static str,
+) -> Result<ExecPage, HandlerError> {
+    exec_inner(
+        target_name,
+        command,
+        work_dir,
+        timeout_secs,
+        extra_env,
+        config,
+        registry,
+        limiter,
+        session_map,
+        profiler,
+        Some((audit, source)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn exec_inner(
+    target_name: &str,
+    command: &str,
+    work_dir: &str,
+    timeout_secs: Option<u32>,
+    extra_env: Vec<(String, String)>,
+    config: &Arc<GatewayConfig>,
+    registry: &Arc<Mutex<Registry>>,
+    limiter: &Arc<ConcurrencyLimiter>,
+    session_map: &Rc<RefCell<SessionMap>>,
+    profiler: &mut Profiler,
+    audit: Option<AuditSink<'_>>,
+) -> Result<ExecPage, HandlerError> {
+    let timeout = timeout_secs.unwrap_or(config.agent.default_timeout_secs);
+    let reject = |message: String| {
+        if let Some((logger, source)) = audit {
+            logger.log_rejected(target_name, command, source, &message);
         }
+        HandlerError::bad_request(message)
+    };
+
+    // Copy what is needed and release the lock before any audit write.
+    let target = {
+        let reg = registry.lock().unwrap();
+        reg.get(target_name)
+            .map(|t| (t.host.clone(), t.port, t.status.clone()))
+    };
+    let Some((host, port, status)) = target else {
+        return Err(reject(format!("unknown target: {target_name}")));
     };
     profiler.stage("registry_lookup");
 
     if host.is_empty() {
-        return Err(HandlerError::bad_request(format!(
+        return Err(reject(format!(
             "target '{}' is {} (no IP available)",
             target_name, status
         )));
@@ -419,14 +454,14 @@ pub async fn handle_exec_core(
     let psk = match config.agent.psk.get(target_name) {
         Some(p) => p.clone(),
         None => {
-            return Err(HandlerError::bad_request(format!(
+            return Err(reject(format!(
                 "no PSK configured for target: {target_name}"
             )));
         }
     };
 
     if !limiter.try_acquire(target_name) {
-        return Err(HandlerError::bad_request(format!(
+        return Err(reject(format!(
             "concurrency limit reached for target: {target_name}"
         )));
     }
@@ -446,6 +481,11 @@ pub async fn handle_exec_core(
     // Create a streaming session
     let (token, session_id) = session_map.borrow_mut().create_session();
 
+    // The spawned task owns the audit guard and writes the end event.
+    let exec_audit = audit.map(|(logger, source)| {
+        ExecAudit::start(logger.clone(), target_name, command, source, &request_id)
+    });
+
     // Start the streaming RPC (the spawned task owns the guard and releases the slot)
     let join_handle = rpc::start_remote_exec_stream(
         &host,
@@ -461,6 +501,7 @@ pub async fn handle_exec_core(
         session_id.clone(),
         guard,
         target_name.to_string(),
+        exec_audit,
     );
     profiler.stage("spawn_rpc");
 
@@ -515,7 +556,7 @@ async fn handle_exec(
         .unwrap_or_default();
 
     let mut profiler = Profiler::new(false); // MCP path: no profiling
-    let result = handle_exec_core(
+    let result = handle_exec_audited(
         target_name,
         command,
         work_dir,
@@ -526,9 +567,10 @@ async fn handle_exec(
         limiter,
         session_map,
         &mut profiler,
+        audit,
+        "mcp",
     )
     .await;
-    audit_exec(audit, target_name, command, &result, "mcp");
     match result {
         Ok(page) => format_page_response(id, &page),
         Err(e) => make_tool_error(id, &e.message),
@@ -567,7 +609,9 @@ fn format_page_response(id: &Value, page: &ExecPage) -> Value {
     if let Some(next_page) = &page.next_page {
         text.push_str(&format!("\n[streaming] next_page={next_page}"));
     }
-    let is_error = page.exit_code.is_some_and(|c| c != 0) || page.timed_out.unwrap_or(false);
+    let is_error = page.exit_code.is_some_and(|c| c != 0)
+        || page.timed_out.unwrap_or(false)
+        || page.error.is_some();
     if is_error {
         make_tool_error(id, &text)
     } else {
@@ -1746,6 +1790,22 @@ mod tests {
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("[error] authentication timed out after 5s"));
         assert!(text.contains("exit_code: -1"));
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[test]
+    fn format_page_error_without_exit_code_is_error() {
+        let page = ExecPage {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: None,
+            duration_ms: None,
+            timed_out: None,
+            next_page: None,
+            error: Some("boom".to_string()),
+            _profile: None,
+        };
+        let resp = format_page_response(&json!(1), &page);
         assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
     }
 

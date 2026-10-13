@@ -148,6 +148,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("execution_mode", &self.execution_mode)
             .field("audit_log_path", &self.audit_log_path)
+            .field("audit_log_max_bytes", &self.audit_log_max_bytes)
             .finish()
     }
 }

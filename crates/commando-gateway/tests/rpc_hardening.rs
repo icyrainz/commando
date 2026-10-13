@@ -199,7 +199,7 @@ fn wrong_psk_reports_authentication_error_and_closes_connection() {
         println!("error: {:?}", page.error);
         assert_eq!(page.exit_code, Some(-1));
         let error = page.error.expect("final page carries the rpc error");
-        assert!(error.contains("authentication"), "error was: {error}");
+        assert_eq!(error, "authentication failed: invalid HMAC");
 
         let closed = eventually(Duration::from_secs(5), || agent.open_connections.get() == 0).await;
         assert!(closed, "agent connection handler should return");
@@ -250,7 +250,7 @@ fn silent_agent_ping_fails_within_deadline() {
         let error = result.err().expect("ping must fail").to_string();
         println!("error: {error} after {elapsed:?}");
         assert!(error.contains("timed out"), "error was: {error}");
-        // 2 x connect_timeout_secs, plus scheduling slack.
+        // connect + max(connect, 2 s auth floor), plus scheduling slack.
         assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
     });
 }
