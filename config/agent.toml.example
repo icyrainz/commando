@@ -6,5 +6,5 @@ bind = "0.0.0.0"           # Bind to all interfaces (or restrict to a LAN IP)
 port = 9876
 shell = "sh"               # or "bash", "fish"
 psk = "REPLACE_WITH_OUTPUT_OF_openssl_rand_-hex_32"
-max_output_bytes = 131072  # 128KB, tail-truncate beyond this
+max_output_bytes = 131072  # 128KB cap for the non-streaming exec RPC only (the gateway uses streaming)
 max_concurrent = 8         # Max simultaneous exec calls

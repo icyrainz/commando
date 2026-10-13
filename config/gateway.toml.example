@@ -18,6 +18,15 @@
 # token_secret = "REPLACE_WITH_PROXMOX_API_TOKEN"
 # discovery_interval_secs = 60
 
+# Output paging and back-pressure
+# [streaming]
+# page_timeout_secs = 5
+# page_max_bytes = 32768
+# session_idle_timeout_secs = 60
+# Bytes a session may buffer before the gateway holds back the agent's output
+# stream until the client polls. Must be at least page_max_bytes.
+# session_buffer_max_bytes = 8388608  # 8 MiB
+
 [agent]
 default_port = 9876
 default_timeout_secs = 300

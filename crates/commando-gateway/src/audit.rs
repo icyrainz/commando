@@ -30,6 +30,9 @@ pub struct AuditEntry<'a> {
     /// Set on `end` events: `completed`, `timed_out`, `rpc_error` or `aborted`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<&'a str>,
+    /// Set on `end` events when the agent lost output at the command deadline.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<&'a str>,
 }
@@ -104,6 +107,7 @@ impl AuditLogger {
             request_id: None,
             source,
             outcome: None,
+            truncated: false,
             error: Some(error),
         });
     }
@@ -114,6 +118,7 @@ enum Finish {
         exit_code: i32,
         duration_ms: u64,
         timed_out: bool,
+        truncated: bool,
     },
     RpcError(String),
 }
@@ -149,6 +154,7 @@ impl ExecAudit {
             request_id: Some(request_id),
             source,
             outcome: None,
+            truncated: false,
             error: None,
         });
         Self {
@@ -162,11 +168,18 @@ impl ExecAudit {
     }
 
     /// The agent returned a result (`completed`, or `timed_out` when the agent says so).
-    pub fn exec_finished(&mut self, exit_code: i32, duration_ms: u64, timed_out: bool) {
+    pub fn exec_finished(
+        &mut self,
+        exit_code: i32,
+        duration_ms: u64,
+        timed_out: bool,
+        truncated: bool,
+    ) {
         self.finish = Some(Finish::Exec {
             exit_code,
             duration_ms,
             timed_out,
+            truncated,
         });
     }
 
@@ -179,17 +192,18 @@ impl ExecAudit {
 impl Drop for ExecAudit {
     fn drop(&mut self) {
         let wall_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let (outcome, exit_code, duration_ms, error) = match self.finish.take() {
+        let (outcome, exit_code, duration_ms, truncated, error) = match self.finish.take() {
             Some(Finish::Exec {
                 exit_code,
                 duration_ms,
                 timed_out,
+                truncated,
             }) => {
                 let outcome = if timed_out { "timed_out" } else { "completed" };
-                (outcome, Some(exit_code), duration_ms, None)
+                (outcome, Some(exit_code), duration_ms, truncated, None)
             }
-            Some(Finish::RpcError(e)) => ("rpc_error", None, wall_ms, Some(e)),
-            None => ("aborted", None, wall_ms, None),
+            Some(Finish::RpcError(e)) => ("rpc_error", None, wall_ms, false, Some(e)),
+            None => ("aborted", None, wall_ms, false, None),
         };
         self.logger.log(&AuditEntry {
             ts: now_ts(),
@@ -201,6 +215,7 @@ impl Drop for ExecAudit {
             request_id: Some(&self.request_id),
             source: self.source,
             outcome: Some(outcome),
+            truncated,
             error: error.as_deref(),
         });
     }
@@ -239,6 +254,7 @@ mod tests {
             request_id: Some("abc"),
             source: "rest",
             outcome: None,
+            truncated: false,
             error: None,
         });
         logger.log(&AuditEntry {
@@ -251,6 +267,7 @@ mod tests {
             request_id: Some("def"),
             source: "mcp",
             outcome: None,
+            truncated: false,
             error: None,
         });
 
@@ -280,6 +297,7 @@ mod tests {
             request_id: None,
             source: "rest",
             outcome: None,
+            truncated: false,
             error: Some("unknown target: bad-target"),
         });
 
@@ -307,6 +325,7 @@ mod tests {
                 request_id: Some("abc"),
                 source: "rest",
                 outcome: None,
+                truncated: false,
                 error: None,
             });
         }
@@ -342,6 +361,28 @@ mod tests {
     }
 
     #[test]
+    fn exec_audit_records_truncated_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = Arc::new(test_logger(dir.path()));
+
+        let mut audit = ExecAudit::start(logger.clone(), "my-box", "yes", "mcp", "req-1");
+        audit.exec_finished(137, 5000, true, true);
+        drop(audit);
+        let mut audit = ExecAudit::start(logger, "my-box", "true", "mcp", "req-2");
+        audit.exec_finished(0, 1, false, false);
+        drop(audit);
+
+        let content = fs::read_to_string(dir.path().join("audit.log")).unwrap();
+        let lines: Vec<serde_json::Value> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines[1]["outcome"], "timed_out");
+        assert_eq!(lines[1]["truncated"], true);
+        assert!(lines[3].get("truncated").is_none());
+    }
+
+    #[test]
     fn truncates_long_commands() {
         let long_cmd = "x".repeat(1000);
         let truncated = &long_cmd[..500];
@@ -359,6 +400,7 @@ mod tests {
             request_id: None,
             source: "rest",
             outcome: None,
+            truncated: false,
             error: None,
         });
 

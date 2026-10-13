@@ -129,6 +129,7 @@ impl Gateway {
                 page_timeout_secs: 1,
                 page_max_bytes: 32_768,
                 session_idle_timeout_secs: 60,
+                session_buffer_max_bytes: 8 * 1024 * 1024,
             },
         });
         let registry = Registry::from_manual(vec![ManualTargetInput {
@@ -263,6 +264,7 @@ fn error_key_is_absent_without_error() {
         exit_code: Some(0),
         duration_ms: Some(1),
         timed_out: None,
+        truncated: false,
         next_page: None,
         error: None,
         _profile: None,

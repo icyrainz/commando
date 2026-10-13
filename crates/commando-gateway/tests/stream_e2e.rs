@@ -1,5 +1,5 @@
 //! End-to-end tests for the production streaming path:
-//! `handle_exec_core` -> `start_remote_exec_stream` -> agent `exec_stream`,
+//! `handle_exec_core` -> `start_exec_stream` -> agent `exec_stream`,
 //! drained with `build_page`. Also characterizes what happens to a running
 //! command when the gateway task, the TCP connection, or the HTTP client goes away.
 
@@ -132,6 +132,7 @@ impl Gateway {
                 page_timeout_secs: 1,
                 page_max_bytes: 32_768,
                 session_idle_timeout_secs: 60,
+                session_buffer_max_bytes: 8 * 1024 * 1024,
             },
         });
         let registry = Registry::from_manual(vec![ManualTargetInput {
@@ -147,6 +148,22 @@ impl Gateway {
             limiter: Arc::new(ConcurrencyLimiter::new(4)),
             sessions: Rc::new(RefCell::new(SessionMap::new())),
         }
+    }
+
+    fn with_buffer_max(mut self, bytes: usize) -> Self {
+        let mut config = (*self.config).clone();
+        config.streaming.session_buffer_max_bytes = bytes;
+        self.config = Arc::new(config);
+        self
+    }
+
+    /// Bytes buffered in the session behind `token`.
+    fn buffered(&self, token: &str) -> usize {
+        self.sessions
+            .borrow()
+            .get_by_token(token)
+            .map(|s| s.total_buffered())
+            .unwrap_or(0)
     }
 
     /// Start a command and return its first page.
@@ -336,6 +353,149 @@ fn five_megabytes_arrive_complete_and_in_order() {
         assert_eq!(out.exit_code, Some(0));
         assert_eq!(out.stdout.len(), expected.len());
         assert!(out.stdout == expected, "output differs or is out of order");
+    });
+}
+
+#[test]
+fn five_megabytes_arrive_in_order_with_a_small_buffer_cap() {
+    run_local(async {
+        let agent = start_agent(4).await;
+        let gw = Gateway::new(agent.port).with_buffer_max(1024 * 1024);
+        let out = gw.exec("seq 1 800000").await;
+        let expected: String = (1..=800_000).map(|n| format!("{n}\n")).collect();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.stdout == expected, "output differs or is out of order");
+    });
+}
+
+#[test]
+fn slow_client_cannot_grow_the_session_past_the_cap() {
+    const CAP: usize = 1024 * 1024;
+    const TOTAL: usize = 32 * 1024 * 1024;
+    run_local(async {
+        let agent = start_agent(4).await;
+        let gw = Gateway::new(agent.port).with_buffer_max(CAP);
+        let first = gw
+            .start(
+                "head -c 33554432 /dev/zero | tr '\\0' x",
+                "",
+                Some(60),
+                vec![],
+            )
+            .await;
+        assert!(first.exit_code.is_none(), "output should still be coming");
+        let mut token = first.next_page.clone().unwrap();
+        let mut received = first.stdout.len();
+
+        // The client does not poll for 2 s.
+        let mut peak = 0;
+        let until = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < until {
+            peak = peak.max(gw.buffered(&token));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            peak <= CAP + 256 * 1024,
+            "session buffered {peak} bytes, cap is {CAP}"
+        );
+        assert!(peak > CAP / 2, "buffer never filled ({peak} bytes)");
+
+        // Then it polls to the end and gets everything.
+        let mut exit_code = None;
+        for _ in 0..4000 {
+            let page = handler::build_page(&gw.sessions, &token, &gw.config.streaming)
+                .await
+                .unwrap_or_else(|e| panic!("build_page failed: {e}"));
+            assert!(page.stdout.bytes().all(|b| b == b'x'));
+            received += page.stdout.len();
+            if let Some(code) = page.exit_code {
+                exit_code = Some(code);
+                break;
+            }
+            token = page.next_page.unwrap();
+        }
+        assert_eq!(exit_code, Some(0));
+        assert_eq!(received, TOTAL);
+    });
+}
+
+#[test]
+fn blocked_receive_calls_do_not_survive_a_session_cleanup() {
+    const CAP: usize = 64 * 1024;
+    run_local(async {
+        let agent = start_agent(1).await;
+        let gw = Gateway::new(agent.port).with_buffer_max(CAP);
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let map_refs = Rc::strong_count(&gw.sessions);
+
+        // `yes` never ends: it stops only when the agent stops reading its pipe.
+        let command = format!("echo $$ > {}; exec yes", pid_file.display());
+        let first = gw.start(&command, "", Some(60), vec![]).await;
+        let token = first.next_page.expect("command should still be running");
+        let pid = KillOnDrop(wait_for_pid(&pid_file).await);
+
+        let filled = eventually(Duration::from_secs(5), || gw.buffered(&token) > CAP).await;
+        assert!(filled, "buffer should fill past the cap");
+        // Let the agent run out of window so receive calls are held back.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let expired = gw.sessions.borrow_mut().cleanup_expired(Duration::ZERO);
+        assert_eq!(expired.len(), 1);
+
+        let closed = eventually(Duration::from_secs(3), || agent.open_connections.get() == 0).await;
+        let gone = eventually(Duration::from_secs(3), || !process_alive(pid.0)).await;
+        assert!(closed, "agent connection should close");
+        assert!(gone, "remote process should be killed");
+        // Held `receive` futures (each owns a clone of the map) died with the task.
+        let released = eventually(Duration::from_secs(3), || {
+            Rc::strong_count(&gw.sessions) == map_refs
+        })
+        .await;
+        assert!(
+            released,
+            "session map still has {} references, expected {map_refs}",
+            Rc::strong_count(&gw.sessions)
+        );
+    });
+}
+
+#[test]
+fn exec_deadline_waits_while_the_gateway_holds_receive_calls() {
+    const CAP: usize = 64 * 1024;
+    run_local(async {
+        // The command writes everything within its 2 s timeout, but the agent
+        // returns its result only after the held calls are answered, which takes
+        // a slow client past the 2.05 s call deadline.
+        commando_gateway::rpc::set_exec_grace(Some(Duration::from_millis(50)));
+        let agent = start_agent(4).await;
+        let gw = Gateway::new(agent.port).with_buffer_max(CAP);
+        let first = gw
+            .start("head -c 458752 /dev/zero | tr '\\0' x", "", Some(2), vec![])
+            .await;
+
+        let mut page = first;
+        let mut received = page.stdout.len();
+        let started = Instant::now();
+        while page.exit_code.is_none() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let token = page.next_page.clone().expect("running page has next_page");
+            page = handler::build_page(&gw.sessions, &token, &gw.config.streaming)
+                .await
+                .unwrap_or_else(|e| panic!("build_page failed: {e}"));
+            received += page.stdout.len();
+        }
+        assert!(
+            started.elapsed() > Duration::from_millis(2300),
+            "the call must outlast the deadline for this test to mean anything"
+        );
+        commando_gateway::rpc::set_exec_grace(None);
+
+        assert_eq!(page.error, None);
+        assert_eq!(page.exit_code, Some(0));
+        assert_eq!(page.timed_out, None);
+        assert!(!page.truncated);
+        assert_eq!(received, 458_752);
     });
 }
 

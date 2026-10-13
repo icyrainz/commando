@@ -15,13 +15,18 @@ pub fn generate_token() -> String {
 
 /// Last 8 characters of a token, for log lines.
 pub fn token_suffix(token: &str) -> &str {
-    &token[token.len().saturating_sub(8)..]
+    match token.char_indices().rev().nth(7) {
+        Some((i, _)) => &token[i..],
+        None => token,
+    }
 }
 
 pub struct StreamExecResult {
     pub exit_code: i32,
     pub duration_ms: u64,
     pub timed_out: bool,
+    /// The agent lost output at the command deadline.
+    pub truncated: bool,
     /// RPC failure message (connect, auth, deadline, agent error).
     pub error: Option<String>,
 }
@@ -44,6 +49,12 @@ pub struct Session {
     pub rpc_profile: Option<RpcProfile>,
     pub last_polled: Instant,
     pub notify: Rc<Notify>,
+    /// Woken when a page drains the buffers or the session ends; blocked `receive` calls wait on it.
+    pub drained: Rc<Notify>,
+    /// `receive` calls currently held back by the buffer cap.
+    pub held_receives: usize,
+    /// When the last held `receive` call was answered or dropped.
+    pub last_hold_end: Option<Instant>,
     pub rpc_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -57,6 +68,9 @@ impl Session {
             rpc_profile: None,
             last_polled: Instant::now(),
             notify: Rc::new(Notify::new()),
+            drained: Rc::new(Notify::new()),
+            held_receives: 0,
+            last_hold_end: None,
             rpc_task: None,
         }
     }
@@ -164,6 +178,10 @@ impl SessionMap {
         self.sessions.remove(&session_id)
     }
 
+    pub fn get_by_id(&self, session_id: &str) -> Option<&Session> {
+        self.sessions.get(session_id)
+    }
+
     pub fn get_by_id_mut(&mut self, session_id: &str) -> Option<&mut Session> {
         self.sessions.get_mut(session_id)
     }
@@ -179,6 +197,7 @@ impl SessionMap {
             Some(mut session) => {
                 // Wake pages waiting on this session so they fail now, not at their deadline.
                 session.notify.notify_waiters();
+                session.drained.notify_waiters();
                 if let Some(task) = session.rpc_task.take() {
                     task.abort();
                 }
@@ -200,6 +219,7 @@ impl SessionMap {
         for session_id in &expired_ids {
             if let Some(mut session) = self.sessions.remove(session_id) {
                 session.notify.notify_waiters();
+                session.drained.notify_waiters();
                 if let Some(task) = session.rpc_task.take() {
                     task.abort();
                 }
@@ -302,6 +322,15 @@ mod tests {
         assert!(map.cancel_by_token(&token));
         assert!(map.get_by_token(&token).is_none());
         assert!(!map.cancel_by_token(&token));
+    }
+
+    #[test]
+    fn token_suffix_is_safe_for_any_string() {
+        assert_eq!(token_suffix("0123456789abcdef"), "89abcdef");
+        assert_eq!(token_suffix("short"), "short");
+        assert_eq!(token_suffix(""), "");
+        assert_eq!(token_suffix("ééééééééé"), "éééééééé");
+        assert_eq!(token_suffix("日本語"), "日本語");
     }
 
     #[test]

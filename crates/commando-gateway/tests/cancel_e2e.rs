@@ -118,6 +118,7 @@ async fn start_gateway(agent_port: u16, page_timeout_secs: u64, idle_secs: u64) 
             page_timeout_secs,
             page_max_bytes: 32_768,
             session_idle_timeout_secs: idle_secs,
+            session_buffer_max_bytes: 8 * 1024 * 1024,
         },
     });
     let registry = Registry::from_manual(vec![ManualTargetInput {

@@ -24,6 +24,9 @@ pub struct StreamingConfig {
     pub page_max_bytes: usize,
     #[serde(default = "default_session_idle_timeout")]
     pub session_idle_timeout_secs: u64,
+    /// Buffered bytes per session above which `receive` calls are held back.
+    #[serde(default = "default_session_buffer_max_bytes")]
+    pub session_buffer_max_bytes: usize,
 }
 
 impl Default for StreamingConfig {
@@ -32,6 +35,7 @@ impl Default for StreamingConfig {
             page_timeout_secs: default_page_timeout(),
             page_max_bytes: default_page_max_bytes(),
             session_idle_timeout_secs: default_session_idle_timeout(),
+            session_buffer_max_bytes: default_session_buffer_max_bytes(),
         }
     }
 }
@@ -214,6 +218,9 @@ fn default_page_timeout() -> u64 {
 fn default_page_max_bytes() -> usize {
     32_768 // 32KB
 }
+fn default_session_buffer_max_bytes() -> usize {
+    8 * 1024 * 1024 // 8MiB
+}
 fn default_session_idle_timeout() -> u64 {
     60
 }
@@ -240,6 +247,20 @@ impl GatewayConfig {
         let mode = self.server.execution_mode.as_str();
         if !matches!(mode, "cli" | "mcp") {
             anyhow::bail!("invalid execution_mode {mode:?} (expected \"cli\" or \"mcp\")");
+        }
+        let streaming = &self.streaming;
+        if streaming.page_max_bytes < 4 {
+            anyhow::bail!(
+                "streaming.page_max_bytes must be at least 4, got {}",
+                streaming.page_max_bytes
+            );
+        }
+        if streaming.session_buffer_max_bytes < streaming.page_max_bytes {
+            anyhow::bail!(
+                "streaming.session_buffer_max_bytes ({}) must be at least page_max_bytes ({})",
+                streaming.session_buffer_max_bytes,
+                streaming.page_max_bytes
+            );
         }
         Ok(())
     }
@@ -439,6 +460,34 @@ transprot = "stdio"
             .to_string();
         assert!(err.contains("\"http\""), "{err}");
         assert!(err.contains("streamable-http"), "{err}");
+    }
+
+    #[test]
+    fn streaming_defaults_validate() {
+        let (config, _) = load_str("[agent]\n").unwrap();
+        assert_eq!(config.streaming.page_max_bytes, 32_768);
+        assert_eq!(config.streaming.session_buffer_max_bytes, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn tiny_page_max_bytes_rejected() {
+        let err = load_str("[agent]\n[streaming]\npage_max_bytes = 3\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("page_max_bytes"), "{err}");
+        load_str("[agent]\n[streaming]\npage_max_bytes = 4\n").unwrap();
+    }
+
+    #[test]
+    fn buffer_cap_below_page_size_rejected() {
+        let err = load_str(
+            "[agent]\n[streaming]\npage_max_bytes = 1000\nsession_buffer_max_bytes = 999\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("session_buffer_max_bytes"), "{err}");
+        load_str("[agent]\n[streaming]\npage_max_bytes = 1000\nsession_buffer_max_bytes = 1000\n")
+            .unwrap();
     }
 
     #[test]

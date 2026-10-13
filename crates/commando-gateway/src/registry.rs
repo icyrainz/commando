@@ -213,6 +213,29 @@ impl Registry {
     }
 }
 
+/// Discovered targets to restore from the cache at startup. Without Proxmox
+/// nodes no discovery cycle would ever remove them, so none are restored.
+pub fn cached_discovered(
+    json: &str,
+    discovery_enabled: bool,
+) -> anyhow::Result<Vec<DiscoveredTarget>> {
+    if !discovery_enabled {
+        return Ok(Vec::new());
+    }
+    let cached = Registry::from_cache_json(json)?;
+    Ok(cached
+        .targets
+        .values()
+        .filter(|t| t.source == TargetSource::Discovered)
+        .map(|t| DiscoveredTarget {
+            name: t.name.clone(),
+            host: t.host.clone(),
+            port: t.port,
+            status: t.status.clone(),
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +388,18 @@ mod tests {
         let loaded = Registry::from_cache_json(&json).unwrap();
         assert_eq!(loaded.targets.len(), 1);
         assert!(loaded.targets.contains_key("node-1/app"));
+    }
+
+    #[test]
+    fn cached_targets_are_ignored_without_discovery() {
+        let mut registry = Registry::new();
+        registry.update_discovered(vec![disc("node-1/app", "10.0.0.1")]);
+        let json = registry.to_cache_json().unwrap();
+
+        assert!(cached_discovered(&json, false).unwrap().is_empty());
+        let loaded = cached_discovered(&json, true).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "node-1/app");
     }
 
     fn disc(name: &str, host: &str) -> DiscoveredTarget {

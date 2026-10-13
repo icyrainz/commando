@@ -8,7 +8,7 @@ use commando_gateway::config;
 use commando_gateway::handler;
 use commando_gateway::mcp;
 use commando_gateway::proxmox;
-use commando_gateway::registry::{self, DiscoveredTarget, Registry};
+use commando_gateway::registry::{self, Registry};
 use commando_gateway::rpc;
 use commando_gateway::streamable;
 
@@ -145,30 +145,21 @@ async fn run_gateway(config: Arc<config::GatewayConfig>) -> Result<()> {
     let registry = Arc::new(Mutex::new(Registry::from_manual(manual_inputs)));
 
     // Try to load cached registry
+    let has_proxmox = config.proxmox.as_ref().is_some_and(|p| !p.nodes.is_empty());
     let cache_path = std::path::Path::new(&config.cache_dir).join("registry.json");
     if cache_path.exists() {
         match std::fs::read_to_string(cache_path) {
-            Ok(json) => match Registry::from_cache_json(&json) {
-                Ok(cached) => {
-                    let discovered: Vec<DiscoveredTarget> = cached
-                        .targets
-                        .values()
-                        .filter(|t| t.source == registry::TargetSource::Discovered)
-                        .map(|t| DiscoveredTarget {
-                            name: t.name.clone(),
-                            host: t.host.clone(),
-                            port: t.port,
-                            status: t.status.clone(),
-                        })
-                        .collect();
+            Ok(json) => match registry::cached_discovered(&json, has_proxmox) {
+                Ok(discovered) if has_proxmox => {
                     registry.lock().unwrap().update_discovered(discovered);
                     info!("loaded cached registry from disk");
                 }
+                Ok(_) => info!("no Proxmox nodes configured, ignoring cached discovered targets"),
                 Err(e) => warn!(error = %e, "failed to parse cached registry"),
             },
             Err(e) => warn!(error = %e, "failed to read registry cache"),
         }
-    } else if config.proxmox.as_ref().is_some_and(|p| !p.nodes.is_empty()) {
+    } else if has_proxmox {
         info!("no registry cache, running initial discovery");
         run_discovery_cycle(&config, &registry).await;
     }
@@ -189,7 +180,6 @@ async fn run_gateway(config: Arc<config::GatewayConfig>) -> Result<()> {
 
     // Spawn background discovery + ping loop
     {
-        let has_proxmox = config.proxmox.as_ref().is_some_and(|p| !p.nodes.is_empty());
         let discovery_interval = config
             .proxmox
             .as_ref()

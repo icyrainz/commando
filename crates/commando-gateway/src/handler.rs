@@ -487,7 +487,7 @@ async fn exec_inner(
     });
 
     // Start the streaming RPC (the spawned task owns the guard and releases the slot)
-    let join_handle = rpc::start_remote_exec_stream(
+    let join_handle = rpc::start_exec_stream(
         &host,
         port,
         &psk,
@@ -499,6 +499,7 @@ async fn exec_inner(
         config.agent.connect_timeout_secs,
         session_map.clone(),
         session_id.clone(),
+        config.streaming.session_buffer_max_bytes,
         guard,
         target_name.to_string(),
         exec_audit,
@@ -598,6 +599,9 @@ fn format_page_response(id: &Value, page: &ExecPage) -> Value {
     }
     if page.timed_out.unwrap_or(false) {
         text.push_str("\n[timed out]");
+    }
+    if page.truncated {
+        text.push_str("\n[output truncated]");
     }
     if let Some(exit_code) = page.exit_code {
         let duration_ms = page.duration_ms.unwrap_or(0);
@@ -709,7 +713,7 @@ async fn build_page_inner(
     }
 
     // Phase 2: Drain buffers up to page_max_bytes.
-    let (stdout_bytes, stderr_bytes, has_remaining) = {
+    let (stdout_bytes, stderr_bytes, has_remaining, drained) = {
         let mut map = session_map.borrow_mut();
         let session = map
             .get_by_token_mut(token)
@@ -731,10 +735,16 @@ async fn build_page_inner(
         if has_remaining {
             session.notify.notify_one();
         }
-
-        (stdout_bytes, stderr_bytes, has_remaining)
+        (
+            stdout_bytes,
+            stderr_bytes,
+            has_remaining,
+            session.drained.clone(),
+        )
     };
     // Mutable borrow dropped — safe to await below.
+    // Let `receive` calls held back by the buffer cap answer.
+    drained.notify_waiters();
 
     // Check if command already completed.
     let mut exec_result_data = {
@@ -743,10 +753,15 @@ async fn build_page_inner(
             .get_by_token(token)
             .ok_or_else(|| "session lost during drain".to_string())?;
         if session.completed && !has_remaining {
-            session
-                .exec_result
-                .as_ref()
-                .map(|r| (r.exit_code, r.duration_ms, r.timed_out, r.error.clone()))
+            session.exec_result.as_ref().map(|r| {
+                (
+                    r.exit_code,
+                    r.duration_ms,
+                    r.timed_out,
+                    r.truncated,
+                    r.error.clone(),
+                )
+            })
         } else {
             None
         }
@@ -765,10 +780,15 @@ async fn build_page_inner(
                 let map = session_map.borrow();
                 match map.get_by_token(token) {
                     Some(s) if s.completed && s.total_buffered() == 0 => {
-                        exec_result_data = s
-                            .exec_result
-                            .as_ref()
-                            .map(|r| (r.exit_code, r.duration_ms, r.timed_out, r.error.clone()));
+                        exec_result_data = s.exec_result.as_ref().map(|r| {
+                            (
+                                r.exit_code,
+                                r.duration_ms,
+                                r.timed_out,
+                                r.truncated,
+                                r.error.clone(),
+                            )
+                        });
                         break;
                     }
                     Some(s) => s.notify.clone(),
@@ -786,7 +806,7 @@ async fn build_page_inner(
     let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
 
-    if let Some((exit_code, duration_ms, timed_out, error)) = exec_result_data {
+    if let Some((exit_code, duration_ms, timed_out, truncated, error)) = exec_result_data {
         // Final page: remove session from map, extract rpc_profile if present
         let rpc_profile = session_map
             .borrow_mut()
@@ -799,6 +819,7 @@ async fn build_page_inner(
             exit_code: Some(exit_code),
             duration_ms: Some(duration_ms),
             timed_out: if timed_out { Some(true) } else { None },
+            truncated,
             next_page: None,
             error,
             _profile: rpc_profile.map(|rp| {
@@ -839,6 +860,7 @@ async fn build_page_inner(
             exit_code: None,
             duration_ms: None,
             timed_out: None,
+            truncated: false,
             next_page: Some(new_token),
             error: None,
             _profile: None,
@@ -1674,6 +1696,7 @@ mod tests {
             page_timeout_secs: 1, // short timeout for tests
             page_max_bytes,
             session_idle_timeout_secs: 60,
+            session_buffer_max_bytes: 8 * 1024 * 1024,
         }
     }
 
@@ -1696,6 +1719,7 @@ mod tests {
                 exit_code,
                 duration_ms: 42,
                 timed_out: false,
+                truncated: false,
                 error: None,
             });
         }
@@ -1713,6 +1737,7 @@ mod tests {
             exit_code: Some(0),
             duration_ms: Some(10),
             timed_out: None,
+            truncated: false,
             next_page: None,
             error: None,
             _profile: None,
@@ -1726,6 +1751,42 @@ mod tests {
     }
 
     #[test]
+    fn format_page_marks_truncated_output() {
+        let id = json!(1);
+        let page = ExecPage {
+            stdout: "partial".to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration_ms: Some(10),
+            timed_out: None,
+            truncated: true,
+            next_page: None,
+            error: None,
+            _profile: None,
+        };
+        let resp = format_page_response(&id, &page);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("[output truncated]"), "{text}");
+
+        let json = serde_json::to_value(&page).unwrap();
+        assert_eq!(json["truncated"], true);
+
+        let page = ExecPage {
+            truncated: false,
+            ..page
+        };
+        let resp = format_page_response(&id, &page);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("truncated"), "{text}");
+        assert!(
+            serde_json::to_value(&page)
+                .unwrap()
+                .get("truncated")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn format_page_stderr_included() {
         let id = json!(1);
         let page = ExecPage {
@@ -1734,6 +1795,7 @@ mod tests {
             exit_code: Some(0),
             duration_ms: Some(5),
             timed_out: None,
+            truncated: false,
             next_page: None,
             error: None,
             _profile: None,
@@ -1753,6 +1815,7 @@ mod tests {
             exit_code: Some(1),
             duration_ms: Some(0),
             timed_out: None,
+            truncated: false,
             next_page: None,
             error: None,
             _profile: None,
@@ -1770,6 +1833,7 @@ mod tests {
             exit_code: Some(-1),
             duration_ms: Some(5000),
             timed_out: Some(true),
+            truncated: false,
             next_page: None,
             error: None,
             _profile: None,
@@ -1789,6 +1853,7 @@ mod tests {
             exit_code: None,
             duration_ms: None,
             timed_out: None,
+            truncated: false,
             next_page: Some("abc123".to_string()),
             error: None,
             _profile: None,
@@ -1809,6 +1874,7 @@ mod tests {
             exit_code: None,
             duration_ms: None,
             timed_out: None,
+            truncated: false,
             next_page: Some("tok123".to_string()),
             error: None,
             _profile: None,
@@ -1828,6 +1894,7 @@ mod tests {
             exit_code: Some(-1),
             duration_ms: Some(0),
             timed_out: None,
+            truncated: false,
             next_page: None,
             error: Some("authentication timed out after 5s".to_string()),
             _profile: None,
@@ -1847,6 +1914,7 @@ mod tests {
             exit_code: None,
             duration_ms: None,
             timed_out: None,
+            truncated: false,
             next_page: None,
             error: Some("boom".to_string()),
             _profile: None,
@@ -1986,6 +2054,7 @@ mod tests {
             page_timeout_secs: 30,
             page_max_bytes: 32768,
             session_idle_timeout_secs: 60,
+            session_buffer_max_bytes: 8 * 1024 * 1024,
         };
 
         let result =
@@ -2002,6 +2071,7 @@ mod tests {
             page_timeout_secs: 30,
             page_max_bytes: 32768,
             session_idle_timeout_secs: 60,
+            session_buffer_max_bytes: 8 * 1024 * 1024,
         };
 
         let started = Instant::now();
@@ -2167,6 +2237,7 @@ mod tests {
                 exit_code: 0,
                 duration_ms: 100,
                 timed_out: false,
+                truncated: false,
                 error: None,
             });
             session.notify.notify_one();
@@ -2222,6 +2293,7 @@ mod tests {
                         exit_code: 0,
                         duration_ms: 5,
                         timed_out: false,
+                        truncated: false,
                         error: None,
                     });
                     session.notify.clone()
@@ -2425,6 +2497,7 @@ mod tests {
                 exit_code: 0,
                 duration_ms: 1,
                 timed_out: false,
+                truncated: false,
                 error: None,
             });
         }

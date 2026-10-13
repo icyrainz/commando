@@ -107,6 +107,7 @@ impl Gateway {
                 page_timeout_secs,
                 page_max_bytes: 32_768,
                 session_idle_timeout_secs: 60,
+                session_buffer_max_bytes: 8 * 1024 * 1024,
             },
         });
         let registry = Registry::from_manual(vec![ManualTargetInput {

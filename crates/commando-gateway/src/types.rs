@@ -12,6 +12,9 @@ pub struct ExecPage {
     pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timed_out: Option<bool>,
+    /// Set only when the agent lost output at the command deadline.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_page: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

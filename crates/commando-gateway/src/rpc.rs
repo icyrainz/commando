@@ -16,17 +16,6 @@ use crate::session::{SessionMap, StreamExecResult};
 use commando_common::auth;
 use commando_common::commando_capnp::{authenticator, command_agent, output_receiver};
 
-/// Result of executing a command on a remote agent.
-pub struct RemoteExecResult {
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub exit_code: i32,
-    pub duration_ms: u64,
-    pub timed_out: bool,
-    pub truncated: bool,
-    pub request_id: String,
-}
-
 /// Result of pinging a remote agent.
 pub struct RemotePingResult {
     pub hostname: String,
@@ -43,6 +32,20 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Slack added to the command timeout for the `exec_stream` call deadline.
 const EXEC_GRACE: Duration = Duration::from_secs(30);
+
+thread_local! {
+    static EXEC_GRACE_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Override the exec deadline slack on this thread (tests); `None` restores the default.
+pub fn set_exec_grace(grace: Option<Duration>) {
+    EXEC_GRACE_OVERRIDE.with(|g| g.set(grace));
+}
+
+fn exec_grace() -> Duration {
+    EXEC_GRACE_OVERRIDE.with(|g| g.get()).unwrap_or(EXEC_GRACE)
+}
 /// Floor for the authentication deadline: the agent sleeps 1 s after three
 /// failed attempts from one IP, so a 1 s limit would misreport that as a timeout.
 const AUTH_MIN: Duration = Duration::from_secs(2);
@@ -139,7 +142,7 @@ fn auth_deadline(connect_timeout_secs: u64) -> Duration {
 /// Deadline for the `exec_stream` call. The agent maps a timeout of 0 to 60 s.
 fn exec_deadline(timeout_secs: u32) -> Duration {
     let secs = if timeout_secs == 0 { 60 } else { timeout_secs };
-    Duration::from_secs(u64::from(secs)) + EXEC_GRACE
+    Duration::from_secs(u64::from(secs)) + exec_grace()
 }
 
 /// Run `fut` under a deadline; the error names the step and the limit.
@@ -153,71 +156,6 @@ async fn within<T>(
         Ok(Err(e)) => Err(step_error(step, &e)),
         Err(_) => Err(anyhow!("{step} timed out after {}s", limit.as_secs())),
     }
-}
-
-/// Execute a command on a remote agent. Opens a fresh TCP connection,
-/// authenticates, runs the command, and disconnects.
-#[allow(clippy::too_many_arguments)]
-pub async fn remote_exec(
-    host: &str,
-    port: u16,
-    psk: &str,
-    command: &str,
-    work_dir: &str,
-    timeout_secs: u32,
-    extra_env: &[(String, String)],
-    request_id: &str,
-    connect_timeout_secs: u64,
-) -> Result<RemoteExecResult> {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let stream = connect_stream(host, port, connect_timeout_secs).await?;
-            let (auth_client, disconnector, _rpc_task) = start_rpc(stream);
-
-            let agent_client =
-                authenticate(&auth_client, psk.as_bytes(), connect_timeout_secs).await?;
-
-            // Build exec request
-            let mut request = agent_client.exec_request();
-            {
-                let mut req_builder = request.get().init_request();
-                req_builder.set_command(command);
-                req_builder.set_work_dir(work_dir);
-                req_builder.set_timeout_secs(timeout_secs);
-                req_builder.set_request_id(request_id);
-
-                if !extra_env.is_empty() {
-                    let mut env_list = req_builder.init_extra_env(extra_env.len() as u32);
-                    for (i, (key, value)) in extra_env.iter().enumerate() {
-                        let mut entry = env_list.reborrow().get(i as u32);
-                        entry.set_key(key);
-                        entry.set_value(value);
-                    }
-                }
-            }
-
-            let response = request.send().promise.await?;
-            let result = response.get()?.get_result()?;
-
-            let exec_result = RemoteExecResult {
-                stdout: result.get_stdout()?.to_vec(),
-                stderr: result.get_stderr()?.to_vec(),
-                exit_code: result.get_exit_code(),
-                duration_ms: result.get_duration_ms(),
-                timed_out: result.get_timed_out(),
-                truncated: result.get_truncated(),
-                request_id: result.get_request_id()?.to_str()?.to_string(),
-            };
-
-            // Clean up
-            drop(agent_client);
-            drop(auth_client);
-            let _ = disconnector.await;
-
-            Ok(exec_result)
-        })
-        .await
 }
 
 /// Ping a remote agent. Returns agent metadata.
@@ -264,28 +202,61 @@ pub async fn remote_ping(
         .map_err(|_| anyhow!("ping timed out after {}s", deadline.as_secs()))?
 }
 
+/// Whether the call deadline extends: a `receive` call is held now, or the last
+/// hold ended less than one grace ago (the agent needs a round trip to deliver
+/// its result after the final answer).
+fn should_extend(
+    held_receives: usize,
+    last_hold_end: Option<std::time::Instant>,
+    grace: Duration,
+) -> bool {
+    held_receives > 0 || last_hold_end.is_some_and(|t| t.elapsed() < grace)
+}
+
+/// Counts a `receive` call held by the buffer cap; the count drops with the guard.
+struct HeldReceive {
+    session_map: Rc<RefCell<SessionMap>>,
+    session_id: String,
+}
+
+impl Drop for HeldReceive {
+    fn drop(&mut self) {
+        // The session may already be gone, and then there is nothing to update.
+        // No borrow is held when this runs, so a failed borrow is not expected.
+        if let Ok(mut map) = self.session_map.try_borrow_mut()
+            && let Some(s) = map.get_by_id_mut(&self.session_id)
+        {
+            s.held_receives = s.held_receives.saturating_sub(1);
+            s.last_hold_end = Some(std::time::Instant::now());
+        }
+    }
+}
+
 /// Cap'n Proto callback that receives streaming output chunks from the agent.
 struct OutputReceiverImpl {
     session_map: Rc<RefCell<SessionMap>>,
     session_id: String,
+    buffer_max_bytes: usize,
 }
 
 impl output_receiver::Server for OutputReceiverImpl {
     async fn receive(
         self: Rc<Self>,
         params: output_receiver::ReceiveParams,
-        _results: output_receiver::ReceiveResults,
+        results: output_receiver::ReceiveResults,
     ) -> Result<(), capnp::Error> {
-        let reader = params
-            .get()
-            .map_err(|e| capnp::Error::failed(format!("failed to get params: {e}")))?;
-        let data = reader
-            .get_data()
-            .map_err(|e| capnp::Error::failed(format!("failed to get data: {e}")))?;
-        let stream = reader.get_stream();
-
-        // Clone notify before dropping the borrow to avoid holding RefCell across notify_one()
         let notify = {
+            let reader = params
+                .get()
+                .map_err(|e| capnp::Error::failed(format!("failed to get params: {e}")))?;
+            let data = reader
+                .get_data()
+                .map_err(|e| capnp::Error::failed(format!("failed to get data: {e}")))?;
+            let stream = reader.get_stream();
+
+            // Append first and never await before it: an agent without flow control
+            // has many calls in flight, and awaiting here would reorder the output.
+            // Clone notify before dropping the borrow to avoid holding RefCell across notify_one()
             let mut map = self.session_map.borrow_mut();
             if let Some(session) = map.get_by_id_mut(&self.session_id) {
                 match stream {
@@ -298,9 +269,37 @@ impl output_receiver::Server for OutputReceiverImpl {
                 None
             }
         };
-        if let Some(notify) = notify {
-            notify.notify_one();
+        // A held call must not keep a second copy of its chunk alive.
+        drop(params);
+        drop(results);
+        let Some(notify) = notify else {
+            return Ok(());
+        };
+        notify.notify_one();
+
+        // Answering a call lets the agent send more: hold the answer while the
+        // session is over its cap. No borrow is held across the wait.
+        let mut hold = None;
+        loop {
+            let drained = {
+                let mut map = self.session_map.borrow_mut();
+                match map.get_by_id_mut(&self.session_id) {
+                    Some(s) if !s.completed && s.total_buffered() > self.buffer_max_bytes => {
+                        if hold.is_none() {
+                            s.held_receives += 1;
+                            hold = Some(HeldReceive {
+                                session_map: self.session_map.clone(),
+                                session_id: self.session_id.clone(),
+                            });
+                        }
+                        s.drained.clone()
+                    }
+                    _ => break,
+                }
+            };
+            drained.notified().await;
         }
+        drop(hold);
 
         Ok(())
     }
@@ -329,12 +328,12 @@ impl Drop for LimiterGuard {
 
 /// Spawn a long-lived RPC task that streams output into the session map.
 ///
-/// Unlike `remote_exec()` which creates a throwaway `LocalSet` per request,
-/// this function uses `spawn_local` directly — the caller must already be
+/// This function uses `spawn_local` directly — the caller must already be
 /// running on the main `LocalSet`. The caller passes the `LimiterGuard` for
 /// the slot it acquired; the spawned task owns it and releases the slot on drop.
+/// `buffer_max_bytes` holds back `receive` answers while the session buffers more.
 #[allow(clippy::too_many_arguments)]
-pub fn start_remote_exec_stream(
+pub fn start_exec_stream(
     host: &str,
     port: u16,
     psk: &str,
@@ -346,6 +345,7 @@ pub fn start_remote_exec_stream(
     connect_timeout_secs: u64,
     session_map: Rc<RefCell<SessionMap>>,
     session_id: String,
+    buffer_max_bytes: usize,
     guard: LimiterGuard,
     target_name: String,
     audit: Option<ExecAudit>,
@@ -375,6 +375,7 @@ pub fn start_remote_exec_stream(
             connect_timeout_secs,
             session_map.clone(),
             session_id.clone(),
+            buffer_max_bytes,
         )
         .await;
 
@@ -382,9 +383,7 @@ pub fn start_remote_exec_stream(
         // that sees the final page can rely on the log being complete.
         if let Some(a) = audit.as_mut() {
             match &result {
-                Ok((exit_code, duration_ms, timed_out, _)) => {
-                    a.exec_finished(*exit_code, *duration_ms, *timed_out);
-                }
+                Ok(o) => a.exec_finished(o.exit_code, o.duration_ms, o.timed_out, o.truncated),
                 Err(e) => a.rpc_failed(e.to_string()),
             }
         }
@@ -392,19 +391,20 @@ pub fn start_remote_exec_stream(
 
         // Mark session completed regardless of success/failure.
         // Clone notify before dropping the borrow to avoid holding RefCell across notify_one()
-        let notify = {
+        let notifies = {
             let mut map = session_map.borrow_mut();
             if let Some(session) = map.get_by_id_mut(&session_id) {
                 match result {
-                    Ok((exit_code, duration_ms, timed_out, rpc_profile)) => {
+                    Ok(o) => {
                         session.completed = true;
                         session.exec_result = Some(StreamExecResult {
-                            exit_code,
-                            duration_ms,
-                            timed_out,
+                            exit_code: o.exit_code,
+                            duration_ms: o.duration_ms,
+                            timed_out: o.timed_out,
+                            truncated: o.truncated,
                             error: None,
                         });
-                        session.rpc_profile = Some(rpc_profile);
+                        session.rpc_profile = Some(o.rpc_profile);
                     }
                     Err(e) => {
                         error!(
@@ -418,23 +418,33 @@ pub fn start_remote_exec_stream(
                             exit_code: -1,
                             duration_ms: 0,
                             timed_out: false,
+                            truncated: false,
                             error: Some(e.to_string()),
                         });
                     }
                 }
-                Some(session.notify.clone())
+                Some((session.notify.clone(), session.drained.clone()))
             } else {
                 None
             }
         };
-        if let Some(notify) = notify {
+        if let Some((notify, drained)) = notifies {
+            drained.notify_waiters();
             notify.notify_one();
         }
     })
 }
 
+/// What the agent reported for a finished `exec_stream`.
+struct ExecOutcome {
+    exit_code: i32,
+    duration_ms: u64,
+    timed_out: bool,
+    truncated: bool,
+    rpc_profile: crate::session::RpcProfile,
+}
+
 /// Inner helper: connect, authenticate, send exec_stream request, await result.
-/// Returns `(exit_code, duration_ms, timed_out, rpc_profile)` on success.
 #[allow(clippy::too_many_arguments)]
 async fn exec_stream_inner(
     host: &str,
@@ -448,7 +458,8 @@ async fn exec_stream_inner(
     connect_timeout_secs: u64,
     session_map: Rc<RefCell<SessionMap>>,
     session_id: String,
-) -> Result<(i32, u64, bool, crate::session::RpcProfile)> {
+    buffer_max_bytes: usize,
+) -> Result<ExecOutcome> {
     use tokio::time::Instant;
 
     let t0 = Instant::now();
@@ -465,8 +476,9 @@ async fn exec_stream_inner(
 
     // Build exec_stream request
     let receiver_impl = OutputReceiverImpl {
-        session_map,
-        session_id,
+        session_map: session_map.clone(),
+        session_id: session_id.clone(),
+        buffer_max_bytes,
     };
     let receiver_client: output_receiver::Client = capnp_rpc::new_client(receiver_impl);
 
@@ -493,13 +505,32 @@ async fn exec_stream_inner(
 
     info!(request_id = %request_id, "sending exec_stream request");
 
-    let response = within(
-        "exec_stream",
-        exec_deadline(timeout_secs),
-        request.send().promise,
-    )
-    .await?;
-    let (exit_code, duration_ms, timed_out, agent_profile_json) =
+    // The agent answers only after every in-flight `receive` is answered, and the
+    // gateway holds those answers while a session is over its cap. The deadline
+    // must not fire while the gateway itself holds them; idle cleanup bounds a
+    // client that stops polling.
+    let mut call = std::pin::pin!(request.send().promise);
+    let mut waited = exec_deadline(timeout_secs);
+    let mut limit = waited;
+    let response = loop {
+        match timeout(limit, &mut call).await {
+            Ok(Ok(v)) => break v,
+            Ok(Err(e)) => return Err(step_error("exec_stream", &e)),
+            Err(_) => {
+                let grace = exec_grace();
+                let held = session_map
+                    .borrow()
+                    .get_by_id(&session_id)
+                    .is_some_and(|s| should_extend(s.held_receives, s.last_hold_end, grace));
+                if !held {
+                    return Err(anyhow!("exec_stream timed out after {}s", waited.as_secs()));
+                }
+                limit = grace;
+                waited += limit;
+            }
+        }
+    };
+    let (exit_code, duration_ms, timed_out, truncated, agent_profile_json) =
         (|| -> Result<_, capnp::Error> {
             let result = response.get()?.get_result()?;
             let agent_profile_json = result
@@ -512,6 +543,7 @@ async fn exec_stream_inner(
                 result.get_exit_code(),
                 result.get_duration_ms(),
                 result.get_timed_out(),
+                result.get_truncated(),
                 agent_profile_json,
             ))
         })()
@@ -536,7 +568,13 @@ async fn exec_stream_inner(
         let _ = timeout(DISCONNECT_TIMEOUT, disconnector).await;
     });
 
-    Ok((exit_code, duration_ms, timed_out, rpc_profile))
+    Ok(ExecOutcome {
+        exit_code,
+        duration_ms,
+        timed_out,
+        truncated,
+        rpc_profile,
+    })
 }
 
 /// Perform HMAC challenge-response authentication, returns CommandAgent capability.
@@ -571,6 +609,17 @@ async fn authenticate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deadline_extends_for_a_recent_or_active_hold() {
+        use std::time::Instant;
+        let grace = Duration::from_secs(1);
+        let ago = |d: Duration| Instant::now().checked_sub(d);
+        assert!(should_extend(2, None, grace));
+        assert!(should_extend(0, ago(Duration::from_millis(10)), grace));
+        assert!(!should_extend(0, ago(Duration::from_secs(2)), grace));
+        assert!(!should_extend(0, None, grace));
+    }
 
     #[test]
     fn exec_deadline_adds_grace() {

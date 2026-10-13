@@ -1,16 +1,22 @@
 //! Integration tests: spin up a real agent, connect with gateway RPC client,
-//! and verify the full auth → exec / ping flow over TCP.
+//! and verify the auth → ping flow over TCP. The gateway runs commands through
+//! the streaming path (stream_e2e.rs); the agent's non-streaming `exec` is still
+//! served on the wire and is covered here with a raw client.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
 
-use tokio::net::TcpListener;
+use futures::AsyncReadExt;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use commando_agent::config::AgentConfig;
 use commando_agent::rpc::{self as agent_rpc, ConcurrencyGuard};
-use commando_gateway::rpc::{remote_exec, remote_ping};
+use commando_common::auth;
+use commando_common::commando_capnp::{authenticator, command_agent};
+use commando_gateway::rpc::remote_ping;
 
 const TEST_PSK: &str = "integration-test-secret";
 
@@ -99,104 +105,54 @@ fn run_local<F: std::future::Future<Output = ()>>(f: F) {
     local.block_on(&rt, f);
 }
 
-// ─── E2E: Auth + Exec ─────────────────────────────────────────────
+// ─── E2E: non-streaming exec (raw client) ─────────────────────────
 
 #[test]
-fn e2e_exec_echo() {
+fn e2e_agent_exec_over_the_wire() {
     run_local(async {
         let port = start_agent().await;
 
-        let result = remote_exec(
-            "127.0.0.1",
-            port,
-            TEST_PSK,
-            "echo hello",
-            "",
-            60,
-            &[],
-            "test-req-1",
-            5,
-        )
-        .await
-        .unwrap();
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.set_nodelay(true).unwrap();
+        let (reader, writer) = stream.compat().split();
+        let network = capnp_rpc::twoparty::VatNetwork::new(
+            futures::io::BufReader::new(reader),
+            futures::io::BufWriter::new(writer),
+            capnp_rpc::rpc_twoparty_capnp::Side::Client,
+            Default::default(),
+        );
+        let mut rpc_system = capnp_rpc::RpcSystem::new(Box::new(network), None);
+        let auth_client: authenticator::Client =
+            rpc_system.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
+        tokio::task::spawn_local(rpc_system);
 
-        assert_eq!(result.exit_code, 0);
-        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "hello");
-        assert!(!result.timed_out);
-        assert!(!result.truncated);
-        assert_eq!(result.request_id, "test-req-1");
-    });
-}
+        let challenge = auth_client
+            .challenge_request()
+            .send()
+            .promise
+            .await
+            .unwrap();
+        let nonce = challenge.get().unwrap().get_nonce().unwrap();
+        let hmac = auth::compute_hmac(TEST_PSK.as_bytes(), nonce);
+        let mut auth_request = auth_client.authenticate_request();
+        auth_request.get().set_hmac(&hmac);
+        let auth_response = auth_request.send().promise.await.unwrap();
+        let agent: command_agent::Client = auth_response.get().unwrap().get_agent().unwrap();
 
-#[test]
-fn e2e_exec_exit_code() {
-    run_local(async {
-        let port = start_agent().await;
-
-        let result = remote_exec(
-            "127.0.0.1",
-            port,
-            TEST_PSK,
-            "exit 42",
-            "",
-            60,
-            &[],
-            "test-exit",
-            5,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.exit_code, 42);
-    });
-}
-
-#[test]
-fn e2e_exec_with_env() {
-    run_local(async {
-        let port = start_agent().await;
-
-        let env = vec![("MY_TEST_VAR".to_string(), "works".to_string())];
-        let result = remote_exec(
-            "127.0.0.1",
-            port,
-            TEST_PSK,
-            "echo $MY_TEST_VAR",
-            "",
-            60,
-            &env,
-            "test-env",
-            5,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.exit_code, 0);
-        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "works");
-    });
-}
-
-#[test]
-fn e2e_exec_stderr() {
-    run_local(async {
-        let port = start_agent().await;
-
-        let result = remote_exec(
-            "127.0.0.1",
-            port,
-            TEST_PSK,
-            "echo err >&2",
-            "",
-            60,
-            &[],
-            "test-stderr",
-            5,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.exit_code, 0);
-        assert_eq!(String::from_utf8_lossy(&result.stderr).trim(), "err");
+        let mut request = agent.exec_request();
+        {
+            let mut req = request.get().init_request();
+            req.set_command("echo hello");
+            req.set_work_dir("");
+            req.set_timeout_secs(60);
+            req.set_request_id("integration-exec");
+        }
+        let response = request.send().promise.await.unwrap();
+        let result = response.get().unwrap().get_result().unwrap();
+        assert_eq!(result.get_exit_code(), 0);
+        assert_eq!(result.get_stdout().unwrap(), b"hello\n");
+        assert!(!result.get_timed_out());
+        assert!(!result.get_truncated());
     });
 }
 
@@ -222,18 +178,7 @@ fn e2e_auth_failure_wrong_psk() {
     run_local(async {
         let port = start_agent().await;
 
-        let result = remote_exec(
-            "127.0.0.1",
-            port,
-            "wrong-secret",
-            "echo should-not-run",
-            "",
-            60,
-            &[],
-            "test-bad-auth",
-            5,
-        )
-        .await;
+        let result = remote_ping("127.0.0.1", port, "wrong-secret", 5).await;
 
         assert!(result.is_err());
     });
@@ -250,34 +195,17 @@ fn e2e_connect_timeout() {
     });
 }
 
-// ─── Multiple sequential requests ───────────────────────────────────
+// ─── Multiple sequential pings ───────────────────────────────────
 
 #[test]
 fn e2e_multiple_requests() {
     run_local(async {
         let port = start_agent_multi(3).await;
 
-        // Each remote_exec opens a fresh connection
-        for i in 0..3 {
-            let result = remote_exec(
-                "127.0.0.1",
-                port,
-                TEST_PSK,
-                &format!("echo request-{i}"),
-                "",
-                60,
-                &[],
-                &format!("req-{i}"),
-                5,
-            )
-            .await
-            .unwrap();
-
-            assert_eq!(result.exit_code, 0);
-            assert_eq!(
-                String::from_utf8_lossy(&result.stdout).trim(),
-                format!("request-{i}")
-            );
+        // Each ping opens a fresh connection
+        for _ in 0..3 {
+            let result = remote_ping("127.0.0.1", port, TEST_PSK, 5).await.unwrap();
+            assert!(!result.hostname.is_empty());
         }
     });
 }

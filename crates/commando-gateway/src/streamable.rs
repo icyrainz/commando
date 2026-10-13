@@ -61,6 +61,10 @@ pub fn build_app(
             let aud = audit.clone();
             tokio::task::spawn_local(async move {
                 let mut response_tx = item.response_tx;
+                // Client already gone: do not start a command nobody will read.
+                if response_tx.is_closed() {
+                    return;
+                }
                 // Client gone: dropping the dispatch future cancels its session.
                 let result = tokio::select! {
                     result = handler::dispatch_request(&item.request, &cfg, &reg, &lim, &smap, &aud) => result,
