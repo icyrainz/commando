@@ -15,6 +15,8 @@ pub struct ExecPage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_page: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub _profile: Option<ProfileData>,
 }
 

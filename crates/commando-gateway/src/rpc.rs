@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Result, anyhow};
 use futures::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -34,6 +34,112 @@ pub struct RemotePingResult {
     pub version: String,
 }
 
+/// Idle time before the kernel probes a silent agent connection.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+/// Interval between keepalive probes.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// Upper bound for the graceful RPC disconnect after a successful call.
+const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Slack added to the command timeout for the `exec_stream` call deadline.
+const EXEC_GRACE: Duration = Duration::from_secs(30);
+
+type RpcDisconnector = capnp_rpc::Disconnector<capnp_rpc::rpc_twoparty_capnp::Side>;
+
+/// Aborts the RpcSystem task on drop, which closes the TCP connection.
+struct AbortOnDrop(tokio::task::JoinHandle<Result<(), capnp::Error>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Connect to the agent with a deadline, TCP_NODELAY and keepalive.
+async fn connect_stream(host: &str, port: u16, connect_timeout_secs: u64) -> Result<TcpStream> {
+    let addr = format!("{host}:{port}");
+    let stream = timeout(
+        Duration::from_secs(connect_timeout_secs),
+        TcpStream::connect(&addr),
+    )
+    .await
+    .map_err(|_| anyhow!("connect to {addr} timed out after {connect_timeout_secs}s"))?
+    .map_err(|e| anyhow!("connect to {addr} failed: {e}"))?;
+
+    stream.set_nodelay(true)?;
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL);
+    if let Err(e) = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
+        tracing::warn!(addr = %addr, error = %e, "failed to set TCP keepalive");
+    }
+    Ok(stream)
+}
+
+/// Start the RpcSystem on `stream`; the task lives as long as the returned guard.
+fn start_rpc(stream: TcpStream) -> (authenticator::Client, RpcDisconnector, AbortOnDrop) {
+    let stream = stream.compat();
+    let (reader, writer) = stream.split();
+
+    let network = capnp_rpc::twoparty::VatNetwork::new(
+        futures::io::BufReader::new(reader),
+        futures::io::BufWriter::new(writer),
+        capnp_rpc::rpc_twoparty_capnp::Side::Client,
+        Default::default(),
+    );
+
+    let mut rpc_system = capnp_rpc::RpcSystem::new(Box::new(network), None);
+    let disconnector = rpc_system.get_disconnector();
+    let auth_client: authenticator::Client =
+        rpc_system.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
+    let task = AbortOnDrop(tokio::task::spawn_local(rpc_system));
+    (auth_client, disconnector, task)
+}
+
+/// The agent's message without capnp's "Failed: " and "remote exception: " prefixes.
+fn rpc_message(e: &capnp::Error) -> String {
+    let mut msg = e.extra.as_str();
+    loop {
+        let stripped = msg
+            .strip_prefix("Failed: ")
+            .or_else(|| msg.strip_prefix("remote exception: "));
+        match stripped {
+            Some(rest) => msg = rest,
+            None => break,
+        }
+    }
+    if msg.is_empty() {
+        e.to_string()
+    } else {
+        msg.to_string()
+    }
+}
+
+/// Deadline for the `exec_stream` call. The agent maps a timeout of 0 to 60 s.
+fn exec_deadline(timeout_secs: u32) -> Duration {
+    let secs = if timeout_secs == 0 { 60 } else { timeout_secs };
+    Duration::from_secs(u64::from(secs)) + EXEC_GRACE
+}
+
+/// Run `fut` under a deadline; the error names the step and the limit.
+async fn within<T>(
+    step: &str,
+    limit: Duration,
+    fut: impl std::future::Future<Output = Result<T, capnp::Error>>,
+) -> Result<T> {
+    match timeout(limit, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => {
+            let msg = rpc_message(&e);
+            if msg.starts_with(step) {
+                Err(anyhow!(msg))
+            } else {
+                Err(anyhow!("{step} failed: {msg}"))
+            }
+        }
+        Err(_) => Err(anyhow!("{step} timed out after {}s", limit.as_secs())),
+    }
+}
+
 /// Execute a command on a remote agent. Opens a fresh TCP connection,
 /// authenticates, runs the command, and disconnects.
 #[allow(clippy::too_many_arguments)]
@@ -51,37 +157,11 @@ pub async fn remote_exec(
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let addr = format!("{host}:{port}");
+            let stream = connect_stream(host, port, connect_timeout_secs).await?;
+            let (auth_client, disconnector, _rpc_task) = start_rpc(stream);
 
-            // Connect with timeout
-            let stream = timeout(
-                Duration::from_secs(connect_timeout_secs),
-                TcpStream::connect(&addr),
-            )
-            .await
-            .context("connect timeout")?
-            .context("TCP connect failed")?;
-
-            stream.set_nodelay(true)?;
-            let stream = stream.compat();
-            let (reader, writer) = stream.split();
-
-            let network = capnp_rpc::twoparty::VatNetwork::new(
-                futures::io::BufReader::new(reader),
-                futures::io::BufWriter::new(writer),
-                capnp_rpc::rpc_twoparty_capnp::Side::Client,
-                Default::default(),
-            );
-
-            let mut rpc_system = capnp_rpc::RpcSystem::new(Box::new(network), None);
-            let disconnector = rpc_system.get_disconnector();
-            let auth_client: authenticator::Client =
-                rpc_system.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
-
-            tokio::task::spawn_local(rpc_system);
-
-            // Authenticate
-            let agent_client = authenticate(&auth_client, psk.as_bytes()).await?;
+            let agent_client =
+                authenticate(&auth_client, psk.as_bytes(), connect_timeout_secs).await?;
 
             // Build exec request
             let mut request = agent_client.exec_request();
@@ -132,56 +212,33 @@ pub async fn remote_ping(
     psk: &str,
     connect_timeout_secs: u64,
 ) -> Result<RemotePingResult> {
+    let deadline = Duration::from_secs(connect_timeout_secs.saturating_mul(2));
     let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let addr = format!("{host}:{port}");
+    let run = local.run_until(async {
+        let stream = connect_stream(host, port, connect_timeout_secs).await?;
+        let (auth_client, disconnector, _rpc_task) = start_rpc(stream);
 
-            let stream = timeout(
-                Duration::from_secs(connect_timeout_secs),
-                TcpStream::connect(&addr),
-            )
-            .await
-            .context("connect timeout")?
-            .context("TCP connect failed")?;
+        let agent_client = authenticate(&auth_client, psk.as_bytes(), connect_timeout_secs).await?;
 
-            stream.set_nodelay(true)?;
-            let stream = stream.compat();
-            let (reader, writer) = stream.split();
+        let response = agent_client.ping_request().send().promise.await?;
+        let pong = response.get()?.get_pong()?;
 
-            let network = capnp_rpc::twoparty::VatNetwork::new(
-                futures::io::BufReader::new(reader),
-                futures::io::BufWriter::new(writer),
-                capnp_rpc::rpc_twoparty_capnp::Side::Client,
-                Default::default(),
-            );
+        let ping_result = RemotePingResult {
+            hostname: pong.get_hostname()?.to_str()?.to_string(),
+            uptime_secs: pong.get_uptime_secs(),
+            shell: pong.get_shell()?.to_str()?.to_string(),
+            version: pong.get_version()?.to_str()?.to_string(),
+        };
 
-            let mut rpc_system = capnp_rpc::RpcSystem::new(Box::new(network), None);
-            let disconnector = rpc_system.get_disconnector();
-            let auth_client: authenticator::Client =
-                rpc_system.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
+        drop(agent_client);
+        drop(auth_client);
+        let _ = timeout(DISCONNECT_TIMEOUT, disconnector).await;
 
-            tokio::task::spawn_local(rpc_system);
-
-            let agent_client = authenticate(&auth_client, psk.as_bytes()).await?;
-
-            let response = agent_client.ping_request().send().promise.await?;
-            let pong = response.get()?.get_pong()?;
-
-            let ping_result = RemotePingResult {
-                hostname: pong.get_hostname()?.to_str()?.to_string(),
-                uptime_secs: pong.get_uptime_secs(),
-                shell: pong.get_shell()?.to_str()?.to_string(),
-                version: pong.get_version()?.to_str()?.to_string(),
-            };
-
-            drop(agent_client);
-            drop(auth_client);
-            let _ = disconnector.await;
-
-            Ok(ping_result)
-        })
+        Ok(ping_result)
+    });
+    timeout(deadline, run)
         .await
+        .map_err(|_| anyhow!("ping timed out after {}s", deadline.as_secs()))?
 }
 
 /// Cap'n Proto callback that receives streaming output chunks from the agent.
@@ -307,6 +364,7 @@ pub fn start_remote_exec_stream(
                             exit_code,
                             duration_ms,
                             timed_out,
+                            error: None,
                         });
                         session.rpc_profile = Some(rpc_profile);
                     }
@@ -322,6 +380,7 @@ pub fn start_remote_exec_stream(
                             exit_code: -1,
                             duration_ms: 0,
                             timed_out: false,
+                            error: Some(e.to_string()),
                         });
                     }
                 }
@@ -355,39 +414,15 @@ async fn exec_stream_inner(
     use tokio::time::Instant;
 
     let t0 = Instant::now();
-    let addr = format!("{host}:{port}");
 
-    // Connect with timeout
-    let stream = timeout(
-        Duration::from_secs(connect_timeout_secs),
-        TcpStream::connect(&addr),
-    )
-    .await
-    .context("connect timeout")?
-    .context("TCP connect failed")?;
-
-    stream.set_nodelay(true)?;
+    let stream = connect_stream(host, port, connect_timeout_secs).await?;
     let t_connected = Instant::now();
 
-    let stream = stream.compat();
-    let (reader, writer) = stream.split();
-
-    let network = capnp_rpc::twoparty::VatNetwork::new(
-        futures::io::BufReader::new(reader),
-        futures::io::BufWriter::new(writer),
-        capnp_rpc::rpc_twoparty_capnp::Side::Client,
-        Default::default(),
-    );
-
-    let mut rpc_system = capnp_rpc::RpcSystem::new(Box::new(network), None);
-    let disconnector = rpc_system.get_disconnector();
-    let auth_client: authenticator::Client =
-        rpc_system.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
-
-    tokio::task::spawn_local(rpc_system);
+    // Dropped on every exit path (and when the task is aborted), which closes the connection.
+    let (auth_client, disconnector, rpc_task) = start_rpc(stream);
 
     // Authenticate
-    let agent_client = authenticate(&auth_client, psk.as_bytes()).await?;
+    let agent_client = authenticate(&auth_client, psk.as_bytes(), connect_timeout_secs).await?;
     let t_authed = Instant::now();
 
     // Build exec_stream request
@@ -420,7 +455,12 @@ async fn exec_stream_inner(
 
     info!(request_id = %request_id, "sending exec_stream request");
 
-    let response = request.send().promise.await?;
+    let response = within(
+        "exec_stream",
+        exec_deadline(timeout_secs),
+        request.send().promise,
+    )
+    .await?;
     let result = response.get()?.get_result()?;
 
     let exit_code = result.get_exit_code();
@@ -443,34 +483,65 @@ async fn exec_stream_inner(
     };
 
     // Clean up RPC connection — fire-and-forget to avoid blocking on TCP teardown.
-    // The RPC system is already running via spawn_local; the disconnector just
-    // triggers a graceful shutdown that can take 20-30ms on LAN.
+    // The disconnector triggers a graceful shutdown that can take 20-30ms on LAN;
+    // the task guard moves along so the connection closes even if it stalls.
     drop(agent_client);
     drop(auth_client);
     tokio::task::spawn_local(async move {
-        let _ = disconnector.await;
+        let _rpc_task = rpc_task;
+        let _ = timeout(DISCONNECT_TIMEOUT, disconnector).await;
     });
 
     Ok((exit_code, duration_ms, timed_out, rpc_profile))
 }
 
 /// Perform HMAC challenge-response authentication, returns CommandAgent capability.
+/// The whole exchange must finish within `connect_timeout_secs`.
 async fn authenticate(
     auth_client: &authenticator::Client,
     psk: &[u8],
+    connect_timeout_secs: u64,
 ) -> Result<command_agent::Client> {
-    // Step 1: Get challenge nonce
-    let challenge_response = auth_client.challenge_request().send().promise.await?;
-    let nonce = challenge_response.get()?.get_nonce()?;
+    within(
+        "authentication",
+        Duration::from_secs(connect_timeout_secs),
+        async {
+            // Step 1: Get challenge nonce
+            let challenge_response = auth_client.challenge_request().send().promise.await?;
+            let nonce = challenge_response.get()?.get_nonce()?;
 
-    // Step 2: Compute HMAC
-    let hmac = auth::compute_hmac(psk, nonce);
+            // Step 2: Compute HMAC
+            let hmac = auth::compute_hmac(psk, nonce);
 
-    // Step 3: Authenticate
-    let mut auth_request = auth_client.authenticate_request();
-    auth_request.get().set_hmac(&hmac);
-    let auth_response = auth_request.send().promise.await?;
+            // Step 3: Authenticate
+            let mut auth_request = auth_client.authenticate_request();
+            auth_request.get().set_hmac(&hmac);
+            let auth_response = auth_request.send().promise.await?;
 
-    let agent_client = auth_response.get()?.get_agent()?;
-    Ok(agent_client)
+            auth_response.get()?.get_agent()
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_deadline_adds_grace() {
+        assert_eq!(exec_deadline(10), Duration::from_secs(40));
+    }
+
+    #[test]
+    fn exec_deadline_maps_zero_to_agent_default() {
+        assert_eq!(exec_deadline(0), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn rpc_message_strips_capnp_prefixes() {
+        let e =
+            capnp::Error::failed("remote exception: authentication failed: invalid HMAC".into());
+        assert_eq!(rpc_message(&e), "authentication failed: invalid HMAC");
+    }
 }

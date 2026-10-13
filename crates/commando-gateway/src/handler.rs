@@ -363,7 +363,7 @@ fn audit_exec(
                 duration_ms: page.duration_ms,
                 request_id: None,
                 source,
-                error: None,
+                error: page.error.as_deref(),
             });
         }
         Err(e) => {
@@ -548,6 +548,12 @@ fn format_page_response(id: &Value, page: &ExecPage) -> Value {
         text.push_str("[stderr]\n");
         text.push_str(&page.stderr);
     }
+    if let Some(error) = &page.error {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!("[error] {error}"));
+    }
     if page.timed_out.unwrap_or(false) {
         text.push_str("\n[timed out]");
     }
@@ -650,7 +656,7 @@ pub async fn build_page(
             session
                 .exec_result
                 .as_ref()
-                .map(|r| (r.exit_code, r.duration_ms, r.timed_out))
+                .map(|r| (r.exit_code, r.duration_ms, r.timed_out, r.error.clone()))
         } else {
             None
         }
@@ -672,7 +678,7 @@ pub async fn build_page(
                         exec_result_data = s
                             .exec_result
                             .as_ref()
-                            .map(|r| (r.exit_code, r.duration_ms, r.timed_out));
+                            .map(|r| (r.exit_code, r.duration_ms, r.timed_out, r.error.clone()));
                         break;
                     }
                     Some(s) => s.notify.clone(),
@@ -690,7 +696,7 @@ pub async fn build_page(
     let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
 
-    if let Some((exit_code, duration_ms, timed_out)) = exec_result_data {
+    if let Some((exit_code, duration_ms, timed_out, error)) = exec_result_data {
         // Final page: remove session from map, extract rpc_profile if present
         let rpc_profile = session_map
             .borrow_mut()
@@ -704,6 +710,7 @@ pub async fn build_page(
             duration_ms: Some(duration_ms),
             timed_out: if timed_out { Some(true) } else { None },
             next_page: None,
+            error,
             _profile: rpc_profile.map(|rp| {
                 let mut stages = BTreeMap::new();
                 stages.insert("rpc_tcp_connect".to_string(), rp.tcp_connect_ms);
@@ -743,6 +750,7 @@ pub async fn build_page(
             duration_ms: None,
             timed_out: None,
             next_page: Some(new_token),
+            error: None,
             _profile: None,
         })
     }
@@ -1598,6 +1606,7 @@ mod tests {
                 exit_code,
                 duration_ms: 42,
                 timed_out: false,
+                error: None,
             });
         }
         session.notify.notify_one();
@@ -1615,6 +1624,7 @@ mod tests {
             duration_ms: Some(10),
             timed_out: None,
             next_page: None,
+            error: None,
             _profile: None,
         };
         let resp = format_page_response(&id, &page);
@@ -1635,6 +1645,7 @@ mod tests {
             duration_ms: Some(5),
             timed_out: None,
             next_page: None,
+            error: None,
             _profile: None,
         };
         let resp = format_page_response(&id, &page);
@@ -1653,6 +1664,7 @@ mod tests {
             duration_ms: Some(0),
             timed_out: None,
             next_page: None,
+            error: None,
             _profile: None,
         };
         let resp = format_page_response(&id, &page);
@@ -1669,6 +1681,7 @@ mod tests {
             duration_ms: Some(5000),
             timed_out: Some(true),
             next_page: None,
+            error: None,
             _profile: None,
         };
         let resp = format_page_response(&id, &page);
@@ -1687,6 +1700,7 @@ mod tests {
             duration_ms: None,
             timed_out: None,
             next_page: Some("abc123".to_string()),
+            error: None,
             _profile: None,
         };
         let resp = format_page_response(&id, &page);
@@ -1706,12 +1720,33 @@ mod tests {
             duration_ms: None,
             timed_out: None,
             next_page: Some("tok123".to_string()),
+            error: None,
             _profile: None,
         };
         let resp = format_page_response(&id, &page);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         // Should still have the streaming token
         assert!(text.contains("[streaming] next_page=tok123"));
+    }
+
+    #[test]
+    fn format_page_includes_rpc_error() {
+        let id = json!(1);
+        let page = ExecPage {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(-1),
+            duration_ms: Some(0),
+            timed_out: None,
+            next_page: None,
+            error: Some("authentication timed out after 5s".to_string()),
+            _profile: None,
+        };
+        let resp = format_page_response(&id, &page);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("[error] authentication timed out after 5s"));
+        assert!(text.contains("exit_code: -1"));
+        assert!(resp["result"]["isError"].as_bool().unwrap_or(false));
     }
 
     // -- build_page tests --
@@ -1975,6 +2010,7 @@ mod tests {
                 exit_code: 0,
                 duration_ms: 100,
                 timed_out: false,
+                error: None,
             });
             session.notify.notify_one();
         }
@@ -2029,6 +2065,7 @@ mod tests {
                         exit_code: 0,
                         duration_ms: 5,
                         timed_out: false,
+                        error: None,
                     });
                     session.notify.clone()
                 };
@@ -2231,6 +2268,7 @@ mod tests {
                 exit_code: 0,
                 duration_ms: 1,
                 timed_out: false,
+                error: None,
             });
         }
         let page = build_page(&sm, &token, &config).await.unwrap();

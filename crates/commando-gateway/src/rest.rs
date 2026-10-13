@@ -20,6 +20,11 @@ fn error_response(status: axum::http::StatusCode, msg: &str) -> Response {
     (status, Json(json!({"error": msg}))).into_response()
 }
 
+/// A handler failure carries `error` without a page; every page has `stdout`.
+fn is_handler_failure(resp: &Value) -> bool {
+    resp.get("error").is_some() && resp.get("stdout").is_none()
+}
+
 pub async fn handle_exec_post(
     State(state): State<crate::streamable::AppState>,
     headers: axum::http::HeaderMap,
@@ -39,7 +44,7 @@ pub async fn handle_exec_post(
     });
     match send_work(&state, internal_req).await {
         Ok(resp) => {
-            if resp.get("error").is_some() {
+            if is_handler_failure(&resp) {
                 let status = if resp["_gateway"].as_bool().unwrap_or(false) {
                     axum::http::StatusCode::BAD_GATEWAY
                 } else {
@@ -64,7 +69,7 @@ pub async fn handle_exec_get(
     });
     match send_work(&state, internal_req).await {
         Ok(resp) => {
-            if resp.get("error").is_some() {
+            if is_handler_failure(&resp) {
                 return (axum::http::StatusCode::BAD_REQUEST, Json(resp)).into_response();
             }
             Json(resp).into_response()
@@ -133,6 +138,7 @@ mod tests {
             duration_ms: Some(150),
             timed_out: None,
             next_page: None,
+            error: None,
             _profile: None,
         };
         let json = serde_json::to_value(&page).unwrap();
@@ -152,6 +158,7 @@ mod tests {
             duration_ms: None,
             timed_out: None,
             next_page: Some("abc123".to_string()),
+            error: None,
             _profile: None,
         };
         let json = serde_json::to_value(&page).unwrap();
@@ -168,6 +175,7 @@ mod tests {
             duration_ms: Some(60000),
             timed_out: Some(true),
             next_page: None,
+            error: None,
             _profile: None,
         };
         let json = serde_json::to_value(&page).unwrap();

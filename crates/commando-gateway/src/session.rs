@@ -14,6 +14,8 @@ pub struct StreamExecResult {
     pub exit_code: i32,
     pub duration_ms: u64,
     pub timed_out: bool,
+    /// RPC failure message (connect, auth, deadline, agent error).
+    pub error: Option<String>,
 }
 
 /// RPC-internal timing breakdown, stored in the session for profiling.

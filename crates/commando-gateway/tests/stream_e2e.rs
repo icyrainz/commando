@@ -362,7 +362,7 @@ fn timeout_reports_timed_out_and_137() {
 
 /// (a) Gateway aborts the rpc task of a running command: is the agent's
 /// `exec_stream` call future dropped? The abort drops the pending call (capnp
-/// Finish); the gateway's rpc_system task and the TCP connection stay open.
+/// Finish) and the rpc_system task with it, so the TCP connection closes.
 #[test]
 fn finding_a_gateway_task_abort() {
     run_local(async {
@@ -387,17 +387,26 @@ fn finding_a_gateway_task_abort() {
         assert_eq!(expired.len(), 1);
 
         let released = eventually(Duration::from_secs(5), || permit_available(&agent.guard)).await;
-        // Let any connection teardown triggered by the abort finish.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let connection_open = agent.open_connections.get() == 1;
+        let connection_closed =
+            eventually(Duration::from_secs(5), || agent.open_connections.get() == 0).await;
         let alive = process_alive(pid.0);
         println!("FINDING: (a) gateway task abort: agent permit released = {released}");
-        println!("FINDING: (a) gateway task abort: connection still open = {connection_open}");
+        println!("FINDING: (a) gateway task abort: connection closed = {connection_closed}");
         println!("FINDING: (a) gateway task abort: remote process alive = {alive}");
 
         assert!(released, "agent exec_stream future should be dropped");
-        // current behavior; the gateway rpc row will change this
-        assert!(connection_open, "connection stays open after the abort");
+        assert!(connection_closed, "connection closes after the abort");
+        // The gateway-side concurrency slot is free again.
+        let max = gw.config.agent.max_concurrent_per_target;
+        for _ in 0..max {
+            assert!(
+                gw.limiter.try_acquire(TARGET),
+                "gateway slot should be free"
+            );
+        }
+        for _ in 0..max {
+            gw.limiter.release(TARGET);
+        }
         // current behavior; the agent lifecycle row will change this and must flip this assertion
         assert!(alive, "remote process survives the abort");
     });

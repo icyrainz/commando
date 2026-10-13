@@ -166,6 +166,10 @@ async fn cmd_exec(
             eprint!("{stderr}");
             let _ = std::io::stderr().flush();
         }
+        if let Some(error) = json["error"].as_str() {
+            eprintln!("error: {error}");
+            return 1;
+        }
         if let Some(exit_code) = json["exit_code"].as_i64() {
             if profile {
                 let t_end = Instant::now();
